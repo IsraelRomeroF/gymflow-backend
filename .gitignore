@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+*.tsbuildinfo
+perf/medicion.txt
+# Bitácoras de cualquier guion y notas de trabajo (auditoría 8, 27-12/27-14).
+*.log
+scratchpad/
+# Motor facial (Python): su entorno y su modelo los instala motor-facial/preparar.sh.
+motor-facial/.venv/
+motor-facial/modelo/
+__pycache__/
+*.pyc

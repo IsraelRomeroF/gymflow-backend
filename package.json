@@ -1,0 +1,71 @@
+{
+  "name": "@gymflow/backend",
+  "version": "0.1.0",
+  "description": "API modular de GymFlow. Cada módulo es extraíble a servicio propio.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "packageManager": "pnpm@10.26.0",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/main.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "perf": "PERF=1 DB_LOG_QUERIES=1 vitest run",
+    "lint": "eslint src test perf",
+    "jobs:daily": "tsx src/platform/jobs/run-daily.ts",
+    "jobs:frequent": "tsx src/platform/jobs/run-frequent.ts",
+    "jobs:estado": "tsx scripts/jobs-estado.ts",
+    "verify": "pnpm typecheck && pnpm lint && pnpm test",
+    "local:preparar": "bash scripts/local-preparar.sh",
+    "plataforma:alta": "bash scripts/perfil.sh uso-real tsx scripts/plataforma-alta.ts",
+    "dev:local": "bash scripts/perfil.sh uso-real tsx watch src/main.ts",
+    "start:local": "bash scripts/perfil.sh uso-real tsx src/main.ts",
+    "jobs:local": "bash scripts/perfil.sh uso-real tsx src/platform/jobs/run-daily.ts",
+    "jobs:local:15min": "bash scripts/perfil.sh uso-real tsx src/platform/jobs/run-frequent.ts",
+    "jobs:local:estado": "bash scripts/perfil.sh uso-real tsx scripts/jobs-estado.ts",
+    "jobs:local:ciclo": "bash scripts/jobs-ciclo.sh uso-real",
+    "pruebas:reset": "bash scripts/pruebas-reset.sh",
+    "dev:pruebas": "bash scripts/perfil.sh pruebas tsx watch src/main.ts",
+    "jobs:pruebas": "bash scripts/perfil.sh pruebas tsx src/platform/jobs/run-daily.ts",
+    "jobs:pruebas:15min": "bash scripts/perfil.sh pruebas tsx src/platform/jobs/run-frequent.ts",
+    "jobs:pruebas:estado": "bash scripts/perfil.sh pruebas tsx scripts/jobs-estado.ts"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.1.2",
+    "@fastify/cors": "^11.3.0",
+    "@fastify/helmet": "^13.1.1",
+    "@fastify/rate-limit": "^11.2.0",
+    "@gymflow/core": "link:../gymflow-core",
+    "@gymflow/db": "link:../gymflow-db",
+    "@node-rs/argon2": "^2.2.1",
+    "dotenv": "^18.0.3",
+    "fastify": "^5.12.5",
+    "fastify-plugin": "^6.0.0",
+    "web-push": "3.6.7",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "@types/node": "^22.10.0",
+    "@types/web-push": "^3.6.4",
+    "eslint": "^9.17.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.19.0",
+    "vite": "^7.3.6",
+    "vitest": "^4.1.11"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "@node-rs/argon2",
+      "@prisma/client",
+      "@prisma/engines",
+      "prisma"
+    ]
+  }
+}

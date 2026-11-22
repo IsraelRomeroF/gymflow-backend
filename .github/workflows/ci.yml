@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push: { branches: [main] }
+  pull_request:
+
+# Verifica las TRES reglas de arquitectura además de las pruebas:
+#   · fronteras de módulo (test/module-boundaries.test.ts)
+#   · solo un repositorio toca la base de datos (lint)
+#   · ninguna ruta nace sin declarar su seguridad (test/route-security.test.ts)
+#
+# ACCESO ENTRE REPOSITORIOS: `gymflow-core` y `gymflow-db` son públicos, así
+# que se bajan sin clave ni token.
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PGADMIN_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      DATABASE_URL: postgresql://gymflow_app:gymflow_app_ci@localhost:5432/gymflow_dev?schema=public
+      DATABASE_URL_MIGRATOR: postgresql://gymflow_owner:gymflow_owner_ci@localhost:5432/gymflow_dev?schema=public
+      SHADOW_DATABASE_URL: postgresql://gymflow_owner:gymflow_owner_ci@localhost:5432/gymflow_shadow?schema=public
+      GYMFLOW_OWNER_PASSWORD: gymflow_owner_ci
+      GYMFLOW_APP_PASSWORD: gymflow_app_ci
+      # 32 bytes en base64, no hexadecimal: es lo que valida `env.ts`.
+      # Clave DESECHABLE de CI, nunca la de producción.
+      MFA_ENCRYPTION_KEY: FHWdc5H65ppznZtcuhundPchEna69IIVbtenjrGFUDU=
+      NODE_ENV: test
+      # Clave de firma del padrón, DESECHABLE y solo para CI.
+      ROSTER_SIGNING_KEY: |
+        -----BEGIN PRIVATE KEY-----
+        MC4CAQAwBQYDK2VwBCIEIIdtrop+w116jXmOWFhyYdkp5yFbk7Wz2IYL2Zpy2n9X
+        -----END PRIVATE KEY-----
+      API_PORT: '3001'
+      CORS_ORIGINS: http://localhost:3000
+      SESSION_TTL_STAFF_HOURS: '12'
+      SESSION_TTL_MEMBER_DAYS: '30'
+
+    steps:
+      # Los tres repositorios, hermanos DENTRO del workspace: `actions/checkout`
+      # no admite rutas fuera de él y `link:` necesita que lo sean.
+      - uses: actions/checkout@v4
+        with: { path: gymflow-backend }
+      - uses: actions/checkout@v4
+        with:
+          repository: IsraelRomeroF/gymflow-core
+          path: gymflow-core
+      - uses: actions/checkout@v4
+        with:
+          repository: IsraelRomeroF/gymflow-db
+          path: gymflow-db
+
+      - uses: pnpm/action-setup@v4
+        with: { version: 10.26.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+
+      - name: Construir dominio
+        working-directory: gymflow-core
+        run: pnpm install --frozen-lockfile && pnpm build
+
+      - name: Construir datos y preparar la base
+        working-directory: gymflow-db
+        run: |
+          pnpm install --frozen-lockfile
+          node scripts/bootstrap-db.mjs
+          pnpm exec prisma migrate deploy
+          pnpm build
+          pnpm exec tsx src/seed.ts
+          pnpm exec tsx src/seed-demo.ts
+          # Volumen representativo: varias pruebas MIDEN sobre él (búsqueda
+          # tolerante a errores, drenado de jobs por lotes). En local pasaban
+          # por arrastre de corridas anteriores; en una base limpia, no.
+          pnpm exec tsx src/seed-volume.ts
+
+      - name: Instalar
+        working-directory: gymflow-backend
+        run: pnpm install --frozen-lockfile
+
+      - name: Verificar
+        working-directory: gymflow-backend
+        run: pnpm typecheck && pnpm lint && pnpm test && pnpm build

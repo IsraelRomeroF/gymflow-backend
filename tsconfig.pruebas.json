@@ -1,0 +1,8 @@
+// `pnpm typecheck` solo mira `src/` (su `rootDir`): las pruebas y la medición no pasaban
+// por el compilador y vitest quita los tipos sin comprobarlos (1.17b). Esto las comprueba:
+//   pnpm exec tsc -p tsconfig.pruebas.json
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": { "noEmit": true, "rootDir": ".", "declaration": false, "declarationMap": false },
+  "include": ["src/**/*.ts", "test/**/*.ts", "perf/**/*.ts"]
+}

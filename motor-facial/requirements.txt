@@ -1,0 +1,59 @@
+# Motor facial de GymFlow · dependencias FIJAS (todas, también las indirectas).
+#
+# Son las versiones del sidecar de HRFlow que ya reconocía a los socios (las
+# directas venían fijadas así de HRFlow; las indirectas se tomaron de su
+# entorno validado el 2026-11-19). Un rango abierto («>=») dejaría que una
+# instalación nueva traiga otro InsightFace u onnxruntime que no se ha probado:
+# la detección podría cambiar sin aviso y los rostros ya registrados dejar de
+# reconocerse. Para subir una versión: cámbiala aquí, corre preparar.sh y
+# probar.sh, y prueba con rostros reales antes de llevarla al gimnasio.
+#
+# Lo instala preparar.sh en motor-facial/.venv. Probado con Python 3.14.
+
+# ── Directas (igual que HRFlow) ──────────────────────────────────────────────
+fastapi==0.136.3
+uvicorn[standard]==0.49.0
+insightface==1.0.1
+onnx==1.21.0
+onnxruntime==1.26.0
+opencv-python-headless==4.13.0.92
+scikit-image==0.26.0
+pillow==12.2.0
+numpy==2.4.6
+
+# ── Indirectas ───────────────────────────────────────────────────────────────
+# insightface pide además `opencv-python` (el completo, con ventanas). Se fija
+# para que no llegue otra versión; preparar.sh lo quita después y deja solo el
+# headless, como la imagen de HRFlow en su servidor (el completo pide libGL).
+opencv-python==4.13.0.92
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anyio==4.13.0
+certifi==2026.5.20
+charset-normalizer==3.4.7
+click==8.4.1
+flatbuffers==25.12.19
+h11==0.16.0
+httptools==0.8.0
+idna==3.18
+ImageIO==2.37.3
+lazy-loader==0.5
+ml_dtypes==0.5.4
+networkx==3.6.1
+packaging==26.2
+protobuf==7.35.0
+pydantic==2.13.4
+pydantic_core==2.46.4
+python-dotenv==1.2.2
+PyYAML==6.0.3
+requests==2.34.2
+scipy==1.17.1
+starlette==1.2.1
+tifffile==2026.6.1
+tqdm==4.67.3
+typing_extensions==4.15.0
+typing-inspection==0.4.2
+urllib3==2.7.0
+uvloop==0.22.1
+watchfiles==1.2.0
+websockets==16.0
