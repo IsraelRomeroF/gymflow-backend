@@ -78,7 +78,9 @@ describe('las garantías del esquema que Prisma no ve', () => {
     const filas = await owner.$queryRawUnsafe<Array<{ t: string; n: string; tipo: number }>>(
       `select tgrelid::regclass::text t, tgname n, tgtype::int tipo from pg_trigger where not tgisinternal order by 1, 2`);
     const sobre = (tipo: number) => [[4, 'I'], [16, 'U'], [8, 'D'], [32, 'T']].filter(([bit]) => (tipo & (bit as number)) > 0).map(([, l]) => l).join('');
-    expect(filas.map((f) => `${f.t} · ${f.n} · ${sobre(f.tipo)}`)).toEqual(TRIGGERS);
+    // Se ordena aquí y no en SQL: el orden de «privacy_batch_items» y «privacy_batches» depende de la
+    // intercalación de la base (la de CI no es la local), y lo que se afirma es el conjunto.
+    expect(filas.map((f) => `${f.t} · ${f.n} · ${sobre(f.tipo)}`).sort()).toEqual([...TRIGGERS].sort());
   });
 
   it('el rol de la aplicación no puede borrar ni corregir el libro: los permisos son exactamente estos', async () => {
@@ -90,9 +92,9 @@ describe('las garantías del esquema que Prisma no ve', () => {
         where t.schemaname = 'public' and t.tablename <> '_prisma_migrations'
         group by 1 order by 1`);
     const con = (permisos: string) => filas.filter((f) => (f.permisos ?? '') === permisos).map((f) => f.tabla);
-    expect(con('INSERT,SELECT'), 'solo agregar').toEqual(SOLO_AGREGAR);
-    expect(con('INSERT,SELECT,UPDATE'), 'sin borrar').toEqual(SIN_BORRAR);
-    expect(con('DELETE,INSERT,SELECT'), 'sin actualizar').toEqual(SIN_ACTUALIZAR);
+    expect(con('INSERT,SELECT').sort(), 'solo agregar').toEqual([...SOLO_AGREGAR].sort());
+    expect(con('INSERT,SELECT,UPDATE').sort(), 'sin borrar').toEqual([...SIN_BORRAR].sort());
+    expect(con('DELETE,INSERT,SELECT').sort(), 'sin actualizar').toEqual([...SIN_ACTUALIZAR].sort());
     // Todo lo demás, completo: una tabla nueva sin permisos (la aplicación no la podría usar) también se nota aquí.
     const resto = filas.filter((f) => ![...SOLO_AGREGAR, ...SIN_BORRAR, ...SIN_ACTUALIZAR].includes(f.tabla));
     expect(resto.filter((f) => f.permisos !== 'DELETE,INSERT,SELECT,UPDATE').map((f) => `${f.tabla}: ${f.permisos}`)).toEqual([]);
