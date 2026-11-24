@@ -230,6 +230,17 @@ export function registerProfileRoutes(app: FastifyInstance): void {
         await new ResponsibleRepository(orgId).escribir(id, responsableNuevo);
         await asentarResponsable(orgId, id, updated.phoneE164, responsableNuevo);
       }
+      // Bloque 4.11: igual que cuando el socio lo cambia desde el portal (4.8). Si su celular cambió (o se
+      // quitó), quien lo tenía anotado como responsable del número ANTERIOR se queda sin responsable, y si
+      // él tenía anotado a otro socio con quien ya no comparte número, también lo suelta. Lo demás (un
+      // adulto o un tutor anotados a mano en el mostrador) no se toca.
+      let dejaronDeTenerloDeResponsable = 0;
+      let soltoASuResponsable = false;
+      if (resto.phoneE164 !== undefined && updated.phoneE164 !== before.phoneE164) {
+        const responsables = new ResponsibleRepository(orgId);
+        dejaronDeTenerloDeResponsable = await responsables.soltarA(id);
+        if (!responsableNuevo) soltoASuResponsable = await responsables.soltarSiYaNoComparte(id);
+      }
 
       await audit.record(ctx, {
         action: 'member.update',
@@ -242,6 +253,8 @@ export function registerProfileRoutes(app: FastifyInstance): void {
         afterState: {
           changedFields: Object.keys(body).filter((k) => k !== 'reason' && k !== 'responsible' && !ocultos.has(k) && (k !== 'joinedAt' || cambiaAntiguedad)),
           ...(responsableNuevo ? { responsable: responsableNuevo.responsibleKind } : {}),
+          ...(dejaronDeTenerloDeResponsable > 0 ? { dejaronDeTenerloDeResponsable } : {}),
+          ...(soltoASuResponsable ? { soltoASuResponsable: true } : {}),
           homeBranchId: updated.homeBranchId,
           ...(cambiaAntiguedad ? { joinedAt: diaDeAlta } : {}),
         },

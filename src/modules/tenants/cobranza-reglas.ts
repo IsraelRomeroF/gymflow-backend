@@ -137,11 +137,12 @@ export function avisoDeSuspension(f: { folio: string; saldoCents: bigint }): Tex
   };
 }
 
-export function avisoDeCambioDePrecio(x: { effectiveFrom: string; antesCents: bigint; despuesCents: bigint }): TextoDeAviso {
+export function avisoDeCambioDePrecio(x: { effectiveFrom: string; antesCents: bigint; despuesCents: bigint; /** D-39: el cambio trae (o quita) el IVA desde esa factura. */ iva?: { rateBps: number; included: boolean } | null }): TextoDeAviso {
   const sube = x.despuesCents > x.antesCents;
+  const porIva = !x.iva ? '' : x.iva.rateBps > 0 ? ` Desde esa factura se suma el IVA (${(x.iva.rateBps / 100).toString()} %), que va desglosado.` : ' Desde esa factura ya no se suma el IVA.';
   return {
     title: `Tu mensualidad de GymFlow cambia en ${nombreDeMes(x.effectiveFrom)}`,
-    body: `A partir de la factura de ${nombreDeMes(x.effectiveFrom)}, tu mensualidad de GymFlow ${sube ? 'sube' : 'baja'} de ${pesos(x.antesCents)} a ${pesos(x.despuesCents)}. Hasta entonces pagas lo mismo que hoy.`,
+    body: `A partir de la factura de ${nombreDeMes(x.effectiveFrom)}, tu mensualidad de GymFlow ${sube ? 'sube' : 'baja'} de ${pesos(x.antesCents)} a ${pesos(x.despuesCents)}.${porIva} Hasta entonces pagas lo mismo que hoy.`,
   };
 }
 

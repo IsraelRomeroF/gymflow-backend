@@ -491,6 +491,7 @@ export class ApprovalService {
   private async subirEscalon(ctx: RequestContext, firmante: Firmante, step: Exclude<ApprovalFailureStep, 'none'>, r: { failedCount: number; pausedUntil: Date | null }, op: Pick<Operacion, 'branchId'>, canal: 'mostrador' | 'telefono'): Promise<void> {
     const orgId = ctx.tenant.organizationId;
     const push = new PushService();
+    // D-05 (bloque 4.2, edición puntual): los tres avisos llevan `kind` para que quien los apagó en su teléfono no los reciba.
     const tag = `approval-fails-${firmante.id}`;
     if (step === 'warn' || !r.pausedUntil) {
       void push.sendToUsers(orgId, [firmante.id], {
@@ -498,7 +499,7 @@ export class ApprovalService {
         body: canal === 'mostrador'
           ? `Alguien tecleó mal tu contraseña ${r.failedCount} veces al pedir una firma en el mostrador. Si no fuiste tú, cámbiala.`
           : `Tu contraseña no coincidió ${r.failedCount} veces al autorizar. Si no fuiste tú, cámbiala.`,
-        url: '/bitacora', tag,
+        url: '/bitacora', tag, kind: 'PASSWORD_FAILS',
       }).catch(() => undefined);
       return;
     }
@@ -514,14 +515,14 @@ export class ApprovalService {
     void push.sendToUsers(orgId, [firmante.id], {
       title: 'Tus firmas quedaron en pausa',
       body: `Hubo ${r.failedCount} intentos fallidos con tu contraseña. Podrás volver a firmar a las ${hora}. Si no fuiste tú, cambia tu contraseña.`,
-      url: '/bitacora', tag,
+      url: '/bitacora', tag, kind: 'PASSWORD_FAILS',
     }).catch(() => undefined);
     const otros = await this.firmantesDelGimnasio(orgId, firmante.id);
     if (otros.length > 0) {
       void push.sendToUsers(orgId, otros, {
         title: 'Firmas en pausa',
         body: `Las firmas de ${firmante.fullName} quedaron en pausa hasta las ${hora} por intentos fallidos con su contraseña.`,
-        url: '/bitacora', tag,
+        url: '/bitacora', tag, kind: 'PASSWORD_FAILS',
       }).catch(() => undefined);
     }
   }

@@ -182,6 +182,8 @@ export class CashSessionRepository extends TenantRepository {
     openedByUserId?: string | undefined;
     variance?: FiltroDeDescuadre | undefined;
     limit?: number | undefined;
+    /** Página siguiente (bloque 4.11): solo lo que abrió ANTES de ese turno, en el mismo orden. */
+    before?: { openedAt: Date; id: string } | undefined;
   } = {}): Promise<CashSessionRecord[]> {
     const rango = opts.from || opts.to ? { businessDate: { ...(opts.from ? { gte: opts.from } : {}), ...(opts.to ? { lte: opts.to } : {}) } } : {};
     const rows = await this.db.cashSession.findMany({
@@ -192,9 +194,11 @@ export class CashSessionRepository extends TenantRepository {
         ...(opts.openedByUserId ? { openedByUserId: opts.openedByUserId } : {}),
         ...(opts.variance === 'ANY' ? { varianceCents: { not: 0n }, status: opts.status ? S[opts.status] : { not: S.OPEN } }
           : opts.variance ? { varianceStatus: opts.variance } : {}),
+        ...(opts.before ? { OR: [{ openedAt: { lt: opts.before.openedAt } }, { openedAt: opts.before.openedAt, id: { lt: opts.before.id } }] } : {}),
       }),
       select: SESSION_SELECT,
-      orderBy: { openedAt: 'desc' },
+      // El id desempata: dos turnos abiertos en el mismo instante no se repiten ni se pierden entre páginas.
+      orderBy: [{ openedAt: 'desc' }, { id: 'desc' }],
       take: opts.limit ?? 100,
     });
     return rows as CashSessionRecord[];

@@ -1,7 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import {
-  conflict, DomainError, formatMoney, forbidden, money, notFound, LIMITES_DE_LOS_TOPES_DEL_CAJON, type CashMovementType,
+  conflict, DomainError, formatMoney, forbidden, money, notFound, validation, LIMITES_DE_LOS_TOPES_DEL_CAJON, type CashMovementType,
 } from '@gymflow/core';
 import {
   CashAlerts, CashLimits, CashMovement, CashSession, CashSessionList, CashShiftAllowance, CloseCashSessionResult,
@@ -21,6 +21,17 @@ import { CashAlertsService } from './cash-alerts.service.js';
 import { UserRepository } from '../identity/index.js';
 
 const idParam = z.object({ id: z.string().uuid() });
+
+/** El cursor de `GET /cash-sessions` (bloque 4.11): hora de apertura e id del último turno de la página anterior. */
+function leerCursorDeTurnos(texto: string): { openedAt: Date; id: string } {
+  try {
+    const partes: unknown = JSON.parse(Buffer.from(texto, 'base64url').toString('utf8'));
+    const [cuando, id] = z.tuple([z.string().datetime(), z.string().uuid()]).parse(partes);
+    return { openedAt: new Date(cuando), id };
+  } catch {
+    throw validation('Esa página ya no existe. Vuelve a abrir la lista.');
+  }
+}
 const cents = (v: bigint): string => v.toString();
 const iso = (d: Date): string => d.toISOString().slice(0, 10);
 
@@ -232,21 +243,32 @@ export function registerCashRoutes(app: FastifyInstance): void {
         openedByUserId: z.string().uuid().optional(),
         variance: z.enum(['PENDING', 'REVIEWED', 'ANY']).optional(),
         limit: z.coerce.number().int().min(1).max(300).optional(),
+        /** Página siguiente (bloque 4.11): el `nextCursor` de la respuesta anterior, con los mismos filtros. */
+        cursor: z.string().max(200).optional(),
       }).parse(request.query);
+      const antesDe = q.cursor ? leerCursorDeTurnos(q.cursor) : undefined;
+      const limite = q.limit ?? 100;
       const sede = sedeDeConsulta(request, 'cash:session:read', q.branchId);
       const dia = (d: string | undefined) => (d ? new Date(`${d}T00:00:00.000Z`) : undefined);
 
-      const rows = await new CashSessionRepository(ctx.tenant.organizationId).list({
+      // Uno de más para saber si hay otra página sin contar toda la tabla.
+      const leidos = await new CashSessionRepository(ctx.tenant.organizationId).list({
         branchId: sede ?? undefined,
         status: q.status,
         businessDate: dia(q.businessDate),
         from: dia(q.from), to: dia(q.to),
         openedByUserId: q.openedByUserId,
         variance: q.variance,
-        limit: q.limit,
+        limit: limite + 1,
+        before: antesDe,
       });
+      const rows = leidos.slice(0, limite);
+      const ultimo = leidos.length > limite ? rows.at(-1) : undefined;
       const nombres = await nombresDe(ctx.tenant.organizationId, rows);
-      return { sessions: rows.map((s) => serializeSession(s, nombres)) };
+      return {
+        sessions: rows.map((s) => serializeSession(s, nombres)),
+        nextCursor: ultimo ? Buffer.from(JSON.stringify([ultimo.openedAt.toISOString(), ultimo.id])).toString('base64url') : null,
+      };
     },
   });
 

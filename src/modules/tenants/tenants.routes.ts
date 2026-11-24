@@ -2,8 +2,9 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { ASSIGNABLE_ROLES, onlyEffectiveSections, MODULES, MODULE_BY_KEY, MODULE_GROUPS, MODULE_TEMPLATES, auditLabel, esFechaDeCalendario, isRoleKey, normalizePhoneMx, notFound, validation } from '@gymflow/core';
 import {
+  PlatformBillingAdjustment, PlatformBillingAdjustmentCreated, PlatformBillingAdjustmentList,
   PlatformCollectionsBoard, PlatformCollectionsHold, PlatformNotice, PlatformOrganizationCreated, PlatformOrganizationDetail, PlatformOrganizationList,
-  PlatformPriceChange, PlatformPriceChangeList, PlatformPriceChangePreview, PlatformServiceChanged, PlatformUserCreated,
+  PlatformPriceChange, PlatformPriceChangeList, PlatformPriceChangePreview, PlatformServiceChanged, PlatformTax, PlatformTaxChange, PlatformTaxScheduled, PlatformUserCreated,
 } from '@gymflow/core/contracts';
 import { readFileSync } from 'node:fs';
 import { AuditService } from '../../platform/audit/audit.service.js';
@@ -18,8 +19,11 @@ import { TenantRepository } from './tenant.repository.js';
 import { TenantService } from './tenant.service.js';
 import { FORMAS_DE_PAGO, PIDE_REFERENCIA, PlatformBillingService } from './platform-billing.service.js';
 import { diaDeCobroDe, esMes } from './cobro-reglas.js';
+import { emisor } from './emisor.js';
+import { PlatformBillingRepository } from './platform-billing.repository.js';
 import { PlatformCollectionsService } from './cobranza.service.js';
 import { PlatformPricingService } from './platform-pricing.service.js';
+import { BillingAdjustmentService, MESES_MAX_DE_AJUSTE } from './ajustes-de-factura.service.js';
 import { registerGymAccountRoutes } from './cuenta-con-gymflow.routes.js';
 import { registerGymBrandRoutes } from './ficha-de-marca.routes.js';
 import { PlatformPlanRepository } from './platform-plan.repository.js';
@@ -97,8 +101,12 @@ export function registerTenantRoutes(app: FastifyInstance, env: Env): void {
   /** La escalera de cobranza (D-37) y los cambios con un mes de aviso (D-38): bloque 3.11. */
   const cobranza = new PlatformCollectionsService();
   const vigencias = new PlatformPricingService();
+  /** Descuentos o precio especial por meses y con motivo (D-39): bloque 4.9. */
+  const ajustes = new BillingAdjustmentService();
   /** Día 1 de un mes, `AAAA-MM-01`: desde qué factura aplica un cambio anunciado. */
   const desdeFactura = z.string().regex(/^\d{4}-(0[1-9]|1[0-2])-01$/, 'Escribe el día 1 del mes desde el que aplica, como AAAA-MM-01');
+  /** El IVA: la tasa en puntos base (1600 = 16 %; 0 lo apaga), si los precios ya lo incluyen y desde qué factura. */
+  const cuerpoDeIva = z.object({ rateBps: z.number().int().min(0).max(5000, 'La tasa no pasa de 50 %'), included: z.boolean().default(false), effectiveFrom: desdeFactura.optional() });
   registerGymAccountRoutes(app);
   // Datos y marca del gimnasio (D-27, bloque 4.6): la ficha de marca y las solicitudes de cambio.
   registerGymBrandRoutes(app);
@@ -686,6 +694,111 @@ export function registerTenantRoutes(app: FastifyInstance, env: Env): void {
     },
   });
 
+  // ── La factura de GymFlow: descuentos por meses e IVA (D-39, bloque 4.9) ───
+
+  /** Los descuentos y precios especiales de una marca: programados, vigentes, terminados y cancelados. */
+  route(app, {
+    method: 'GET',
+    url: '/platform/organizations/:id/billing-adjustments',
+    security: { kind: 'platform' },
+    schema: respuesta(200, PlatformBillingAdjustmentList),
+    handler: async (request) => ajustes.lista(idParam.parse(request.params).id),
+  });
+
+  /**
+   * Dar un descuento o un precio especial: desde la factura de qué mes, por
+   * cuántos meses, cuánto y por qué. Vale solo para las facturas de esos meses
+   * y caduca solo. El motivo sale en el renglón de la factura. Una factura ya
+   * emitida no cambia: `alreadyInvoiced` dice qué meses del ajuste ya la tenían.
+   */
+  route(app, {
+    method: 'POST',
+    url: '/platform/organizations/:id/billing-adjustments',
+    security: { kind: 'platform' },
+    schema: respuesta(201, PlatformBillingAdjustmentCreated),
+    handler: async (request, reply) => {
+      const { id } = idParam.parse(request.params);
+      const body = motivo.extend({
+        kind: z.enum(['PERCENT', 'AMOUNT', 'SPECIAL_PRICE']),
+        /** Puntos base: 2000 = 20 %. Solo con PERCENT. */
+        percentBps: z.number().int().min(1, 'El porcentaje debe ser mayor que cero').max(10_000, 'El porcentaje no pasa de 100 %').optional(),
+        /** El importe del descuento (AMOUNT) o la mensualidad especial sin IVA (SPECIAL_PRICE). */
+        amountCents: centavos.optional(),
+        fromMonth: desdeFactura,
+        months: z.number().int().min(1, 'Dura al menos un mes').max(MESES_MAX_DE_AJUSTE, `Dura a lo más ${MESES_MAX_DE_AJUSTE} meses`),
+      }).superRefine((b, ctx) => {
+        if (b.kind === 'PERCENT' && b.percentBps === undefined) ctx.addIssue({ code: 'custom', path: ['percentBps'], message: 'Escribe el porcentaje del descuento' });
+        if (b.kind !== 'PERCENT' && (b.amountCents === undefined || BigInt(b.amountCents) <= 0n)) ctx.addIssue({ code: 'custom', path: ['amountCents'], message: b.kind === 'AMOUNT' ? 'Escribe el importe del descuento' : 'Escribe el precio especial de la mensualidad' });
+      }).parse(request.body);
+      const r = await ajustes.crear(id, { kind: body.kind, percentBps: body.percentBps, amountCents: body.amountCents !== undefined ? BigInt(body.amountCents) : undefined, fromMonth: body.fromMonth, months: body.months, reason: body.reason }, request.platform!.userId);
+      return reply.status(201).send(r);
+    },
+  });
+
+  /** Cancelar un descuento que no ha terminado: las facturas que faltan salen sin él; las ya emitidas no cambian. */
+  route(app, {
+    method: 'POST',
+    url: '/platform/billing-adjustments/:id/cancel',
+    security: { kind: 'platform' },
+    schema: respuesta(200, PlatformBillingAdjustment),
+    handler: async (request) => {
+      const { id } = idParam.parse(request.params);
+      const { reason } = motivo.parse(request.body);
+      return ajustes.cancelar(id, reason, request.platform!.userId);
+    },
+  });
+
+  /** El IVA de las facturas: el de hoy (apagado mientras nadie lo anuncie), lo anunciado y los datos de GymFlow como emisor. */
+  route(app, {
+    method: 'GET',
+    url: '/platform/tax',
+    security: { kind: 'platform' },
+    schema: respuesta(200, PlatformTax),
+    handler: async () => vigencias.iva(),
+  });
+
+  /** Qué pasaría al anunciar ese IVA: desde qué factura y a qué marcas les mueve el total. No guarda nada. */
+  route(app, {
+    method: 'POST',
+    url: '/platform/tax/preview',
+    security: { kind: 'platform' },
+    schema: respuesta(200, PlatformPriceChangePreview),
+    handler: async (request) => {
+      const b = cuerpoDeIva.parse(request.body);
+      return vigencias.vistaPreviaDeIva({ rateBps: b.rateBps, included: b.included }, b.effectiveFrom);
+    },
+  });
+
+  /**
+   * Anunciar el IVA desde la factura de un mes. Si le sube (o le baja) el
+   * total a algún gimnasio, con un mes de aviso como cualquier cambio de precio
+   * (D-38), y cada uno recibe su aviso con las dos cifras. `included`: los
+   * precios ya lo traen dentro; el total no cambia y solo se desglosa.
+   */
+  route(app, {
+    method: 'PUT',
+    url: '/platform/tax',
+    security: { kind: 'platform' },
+    schema: respuesta(200, PlatformTaxScheduled),
+    handler: async (request) => {
+      const b = cuerpoDeIva.parse(request.body);
+      return vigencias.anunciarIva({ rateBps: b.rateBps, included: b.included }, platformActor(request), { effectiveFrom: b.effectiveFrom });
+    },
+  });
+
+  /** Cancelar un cambio de IVA que todavía no empieza. */
+  route(app, {
+    method: 'POST',
+    url: '/platform/tax/:id/cancel',
+    security: { kind: 'platform' },
+    schema: respuesta(200, PlatformTaxChange),
+    handler: async (request) => {
+      const { id } = idParam.parse(request.params);
+      const { reason } = motivo.parse(request.body);
+      return vigencias.cancelarIva(id, reason, platformActor(request));
+    },
+  });
+
   // ── Escalera de cobranza (D-37, bloque 3.11; ADR-046) ──────────────────────
 
   /** Quién se suspende y cuándo, a quién no se le puede suspender porque el aviso no le ha llegado, y los avisos por mandar. */
@@ -751,9 +864,15 @@ export function registerTenantRoutes(app: FastifyInstance, env: Env): void {
       const { id } = idParam.parse(request.params);
       const f = await cobro.factura(id);
       if (!f) throw notFound('Factura no encontrada');
-      const marca = await repo.marca(f.organizationId);
+      const [marca, marcaFiscal] = await Promise.all([repo.marca(f.organizationId), new PlatformBillingRepository().organization(f.organizationId)]);
       // El estado del servicio, para ofrecer «Reanudar» al registrar el pago (D-37).
-      return { ...f, organization: marca ? { tradeName: marca.tradeName, legalName: marca.legalName, serviceStatus: marca.serviceStatus, suspendedAutomatically: marca.suspendedAutomatically } : null };
+      // Los datos fiscales de la factura son los congelados al emitir (`receiver`, `issuer`); en una anterior a D-39, los de hoy.
+      return {
+        ...f,
+        organization: marca ? { tradeName: marca.tradeName, legalName: marca.legalName, serviceStatus: marca.serviceStatus, suspendedAutomatically: marca.suspendedAutomatically } : null,
+        receiver: f.receiver ?? (marca ? { legalName: marca.legalName, rfc: marcaFiscal?.rfc ?? null, tradeName: marca.tradeName } : null),
+        issuer: f.issuer ?? emisor(),
+      };
     },
   });
 

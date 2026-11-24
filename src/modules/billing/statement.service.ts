@@ -43,7 +43,9 @@ export class StatementService {
 
   async statement(ctx: RequestContext, memberId: string, limit: number): Promise<EstadoDeCuenta> {
     const orgId = ctx.tenant.organizationId;
-    const member = await new MemberRepository(orgId).findById(memberId);
+    // También el de un socio dado de baja (D-12; bloque 4.11): lo que debe se queda en su
+    // estado de cuenta, y sin poder leerlo nadie sabría qué cobrarle.
+    const member = await new MemberRepository(orgId).findByIdIncludingArchived(memberId);
     if (!member) throw notFound('Socio no encontrado');
 
     const lectura = new StatementRepository(orgId);
@@ -94,7 +96,7 @@ export class StatementService {
 
   /** Para las páginas siguientes: el socio tiene que existir en ESTE gimnasio. */
   async assertMember(orgId: string, memberId: string): Promise<void> {
-    if (!await new MemberRepository(orgId).findById(memberId)) throw notFound('Socio no encontrado');
+    if (!await new MemberRepository(orgId).findByIdIncludingArchived(memberId)) throw notFound('Socio no encontrado');
   }
 
   private async conDetalle(lectura: StatementRepository, cargos: readonly ChargeRecord[]): Promise<StatementChargesPage['items']> {

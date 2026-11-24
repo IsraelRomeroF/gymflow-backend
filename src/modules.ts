@@ -22,6 +22,7 @@ import { registerClassRoutes, CLASS_JOBS, registerClassHooks } from './modules/c
 import { registerPaymentRoutes, PAYMENT_JOBS } from './modules/payments/index.js';
 import { registerTrainingRoutes } from './modules/training/index.js';
 import { registerImportRoutes } from './modules/imports/index.js';
+import { registerAlertRoutes, ALERT_JOBS } from './modules/alerts/index.js';
 import { registerHealthRoutes } from './platform/http/health.routes.js';
 import { registerAuditRoutes } from './platform/audit/audit.routes.js';
 import { AUDIT_JOBS } from './platform/audit/audit.jobs.js';
@@ -104,4 +105,6 @@ export const BACKEND_MODULES: readonly BackendModule[] = [
   { name: 'outbound', module: 'core', register: (app) => { registerOutboundHooks(); registerOutboundRoutes(app); }, jobs: OUTBOUND_JOBS },
   { name: 'privacy', module: 'core', register: (app) => registerPrivacyRoutes(app), jobs: PRIVACY_JOBS },
   { name: 'imports', module: 'core', register: (app) => registerImportRoutes(app) },
+  // Avisos al teléfono de la dueña y resumen del lunes (D-05, bloque 4.2). Solo lee de los demás; nadie depende de él.
+  { name: 'alerts', module: 'core', register: (app) => registerAlertRoutes(app), jobs: ALERT_JOBS },
 ];

@@ -154,6 +154,18 @@ export function registerExpenseRoutes(app: FastifyInstance): void {
       if (!g) throw notFound('Gasto no encontrado');
       request.authorize('expenses:manage', { reason, branchId: g.branchId });
 
+      // Bloque 4.11: un «Retiro del dueño» que salió de una caja (4.3) movió efectivo. Anularlo aquí borraría la
+      // anotación y dejaría el cajón como está: el efectivo no vuelve solo. No se anula (ni como ajuste de un mes
+      // cerrado); se dice dónde se corrige.
+      const cajon = g.voidedAt ? null : await repo.salioDelCajon(id);
+      if (cajon) {
+        throw conflict(
+          `Este retiro salió del cajón de ${cajon.registerName} (turno del ${isoDate(cajon.businessDate).split('-').reverse().join('/')}): anularlo aquí no regresaría el efectivo. `
+          + 'Si el dinero volvió al cajón o el retiro se capturó por error, la gerencia lo corrige en Caja con una «Corrección» (lleva la autorización de la dueña); la anotación del retiro se queda como está.',
+          'EXPENSE_FROM_CASH',
+        );
+      }
+
       const cierre = await new MonthlyCloseRepository(orgId).find(g.periodMonth);
       if (!cierre) {
         await enUnaTransaccion(async () => {

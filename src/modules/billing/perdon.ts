@@ -70,7 +70,7 @@ export async function condonarAdeudo(svc: BillingService, ctx: RequestContext, i
 }): Promise<{ charges: Array<{ charge: ChargeRecord; forgivenCents: bigint }>; forgivenCents: bigint }> {
   const orgId = ctx.tenant.organizationId;
   return enUnidadDeDinero(orgId, async () => {
-    if (!await new MemberRepository(orgId).findById(input.memberId)) throw notFound('Socio no encontrado');
+    if (!await new MemberRepository(orgId).findByIdIncludingArchived(input.memberId)) throw notFound('Socio no encontrado');
     const abiertos = await cargosConDeuda(orgId, input.memberId, input.membershipId);
     if (abiertos.length === 0) throw conflict('No debe nada: no hay adeudo que perdonar', 'NO_DEBT');
     const hechos: Array<{ charge: ChargeRecord; forgivenCents: bigint }> = [];

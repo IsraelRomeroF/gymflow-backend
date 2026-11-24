@@ -24,7 +24,8 @@ export function registerGymAccountRoutes(app: FastifyInstance): void {
 
   const vacia = (): GymflowAccount => ({
     visible: false, serviceStatus: 'ACTIVE', status: { code: 'SIN_COBRO', overdueDays: 0, pendingCents: '0' }, suspendsOn: null, suspendsAfterDays: DIAS_PARA_SUSPENDER,
-    monthly: { lines: [], totalCents: '0' }, upcoming: null, invoices: [], notices: [],
+    monthly: { lines: [], subtotalCents: '0', taxCents: '0', taxRateBps: 0, taxIncluded: false, totalCents: '0', discount: null }, upcoming: null, invoices: [],
+    fiscal: { receiver: { legalName: '', rfc: null }, issuer: null }, notices: [],
   });
 
   route(app, {
@@ -41,12 +42,20 @@ export function registerGymAccountRoutes(app: FastifyInstance): void {
         serviceStatus: resumen.serviceStatus as GymflowAccount['serviceStatus'],
         status: resumen.status,
         suspendsOn: suya.collections.suspendsOn, suspendsAfterDays: DIAS_PARA_SUSPENDER,
-        monthly: { lines: resumen.monthly.lines, totalCents: resumen.monthly.totalCents },
+        // D-39: la mensualidad con su renglón de descuento, el subtotal, el IVA y el total.
+        monthly: {
+          lines: resumen.monthly.lines, subtotalCents: resumen.monthly.subtotalCents, taxCents: resumen.monthly.taxCents, taxRateBps: resumen.monthly.taxRateBps,
+          taxIncluded: resumen.monthly.taxIncluded, totalCents: resumen.monthly.totalCents,
+          discount: resumen.monthly.discount ? { label: resumen.monthly.discount.label, lastMonth: resumen.monthly.discount.lastMonth } : null,
+        },
         upcoming: resumen.upcoming ? { effectiveFrom: resumen.upcoming.effectiveFrom, totalCents: resumen.upcoming.totalCents } : null,
         // Las anuladas no son cosa del dueño: solo lo que se le cobró o se le cobra.
         invoices: resumen.invoices.filter((f) => f.state !== 'ANULADA').slice(0, 12).map((f) => ({
           id: f.id, folio: f.folio, periodStart: f.periodStart, dueDate: f.dueDate, totalCents: f.totalCents, balanceCents: f.balanceCents, state: f.state, overdueDays: f.overdueDays,
+          lines: f.lines, itemized: f.itemized, subtotalCents: f.subtotalCents, taxCents: f.taxCents, taxRateBps: f.taxRateBps, taxIncluded: f.taxIncluded,
         })),
+        // A nombre de quién salen (su ficha) y quién las emite y cómo se pagan (configuración de GymFlow).
+        fiscal: { receiver: { legalName: resumen.fiscal.receiver.legalName, rfc: resumen.fiscal.receiver.rfc }, issuer: resumen.fiscal.issuer },
         notices: abiertos.map((a) => ({ id: a.id, kind: a.kind as GymflowAccount['notices'][number]['kind'], title: a.title, body: a.body, noticeOn: a.noticeOn.toISOString().slice(0, 10), seen: a.seenAt !== null })),
       };
     },

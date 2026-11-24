@@ -163,7 +163,7 @@ export class PortalService {
       organizationId: canje.organizationId,
       memberId: canje.memberId,
       tokenHash: hashToken(token),
-      // D-04: nace con lo que aguanta sin abrirse y se corre con el uso (`findSession`). `SESSION_TTL_MEMBER_DAYS` ya no se lee.
+      // D-04: nace con lo que aguanta sin abrirse y se corre con el uso (`findSession`). (La variable `SESSION_TTL_MEMBER_DAYS` se retiró en 4.11: un `.env` que todavía la traiga no estorba, se ignora.)
       ttlDays: MEMBER_IDLE_DAYS,
       userAgent: input.userAgent,
     });
@@ -409,16 +409,19 @@ export class PortalService {
     const pago = await pagos.findById(paymentId);
     if (!pago || pago.memberId !== memberId || !tieneComprobante(pago.status)) throw notFound('Ese pago no tiene comprobante');
     const cargos = new ChargeRepository(organizationId);
-    const [socio, org, sedes, asignaciones] = await Promise.all([
+    const [socio, org, sedes, asignaciones, gym] = await Promise.all([
       new MemberRepository(organizationId).findById(memberId),
       new OrganizationRepository(organizationId).current(),
       new BranchRepository(organizationId).list(),
       pagos.listAllocations(paymentId),
+      // Logo, leyenda, teléfonos y RFC: lo que ya imprime el recibo del mostrador (D-27; bloque 4.11).
+      new OrganizationRepository(organizationId).paraElRecibo(),
     ]);
     if (!socio) throw notFound('Socio no encontrado');
     const tocados = await Promise.all(asignaciones.map((a) => cargos.findById(a.chargeId)));
     return {
       priceNotice: await this.avisoDePrecio(organizationId, pago, tocados),
+      gym,
       gymName: org?.tradeName ?? '',
       branchName: pago.branchId ? sedes.find((b) => b.id === pago.branchId)?.name ?? null : null,
       memberName: `${socio.firstName} ${socio.lastName}`,

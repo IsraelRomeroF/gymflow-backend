@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { makeApp, loginAs, PASSWORD, correoUnico, loginPlataforma } from './helpers.js';
-import { cancelarCambiosAnunciados, ponerPrecios } from './precios-de-prueba.js';
+import { cancelarCambiosAnunciados, liberadaElDiaUno, ponerPrecios } from './precios-de-prueba.js';
 import { closeDb, getDb } from '../src/platform/db/client.js';
 
 /**
@@ -209,6 +209,8 @@ describe('alta de marcas desde la plataforma', () => {
     const emitirEl = () => app.inject({ method: 'POST', url: `/platform/organizations/${orgId}/invoices`, headers: { cookie: plataforma }, payload: { month: mes } });
     expect((await emitirEl()).statusCode).toBe(409);
     expect((await app.inject({ method: 'POST', url: `/platform/organizations/${orgId}/service`, headers: { cookie: plataforma }, payload: { status: 'ACTIVE', reason: 'Prueba' } })).statusCode).toBe(200);
+    // D-39 (bloque 4.9): el primer mes se cobra por días; aquí se prueba el mes completo.
+    await liberadaElDiaUno(orgId);
 
     // La primera se emite y se anula: el mes queda libre para emitir otra.
     const primera = await emitirEl();

@@ -97,7 +97,7 @@ for (const g of gimnasios) {
   console.log(`   · de membresías que YA terminaron tras ${t.lostDebtDays} días suspendidas (atraso): ${pesos(yaTerminadas.reduce((a, c) => a + c.balanceCents, 0n))} en ${yaTerminadas.length} cargo(s)`);
   console.log(`   · de ${porTerminar.length} suspendida(s) que cumplen el plazo hoy y terminan: ${pesos(deHoy.reduce((a, c) => a + c.balanceCents, 0n))} en ${deHoy.length} cargo(s)`);
   console.log(`   «Por cobrar» hoy: ${pesos(cartera.totalOutstandingCents)} (${cartera.membersWithDebt} socios). Ya dada por perdida antes: ${pesos(yaPerdida.lostCents)} (${yaPerdida.lostMembers} socios).`);
-  console.log('   Nota: la cartera no cuenta a los socios dados de baja en su ficha; lo perdido de ellos tampoco se suma en el Tablero, pero sí queda marcado en su estado de cuenta.');
+  // 4.11 (edición puntual): la cartera ya cuenta también a los socios dados de baja en su ficha (D-12); ver `cartera-bajas-estado.ts`.
   console.log('   Nada se borra ni se condona: cada cargo conserva su saldo, sigue en el estado de cuenta del socio y se puede cobrar.');
 
   // 3. Bajas por plazo (para la decisión de la conservación, D-32).

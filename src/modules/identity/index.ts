@@ -25,6 +25,11 @@ export { UserRepository } from './user.repository.js';
 export { AuthUserRepository } from './user.repository.js';
 export { GrantRepository } from './role.repository.js';
 export { PushService } from './push.service.js';
+// Consumidas por: alerts (avisos a la dueña, bloque 4.2). Qué apagó cada quien en su teléfono
+// y en cuántos equipos tiene activos los avisos.
+export type { PushPayload } from './push.service.js';
+export { PushPreferenceRepository } from './push-preference.repository.js';
+export { PushSubscriptionRepository } from './push-subscription.repository.js';
 export type { AuthService } from './auth.service.js';
 
 // Consumida por: members. Los coaches del gimnasio, para asignar el de un socio.

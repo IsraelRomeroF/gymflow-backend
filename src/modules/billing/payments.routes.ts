@@ -161,7 +161,8 @@ export function registerPaymentsRoutes(app: FastifyInstance): void {
       const { id } = idParam.parse(request.params);
       const body = z.object({ branchId: z.string().uuid() }).parse(request.body);
       request.authorize('payments:record', { branchId: body.branchId });
-      if (!await new MemberRepository(orgId).findById(id)) throw notFound('Socio no encontrado');
+      // También a un socio dado de baja (D-12; bloque 4.11): su saldo a favor paga lo que quedó debiendo.
+      if (!await new MemberRepository(orgId).findByIdIncludingArchived(id)) throw notFound('Socio no encontrado');
 
       const aplicado = await service.applyCredit(ctx, id, { branchId: body.branchId });
       const [estado, credito, deuda] = await Promise.all([

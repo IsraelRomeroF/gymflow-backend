@@ -48,7 +48,9 @@ const TOPES: Record<string, number> = {
   'GET /organization/setup': 16,
   // Tope FIJO desde el bloque 2.11 (22-15): antes hacía de 2 a 6 consultas por marca
   // (de 59 a 143 con 24 marcas) y su tope era por marca. Ahora carga todo de una vez.
-  'GET /platform/organizations': 22,
+  // De 22 a 24 en el bloque 4.9 (D-39): la mensualidad de cada marca necesita además el IVA con su fecha y los descuentos
+  // vivos. Son DOS consultas para todas las marcas (se cargan junto con los precios), no por marca: sigue siendo fijo.
+  'GET /platform/organizations': 24,
   'GET /platform/organizations/:id': 14,
   'POST /members/:id/payments (CASH 100)': 32,
 };

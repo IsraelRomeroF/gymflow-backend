@@ -5,12 +5,13 @@ import {
 } from '@gymflow/core';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { systemContext } from '../../platform/jobs/types.js';
-import { forgetModules } from '../../platform/modules/module-state.js';
+import { forgetModules, moduleViewOf } from '../../platform/modules/module-state.js';
 import { ModuleStateRepository } from '../../platform/modules/module-state.repository.js';
 import { TenantRepository, yaTieneDueno, type Cuenta } from './tenant.repository.js';
 import { validarPuesto } from '../../platform/roles/puestos.js';
 import { PlatformPlanRepository, type PlanDePlataforma } from './platform-plan.repository.js';
 import { hoyDeCobro } from './cobro-reglas.js';
+import { PlatformInvoiceRulesRepository } from './factura.repository.js';
 
 /**
  * La VERSIÓN del plan que una marca recibe al contratarlo (D-38, bloque 3.11):
@@ -219,7 +220,10 @@ export class TenantService {
     const def = MODULE_BY_KEY.get(moduleKey);
     if (!def) throw notFound('Módulo no encontrado');
     if (def.kind !== 'optional') throw validation(`${def.name} es parte de lo básico: va con el software`);
+    // D-39 (bloque 4.9): un módulo que la marca NO tenía y se contrata hoy cuenta desde hoy: sus días de este mes se cobran por días.
+    const loTenia = (await moduleViewOf(organizationId)).contracted(moduleKey);
     await new ModuleStateRepository(organizationId).setEntitlement(moduleKey, granted, byUserId, reason);
+    if (!granted || !loTenia) await new PlatformInvoiceRulesRepository().marcarContratadoDesde(organizationId, moduleKey, granted ? hoyDeCobro() : null);
     forgetModules(organizationId);
     await this.audit.record(systemContext(organizationId), {
       action: granted ? 'platform.module.grant' : 'platform.module.revoke',

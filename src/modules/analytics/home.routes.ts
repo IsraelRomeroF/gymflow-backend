@@ -12,6 +12,7 @@ import { RetentionService } from '../retention/index.js';
 import { ProspectRepository } from '../prospects/index.js';
 import { ContactChangeRepository } from '../members/index.js';
 import { CashAlertsService } from '../cash/index.js';
+import { propuestasDelMes } from '../finance/index.js';
 import { medianoche } from './pulse.service.js';
 import { HomeRepository } from './home.repository.js';
 
@@ -121,6 +122,15 @@ export function registerHomeRoutes(app: FastifyInstance): void {
           const r = await new ContactChangeRepository(orgId).pendientesPorSede(
             sedesCon('members:portal:invite', 'member_portal'), request.holds('members:portal:invite', null) && modulos.org.has('member_portal'));
           return renglon(r.total, r.compartidos > 0 ? 'warn' : 'info', { detail: r.nombres });
+        },
+        // D-26 (4.11): gastos que se repiten y ya tocaban este mes, sin confirmar ni descartar. Para quien anota
+        // gastos, en sus sedes; la nómina por persona solo cuenta para quien puede verla (la misma regla que Movimientos).
+        expenses: async () => {
+          const sedes = request.branchScope('expenses:manage');
+          if (sedes !== null && sedes.length === 0) return null;
+          const nomina = request.branchScope('expenses:payroll:read');
+          const mes = (await calendario.today(null)).toISOString().slice(0, 7);
+          return renglon((await propuestasDelMes(orgId, mes, sedes, nomina === null || nomina.length > 0)).pending, 'info');
         },
         // La misma cuenta que la bandeja de interesados (2.4): los que tocan hoy más los que nadie ha contactado.
         prospects: async () => {

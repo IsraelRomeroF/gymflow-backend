@@ -97,6 +97,26 @@ export class ResponsibleRepository extends TenantRepository {
     return count;
   }
 
+  /**
+   * El otro lado de `soltarA` (bloque 4.11): ese socio tenía anotado como
+   * responsable a OTRO SOCIO y ya no tiene su mismo celular. Se queda sin
+   * responsable. No toca a quien tiene anotado a un adulto, a su tutor (D-10) o
+   * a sí mismo: eso no depende de compartir el número con una ficha.
+   */
+  async soltarSiYaNoComparte(memberId: string): Promise<boolean> {
+    const yo = await this.db.member.findFirst({
+      where: this.scope({ id: memberId, responsibleKind: 'MEMBER', guardianSignedAt: null }), select: { phoneE164: true, responsibleMemberId: true },
+    });
+    if (!yo?.responsibleMemberId) return false;
+    const el = await this.db.member.findFirst({ where: this.scope({ id: yo.responsibleMemberId, deletedAt: null }), select: { phoneE164: true } });
+    if (el?.phoneE164 && el.phoneE164 === yo.phoneE164) return false;
+    const { count } = await this.db.member.updateMany({
+      where: this.scope({ id: memberId, responsibleKind: 'MEMBER', responsibleMemberId: yo.responsibleMemberId }),
+      data: { responsibleKind: null, responsibleMemberId: null },
+    });
+    return count > 0;
+  }
+
   async nombres(ids: readonly string[]): Promise<Map<string, { fullName: string; memberCode: string; anonymized: boolean }>> {
     if (ids.length === 0) return new Map();
     const rows = await this.db.member.findMany({

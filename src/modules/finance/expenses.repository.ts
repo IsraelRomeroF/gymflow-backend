@@ -69,6 +69,22 @@ export class ExpensesRepository extends TenantRepository {
     return this.db.operatingExpense.findFirst({ where: this.scope({ id }), select: SELECT });
   }
 
+  /**
+   * ¿Ese gasto salió del cajón? (bloque 4.11). Un «Retiro del dueño» registrado desde Caja (4.3) trae su
+   * movimiento de efectivo (`cash_movements.expenseId`): de qué caja y de qué día de operación.
+   */
+  async salioDelCajon(id: string): Promise<{ registerName: string; businessDate: Date; sessionOpen: boolean } | null> {
+    const filas = await this.db.$queryRaw<Array<{ registerName: string; businessDate: Date; status: string }>>`
+      SELECT r."name" AS "registerName", s."businessDate", s."status"::text AS "status"
+        FROM "cash_movements" mv
+        JOIN "cash_sessions" s ON s."id" = mv."cashSessionId" AND s."organizationId" = mv."organizationId"
+        JOIN "cash_registers" r ON r."id" = s."cashRegisterId"
+       WHERE mv."organizationId" = ${this.organizationId}::uuid AND mv."expenseId" = ${id}::uuid
+       LIMIT 1`;
+    const f = filas[0];
+    return f ? { registerName: f.registerName, businessDate: f.businessDate, sessionOpen: f.status === 'OPEN' } : null;
+  }
+
   async void(id: string, byUserId: string, reason: string): Promise<boolean> {
     const { count } = await this.db.operatingExpense.updateMany({
       where: this.scope({ id, voidedAt: null }),

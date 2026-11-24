@@ -81,6 +81,12 @@ export const ORDEN_FRECUENTE: readonly string[] = [
   'class.release-unpaid-holds',
   'class.close-finished',
   'approvals.expire-forgotten',
+  // D-05 (bloque 4.2): los avisos al teléfono de la dueña. Al final, para que vean lo que esta misma
+  // corrida cerró o dejó vencer; y dentro del cierre diario corren después de los diarios, así que
+  // la deuda que `billing.mark-lost-debt` acaba de marcar se avisa esa misma noche.
+  'audit.anomaly-scan',
+  // El resumen del lunes a las 7:00, hora del gimnasio: casi siempre no hace nada (uno por lunes).
+  'alerts.weekly-summary',
 ];
 
 /** Los de PLATAFORMA: una vez por corrida, fuera del bucle por gimnasio (23-12). */

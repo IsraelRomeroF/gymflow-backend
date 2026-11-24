@@ -125,21 +125,6 @@ export class SessionRepository extends GlobalRepository {
   }
 
   /**
-   * Con TOPE ABSOLUTO desde que se inició sesión (SEC-11): una sesión robada
-   * y usada a diario vivía para siempre. El vencimiento ya no se corre con el
-   * uso (24-04); aquí queda además el techo de 16 h para cualquier sesión.
-   */
-  async findValidByTokenHash(tokenHash: string): Promise<SessionRecord | null> {
-    return this.db.session.findFirst({
-      where: {
-        tokenHash, revokedAt: null, expiresAt: { gt: new Date() },
-        createdAt: { gt: new Date(Date.now() - STAFF_MAX_SESSION_HOURS * 3_600_000) },
-      },
-      select: { id: true, userId: true, organizationId: true, activeBranchId: true, expiresAt: true },
-    });
-  }
-
-  /**
    * Todo lo que una petición necesita para saber quién llama, en UNA consulta:
    * la sesión, su usuario, sus permisos y sus topes (OPT3-03). Antes eran
    * cuatro consultas por petición, y pesaban más que la consulta útil de casi

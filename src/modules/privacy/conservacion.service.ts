@@ -493,7 +493,8 @@ export class ConservacionService {
       await new PushService().sendToUsers(organizationId, firmantes, {
         title: 'Lista de exsocios por anonimizar',
         body: `${cuantos === 1 ? 'Un exsocio cumplió' : `${cuantos} exsocios cumplieron`} el plazo de conservación. Revisa la lista y fírmala: sin tu firma no se borra nada.`,
-        url: '/autorizaciones', tag: `conservacion-${period}`,
+        // D-05 (bloque 4.2, edición puntual): quien apagó este aviso en su teléfono no lo recibe; la lista sale igual en su Inicio.
+        url: '/autorizaciones', tag: `conservacion-${period}`, kind: 'EXMEMBERS_LIST',
       });
     } catch { /* el aviso es un extra: la lista ya quedó armada */ }
   }

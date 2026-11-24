@@ -31,7 +31,8 @@ export function registerPerdonRoutes(app: FastifyInstance): void {
       const orgId = request.ctx!.tenant.organizationId;
       const { id } = idParam.parse(request.params);
       const { membershipId } = z.object({ membershipId: z.string().uuid().optional() }).parse(request.query);
-      const socio = await new MemberRepository(orgId).findById(id);
+      // También de un socio dado de baja (D-12; bloque 4.11): lo que quedó debiendo se perdona con monto, no desaparece.
+      const socio = await new MemberRepository(orgId).findByIdIncludingArchived(id);
       if (!socio) throw notFound('Socio no encontrado');
       // Como el estado de cuenta: el expediente del socio es uno en todo el gimnasio (se le cobra en cualquier sede).
       const [abiertos, credito, tope] = await Promise.all([
@@ -70,7 +71,8 @@ export function registerPerdonRoutes(app: FastifyInstance): void {
         reason: z.string().min(3).max(300),
         approvalToken: z.string().min(20).max(200).optional(),
       }).parse(request.body);
-      const socio = await new MemberRepository(orgId).findById(id);
+      // También de un socio dado de baja (D-12; bloque 4.11): lo que quedó debiendo se perdona con monto, no desaparece.
+      const socio = await new MemberRepository(orgId).findByIdIncludingArchived(id);
       if (!socio) throw notFound('Socio no encontrado');
 
       const abiertos = await cargosConDeuda(orgId, id, body.membershipId);

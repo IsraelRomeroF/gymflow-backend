@@ -7,6 +7,9 @@ import { ModuleStateRepository } from '../../platform/modules/module-state.repos
 import { hoyDeCobro } from './cobro-reglas.js';
 import { avisoDeCambioCancelado, avisoDeCambioDePrecio, primeraVigencia } from './cobranza-reglas.js';
 import { PlatformCollectionsService } from './cobranza.service.js';
+import { emisor } from './emisor.js';
+import { impuestoEn, type CambioDeIva } from './factura-reglas.js';
+import { PlatformInvoiceRulesRepository, type IvaGuardado } from './factura.repository.js';
 import { PlatformBillingRepository } from './platform-billing.repository.js';
 import { PlatformBillingService } from './platform-billing.service.js';
 import { PlatformNoticeRepository } from './platform-notice.repository.js';
@@ -31,6 +34,7 @@ export type VistaPreviaDeCambio = {
 };
 
 export type CambioJson = ReturnType<PlatformPricingService['serializar']>;
+export type IvaJson = ReturnType<PlatformPricingService['serializarIva']>;
 
 /**
  * CAMBIOS DE PRECIO Y DE PLAN CON UN MES DE AVISO (D-38, bloque 3.11).
@@ -47,6 +51,7 @@ export type CambioJson = ReturnType<PlatformPricingService['serializar']>;
 export class PlatformPricingService {
   private readonly repo = new PlatformBillingRepository();
   private readonly cambios = new PlatformPriceChangeRepository();
+  private readonly reglas = new PlatformInvoiceRulesRepository();
   private readonly planes = new PlatformPlanRepository();
   private readonly avisos = new PlatformNoticeRepository();
   private readonly cobro = new PlatformBillingService();
@@ -64,8 +69,13 @@ export class PlatformPricingService {
   }
 
   /** A qué marcas con contrato corriendo (en uso o suspendidas) les cambia la mensualidad de esa fecha con esos cambios encima. */
-  private async impacto(vigencias: Vigencias, hipoteticos: readonly CambioAnunciado[], fecha: string): Promise<Afectada[]> {
-    const [antes, despues] = await Promise.all([this.cobro.mensualidades(fecha, vigencias), this.cobro.mensualidades(fecha, vigencias.con(hipoteticos))]);
+  private impacto(vigencias: Vigencias, hipoteticos: readonly CambioAnunciado[], fecha: string): Promise<Afectada[]> {
+    return this.diferencia(vigencias, vigencias.con(hipoteticos), fecha);
+  }
+
+  /** Las marcas con contrato corriendo cuya mensualidad de esa fecha es distinta entre dos supuestos. */
+  private async diferencia(antesDe: Vigencias, despuesDe: Vigencias, fecha: string): Promise<Afectada[]> {
+    const [antes, despues] = await Promise.all([this.cobro.mensualidades(fecha, antesDe), this.cobro.mensualidades(fecha, despuesDe)]);
     const afectadas: Afectada[] = [];
     for (const [id, a] of antes) {
       const d = despues.get(id)!;
@@ -307,14 +317,19 @@ export class PlatformPricingService {
     const r = { created: 0, closed: 0 };
     if (fecha <= hoy) return r;
     const vigencias = await cargarVigencias();
-    const [actuales, futuras, abiertos] = await Promise.all([this.cobro.mensualidades(hoy, vigencias), this.cobro.mensualidades(fecha, vigencias), this.avisos.abiertosDeCambio(fecha)]);
+    // Ese mes CON lo anunciado y SIN ello (D-39): así un descuento que para entonces ya caducó no pasa por «cambio de precio»,
+    // y el aviso dice lo que mueve lo anunciado. Sin descuentos de por medio, «sin lo anunciado» es lo que la marca paga hoy.
+    const sinAnuncios = vigencias.sinLoAnunciado(hoy);
+    const [actuales, futuras, abiertos] = await Promise.all([this.cobro.mensualidades(fecha, sinAnuncios), this.cobro.mensualidades(fecha, vigencias), this.avisos.abiertosDeCambio(fecha)]);
+    const ivaAntes = sinAnuncios.impuestoEn(fecha); const ivaDespues = vigencias.impuestoEn(fecha);
+    const iva = ivaAntes.rateBps !== ivaDespues.rateBps || ivaAntes.included !== ivaDespues.included ? ivaDespues : null;
     for (const [id, a] of actuales) {
       if (a.marca.serviceStatus !== 'ACTIVE' && a.marca.serviceStatus !== 'SUSPENDED') continue;
       const f = futuras.get(id)!;
       const abierto = abiertos.find((x) => x.organizationId === id) ?? null;
       const llave = `${id}:${fecha}`;
       if (f.totalCents !== a.totalCents) {
-        const texto = avisoDeCambioDePrecio({ effectiveFrom: fecha, antesCents: a.totalCents, despuesCents: f.totalCents });
+        const texto = avisoDeCambioDePrecio({ effectiveFrom: fecha, antesCents: a.totalCents, despuesCents: f.totalCents, iva });
         if (abierto?.body === texto.body) continue;
         if (abierto) r.closed += await this.avisos.cerrar([abierto.id], 'SUPERSEDED', ahora);
         if (await this.cobranza.avisar({ organizationId: id, kind: 'PRICE_CHANGE', llave, texto, amountCents: f.totalCents }, ahora)) r.created += 1;
@@ -329,9 +344,120 @@ export class PlatformPricingService {
   /** La corrida diaria: aplica lo que ya llegó a su fecha y pone al día los avisos de lo que sigue anunciado. */
   async correr(ahora = new Date()): Promise<{ applied: number; organizations: number; notices: number; errors: Array<{ id: string; error: string }> }> {
     const aplicado = await this.aplicarVencidos(ahora);
+    const hoy = hoyDeCobro(ahora);
+    const iva = await this.reglas.ivaVigente();
+    await this.cerrarAvisosDeIva(ahora, iva);
     let notices = 0;
-    for (const fecha of new Set((await this.cambios.pendientes()).map((c) => iso(c.effectiveFrom)))) notices += (await this.reconciliarAvisos(fecha, ahora)).created;
+    const fechas = new Set([...(await this.cambios.pendientes()).map((c) => iso(c.effectiveFrom)), ...iva.filter((x) => x.effectiveFrom > hoy).map((x) => x.effectiveFrom)]);
+    for (const fecha of fechas) notices += (await this.reconciliarAvisos(fecha, ahora)).created;
     return { ...aplicado, notices };
+  }
+
+  // ── IVA de las facturas (D-39, bloque 4.9) ─────────────────────────────────
+
+  /** El IVA no «se aplica» (se lee al emitir): al llegar su fecha solo se cierran sus avisos, que ya son lo vigente. */
+  async cerrarAvisosDeIva(ahora = new Date(), iva?: readonly IvaGuardado[]): Promise<number> {
+    const hoy = hoyDeCobro(ahora);
+    let cerrados = 0;
+    for (const c of (iva ?? await this.reglas.ivaVigente()).filter((x) => x.effectiveFrom <= hoy)) {
+      const abiertos = await this.avisos.abiertosDeCambio(c.effectiveFrom);
+      if (abiertos.length > 0) cerrados += await this.avisos.cerrar(abiertos.map((a) => a.id), 'APPLIED', ahora);
+    }
+    return cerrados;
+  }
+
+  /**
+   * Desde qué factura puede empezar un cambio de IVA: si le mueve el total a
+   * alguna marca con contrato corriendo, con un mes de aviso, como cualquier
+   * cambio de precio (D-38); si no le mueve el total a nadie (los precios ya
+   * lo incluyen y solo se desglosa, o no hay marcas), desde la de este mes.
+   */
+  private async planDeIva(pedido: { rateBps: number; included: boolean }, effectiveFrom: string | undefined, hoy: string) {
+    if (!Number.isInteger(pedido.rateBps) || pedido.rateBps < 0 || pedido.rateBps > 5000) throw validation('La tasa del IVA va de 0 % a 50 %');
+    if (effectiveFrom !== undefined && !/^\d{4}-(0[1-9]|1[0-2])-01$/.test(effectiveFrom)) throw validation('El IVA empieza en una factura: elige el día 1 de un mes');
+    const mesActual = `${hoy.slice(0, 7)}-01`;
+    const minima = primeraVigencia(hoy);
+    const vigencias = await cargarVigencias();
+    const hipotetico = (fecha: string): CambioDeIva => ({ id: 'vista-previa', rateBps: pedido.rateBps, included: pedido.included && pedido.rateBps > 0, effectiveFrom: fecha, canceled: false });
+    // ¿A quién le mueve el total? Se mira en la fecha pedida (o en la primera con aviso).
+    const probar = effectiveFrom ?? minima;
+    const affected = await this.diferencia(vigencias, vigencias.conIva([hipotetico(probar)]), probar);
+    const immediate = affected.length === 0;
+    const fecha = effectiveFrom ?? (immediate ? mesActual : minima);
+    if (fecha < mesActual) throw validation('El IVA no puede empezar en un mes que ya pasó');
+    if (!immediate && fecha < minima) throw validation('Sumar o quitar el IVA le cambia el total a los gimnasios: se avisa con al menos un mes', undefined, 'PRICE_CHANGE_TOO_SOON');
+    return { vigencias, fecha, minima, mesActual, affected, immediate };
+  }
+
+  /** Qué pasaría al anunciar ese IVA: desde cuándo y a qué marcas les mueve el total. No guarda nada. */
+  async vistaPreviaDeIva(pedido: { rateBps: number; included: boolean }, effectiveFrom?: string, ahora = new Date()): Promise<VistaPreviaDeCambio> {
+    const p = await this.planDeIva(pedido, effectiveFrom, hoyDeCobro(ahora));
+    return { minEffectiveFrom: p.minima, effectiveFrom: p.fecha, immediate: p.immediate, affected: p.affected };
+  }
+
+  /**
+   * Anuncia el IVA de las facturas desde la de un mes. Nace APAGADO: mientras
+   * nadie anuncie nada aquí, ninguna factura lleva IVA. Un solo cambio
+   * pendiente a la vez. Las facturas ya emitidas no cambian nunca.
+   */
+  async anunciarIva(pedido: { rateBps: number; included: boolean }, actor: PlatformActor, opciones: { effectiveFrom?: string | undefined } = {}, ahora = new Date()): Promise<{ change: IvaJson; affected: number }> {
+    const hoy = hoyDeCobro(ahora);
+    const p = await this.planDeIva(pedido, opciones.effectiveFrom, hoy);
+    if (p.vigencias.ivaPendiente(hoy).length > 0) throw conflict('Ya hay un cambio de IVA anunciado: cancélalo antes de anunciar otro', 'TAX_CHANGE_PENDING');
+    const antes = p.vigencias.impuestoEn(p.fecha);
+    const included = pedido.included && pedido.rateBps > 0;
+    if (antes.rateBps === pedido.rateBps && antes.included === included) throw validation('Las facturas de ese mes ya llevan ese IVA: no hay nada que cambiar');
+    let creado: IvaGuardado;
+    try {
+      creado = await this.reglas.anunciarIva({ rateBps: pedido.rateBps, included, effectiveFrom: p.fecha, announcedOn: hoy, byUserId: actor.userId });
+    } catch (e) {
+      if ((e as { code?: unknown }).code === 'P2002') throw conflict('Ya hay un cambio de IVA para esa fecha: cancélalo antes de anunciar otro', 'TAX_CHANGE_PENDING');
+      throw e;
+    }
+    await this.cadena.record(actor, {
+      action: 'platform.tax.schedule', resourceType: 'PlatformTaxChange', resourceId: creado.id,
+      beforeState: { rateBps: antes.rateBps, included: antes.included },
+      afterState: { rateBps: creado.rateBps, included: creado.included, effectiveFrom: creado.effectiveFrom, announcedOn: hoy, organizationsAffected: p.affected.length },
+    });
+    await this.reconciliarAvisos(creado.effectiveFrom, ahora);
+    return { change: this.serializarIva(creado, [creado, ...p.vigencias.iva.map((c) => ({ ...c }))], hoy), affected: p.affected.length };
+  }
+
+  /** Cancela un cambio de IVA que todavía no empieza. A quien ya se le había avisado se le avisa que ya no aplica. */
+  async cancelarIva(id: string, reason: string, actor: PlatformActor, ahora = new Date()): Promise<IvaJson> {
+    const hoy = hoyDeCobro(ahora);
+    const c = await this.reglas.cambioDeIva(id);
+    if (!c) throw notFound('Cambio de IVA no encontrado');
+    if (!(await this.reglas.cancelarIva(id, actor.userId, reason, ahora, hoy))) {
+      throw conflict(c.canceled ? 'Ese cambio de IVA ya estaba cancelado' : 'Ese IVA ya empezó a aplicar: para quitarlo se anuncia otro cambio', 'TAX_CHANGE_CLOSED');
+    }
+    await this.cadena.record(actor, {
+      action: 'platform.tax.cancel', resourceType: 'PlatformTaxChange', resourceId: id, reason,
+      afterState: { rateBps: c.rateBps, included: c.included, effectiveFrom: c.effectiveFrom },
+    });
+    await this.reconciliarAvisos(c.effectiveFrom, ahora);
+    const todos = await this.reglas.ivaReciente();
+    return this.serializarIva(todos.find((x) => x.id === id)!, todos, hoy);
+  }
+
+  /** El IVA de hoy, lo anunciado, la historia y si el emisor está configurado. */
+  async iva(ahora = new Date()) {
+    const hoy = hoyDeCobro(ahora);
+    const todos = await this.reglas.ivaReciente();
+    const actual = impuestoEn(todos, hoy);
+    const cambios = todos.map((c) => this.serializarIva(c, todos, hoy));
+    return {
+      current: { rateBps: actual.rateBps, included: actual.included },
+      pending: cambios.filter((c) => c.status === 'PENDING').sort((a, b) => a.effectiveFrom.localeCompare(b.effectiveFrom))[0] ?? null,
+      minEffectiveFrom: primeraVigencia(hoy), currentMonth: `${hoy.slice(0, 7)}-01`, changes: cambios, issuer: emisor(),
+    };
+  }
+
+  serializarIva(c: IvaGuardado, todos: ReadonlyArray<Pick<CambioDeIva, 'id' | 'effectiveFrom' | 'canceled'>>, hoy: string) {
+    // Vigente = el vivo más reciente que ya empezó; los vivos anteriores a ese quedaron sustituidos.
+    const empezados = todos.filter((x) => !x.canceled && x.effectiveFrom <= hoy).sort((a, b) => a.effectiveFrom.localeCompare(b.effectiveFrom));
+    const status: 'PENDING' | 'ACTIVE' | 'REPLACED' | 'CANCELED' = c.canceled ? 'CANCELED' : c.effectiveFrom > hoy ? 'PENDING' : empezados.at(-1)?.id === c.id ? 'ACTIVE' : 'REPLACED';
+    return { id: c.id, rateBps: c.rateBps, included: c.included, effectiveFrom: c.effectiveFrom, announcedOn: c.announcedOn, status, cancelReason: c.cancelReason };
   }
 
   // ── Leer ───────────────────────────────────────────────────────────────────

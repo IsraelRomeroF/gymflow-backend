@@ -32,3 +32,7 @@ export { MonthlyCloseService } from './monthly-close.service.js';
 // Consumida por: analytics. El Tablero y Movimientos dicen si el mes ya está
 // cerrado y, si lo está, sirven sus cifras desde la foto (D-22).
 export { MonthlyCloseRepository } from './monthly-close.repository.js';
+
+// Consumida por: analytics (`/me/home`, bloque 4.11). Cuántos gastos que se
+// repiten siguen «por confirmar» en un mes, para las sedes de quien mira.
+export { propuestasDelMes } from './propuestas.js';

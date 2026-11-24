@@ -1,4 +1,6 @@
 import { valorEn, type CambioDeValor } from './cobranza-reglas.js';
+import { ajusteDe, impuestoEn, type Ajuste, type CambioDeIva, type Impuesto } from './factura-reglas.js';
+import { PlatformInvoiceRulesRepository } from './factura.repository.js';
 import { PlatformBillingRepository } from './platform-billing.repository.js';
 import { PlatformPriceChangeRepository, versionDePlan, type CambioAnunciado, type ValorDePlan } from './platform-price-change.repository.js';
 import type { PlanDePlataforma } from './platform-plan.repository.js';
@@ -16,16 +18,55 @@ export type PlanVigente = Pick<PlanDePlataforma, 'id' | 'name' | 'modules' | 'mo
  * vez por operación.
  */
 export class Vigencias {
-  constructor(private readonly precios: ReadonlyMap<string, bigint>, readonly cambios: readonly CambioAnunciado[]) {}
+  constructor(
+    private readonly precios: ReadonlyMap<string, bigint>, readonly cambios: readonly CambioAnunciado[],
+    /** D-39 (bloque 4.9): el IVA con su fecha de inicio y los descuentos vivos de cada marca. Sin ellos, ni IVA ni descuentos. */
+    readonly iva: readonly CambioDeIva[] = [], private readonly ajustes: ReadonlyMap<string, readonly Ajuste[]> = new Map(),
+  ) {}
 
   /** Lo mismo, con cambios hipotéticos encima (la vista previa de un cambio que todavía no se anuncia). */
   con(extra: readonly CambioAnunciado[]): Vigencias {
-    return new Vigencias(this.precios, [...this.cambios, ...extra]);
+    return new Vigencias(this.precios, [...this.cambios, ...extra], this.iva, this.ajustes);
   }
 
   /** Lo mismo, sin un cambio (la vista previa de cancelarlo). */
   sin(id: string): Vigencias {
-    return new Vigencias(this.precios, this.cambios.filter((c) => c.id !== id));
+    return new Vigencias(this.precios, this.cambios.filter((c) => c.id !== id), this.iva, this.ajustes);
+  }
+
+  /** Lo mismo, con un cambio de IVA hipotético encima (la vista previa de anunciarlo). */
+  conIva(extra: readonly CambioDeIva[]): Vigencias {
+    return new Vigencias(this.precios, this.cambios, [...this.iva, ...extra], this.ajustes);
+  }
+
+  /**
+   * Lo mismo, como si NADA de lo anunciado para después de `hoy` fuera a
+   * aplicar (ni precios, ni planes, ni IVA). Comparar un mes futuro «con» y
+   * «sin» dice cuánto le mueve la mensualidad lo anunciado, sin mezclarlo con
+   * un descuento que para entonces ya caducó.
+   */
+  sinLoAnunciado(hoy: string): Vigencias {
+    return new Vigencias(this.precios, this.cambios.filter((c) => c.appliedAt !== null || iso(c.effectiveFrom) <= hoy), this.iva.filter((c) => c.effectiveFrom <= hoy), this.ajustes);
+  }
+
+  /** El IVA que lleva la factura del mes de ese día (D-39). Sin nada anunciado, ninguno. */
+  impuestoEn(dia: string): Impuesto {
+    return impuestoEn(this.iva, dia);
+  }
+
+  /** Los cambios de IVA que todavía no empiezan. */
+  ivaPendiente(hoy: string): CambioDeIva[] {
+    return this.iva.filter((c) => !c.canceled && c.effectiveFrom > hoy);
+  }
+
+  /** Los descuentos o precios especiales vivos de una marca. */
+  ajustesDe(organizationId: string): readonly Ajuste[] {
+    return this.ajustes.get(organizationId) ?? [];
+  }
+
+  /** El descuento o precio especial que lleva la factura de la marca en el mes de ese día, si tiene. */
+  ajusteEn(organizationId: string, dia: string): Ajuste | null {
+    return ajusteDe(this.ajustesDe(organizationId), dia);
   }
 
   /** Los precios sueltos que valen ese día. */
@@ -82,6 +123,7 @@ export class Vigencias {
 }
 
 export async function cargarVigencias(): Promise<Vigencias> {
-  const [precios, cambios] = await Promise.all([new PlatformBillingRepository().prices(), new PlatformPriceChangeRepository().vigentes()]);
-  return new Vigencias(precios, cambios);
+  const reglas = new PlatformInvoiceRulesRepository();
+  const [precios, cambios, iva, ajustes] = await Promise.all([new PlatformBillingRepository().prices(), new PlatformPriceChangeRepository().vigentes(), reglas.ivaVigente(), reglas.ajustesVivos()]);
+  return new Vigencias(precios, cambios, iva, ajustes);
 }

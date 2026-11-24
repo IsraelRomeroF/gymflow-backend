@@ -447,6 +447,7 @@ export function registerPortalRoutes(app: FastifyInstance, env: Env): void {
         lines: r.lines.map((l) => ({ concept: l.concept, amountCents: cents(l.amountCents) })),
         // El aviso del cambio de precio de su plan (D-19), el mismo del comprobante del mostrador.
         priceNotice: r.priceNotice && { kind: r.priceNotice.kind, planName: r.priceNotice.planName, fromPriceCents: cents(r.priceNotice.fromPriceCents), toPriceCents: cents(r.priceNotice.toPriceCents) },
+        gym: r.gym,
       };
     },
   });

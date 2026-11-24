@@ -217,16 +217,20 @@ export async function cambiarContactoPropio(ctx: RequestContext, memberId: strin
   }
 
   // ── Tope por periodo ───────────────────────────────────────────────────────
-  const uso = await usoDe(orgId, memberId, ahora);
-  for (const llave of new Set(cambios.map((c) => limiteDe(c.field)))) {
-    const l = limite(llave, uso[llave]);
-    if (l.left === 0) {
-      throw conflict(
-        `Ya cambiaste ${QUE[llave]} ${l.max} veces en los últimos ${CONTACT_CHANGE_WINDOW_DAYS} días. Para cambiarlo otra vez antes, pasa a recepción.`,
-        'CONTACT_CHANGE_LIMIT',
-      );
+  /** El tope por periodo de lo que este toque cambia. Se mira dos veces: aquí (para contestar pronto) y ya con el candado, al guardar. */
+  const exigirTope = async (): Promise<void> => {
+    const uso = await usoDe(orgId, memberId, ahora);
+    for (const llave of new Set(cambios.map((c) => limiteDe(c.field)))) {
+      const l = limite(llave, uso[llave]);
+      if (l.left === 0) {
+        throw conflict(
+          `Ya cambiaste ${QUE[llave]} ${l.max} veces en los últimos ${CONTACT_CHANGE_WINDOW_DAYS} días. Para cambiarlo otra vez antes, pasa a recepción.`,
+          'CONTACT_CHANGE_LIMIT',
+        );
+      }
     }
-  }
+  };
+  await exigirTope();
 
   // ── Que sea él ─────────────────────────────────────────────────────────────
   const deIdentidad = cambios.some((c) => c.field === 'PHONE' || c.field === 'EMAIL');
@@ -289,6 +293,10 @@ export async function cambiarContactoPropio(ctx: RequestContext, memberId: strin
 
   // ── Se guarda todo junto, con su asiento ───────────────────────────────────
   const hecho = await enUnaTransaccion(async () => {
+    // Bloque 4.11: un socio a la vez. Dos cambios simultáneos (dos teléfonos, o un doble toque) leían el mismo
+    // conteo y los dos pasaban el tope; con el candado, el segundo cuenta ya con lo que guardó el primero.
+    await new ContactChangeRepository(orgId).candado(memberId);
+    await exigirTope();
     const despues = await members.update(memberId, patch);
     if (!despues) throw notFound('Socio no encontrado');
     let sinResponsable = 0;

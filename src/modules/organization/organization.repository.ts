@@ -25,6 +25,17 @@ export class OrganizationRepository extends TenantRepository {
     return { ...org, hasLogo: conLogo > 0 };
   }
 
+  /**
+   * Lo que el recibo imprime del gimnasio, en una lectura, para el comprobante que el socio abre en su
+   * teléfono (bloque 4.11): logo, leyenda, teléfonos y RFC. Es lo mismo que ya imprime el del mostrador.
+   */
+  async paraElRecibo(): Promise<{ logo: string | null; phone: string | null; whatsapp: string | null; rfc: string | null; receiptLegend: string | null }> {
+    const org = await this.db.organization.findFirst({
+      where: { id: this.organizationId, deletedAt: null }, select: { logo: true, phone: true, whatsapp: true, rfc: true, receiptLegend: true },
+    });
+    return { logo: org?.logo ?? null, phone: org?.phone ?? null, whatsapp: org?.whatsapp ?? null, rfc: org?.rfc ?? null, receiptLegend: org?.receiptLegend ?? null };
+  }
+
   /** El logo del gimnasio (`data:` URL) o null. */
   async logo(): Promise<string | null> {
     const org = await this.db.organization.findFirst({ where: { id: this.organizationId, deletedAt: null }, select: { logo: true } });

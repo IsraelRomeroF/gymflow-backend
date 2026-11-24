@@ -15,6 +15,14 @@ import type { AgingBucketKey } from '@gymflow/core';
  * perdida (`charges.lostOn`: su membresía llevó suspendida el plazo del
  * gimnasio) no entra en el total, en lo vencido, en los tramos, en el reparto
  * por sede ni en la lista de deudores; se informa aparte (`lostCents`).
+ *
+ * D-12 (fase 4, bloque 4.11): la deuda de un socio DADO DE BAJA en su ficha
+ * (`members.deletedAt`) SÍ cuenta. Dar de baja no borra lo que debe (3.5): sale
+ * de «por cobrar» solo cuando se cobra, se condona con monto o se da por
+ * perdida por plazo. Antes estas consultas filtraban a los socios vivos y la
+ * deuda desaparecía de la cifra el día de la baja, sin que nadie lo decidiera.
+ * (Otra cosa son las membresías VIVAS de socios dados de baja, que sí se
+ * excluyen del ingreso recurrente: eso es `analytics.repository.ts`.)
  */
 
 export type AgingRow = {
@@ -74,7 +82,6 @@ export class PortfolioRepository extends TenantRepository {
              COUNT(*)::bigint AS charges,
              COUNT(DISTINCT c."memberId")::bigint AS members
       FROM "charges" c
-      JOIN "members" mb ON mb."id" = c."memberId" AND mb."deletedAt" IS NULL
       WHERE c."organizationId" = $1::uuid
         AND c."status" IN ('OPEN','PARTIALLY_PAID','OVERDUE')
         AND c."lostOn" IS NULL
@@ -88,7 +95,6 @@ export class PortfolioRepository extends TenantRepository {
              COALESCE(SUM(c."amountCents" - c."allocatedCents" - c."adjustedCents"), 0)::bigint AS amount,
              COUNT(DISTINCT c."memberId")::bigint AS members
       FROM "charges" c
-      JOIN "members" mb ON mb."id" = c."memberId" AND mb."deletedAt" IS NULL
       WHERE c."organizationId" = $1::uuid
         AND c."status" IN ('OPEN','PARTIALLY_PAID','OVERDUE')
         AND c."lostOn" IS NULL
@@ -106,7 +112,6 @@ export class PortfolioRepository extends TenantRepository {
                                ELSE 0 END), 0)::bigint AS overdue,
              COUNT(DISTINCT c."memberId")::bigint AS members
       FROM "charges" c
-      JOIN "members" mb ON mb."id" = c."memberId" AND mb."deletedAt" IS NULL
       WHERE c."organizationId" = $1::uuid
         AND c."status" IN ('OPEN','PARTIALLY_PAID','OVERDUE')
         AND c."lostOn" IS NULL
@@ -122,12 +127,11 @@ export class PortfolioRepository extends TenantRepository {
       WHERE "organizationId" = ${this.organizationId}::uuid
         AND "status" IN ('SUCCEEDED','REVERSED')`;
 
-    // Lo dado por perdido, aparte (misma regla de socios vivos que la cartera).
+    // Lo dado por perdido, aparte (también de socios dados de baja, como la cartera).
     const perdida = await this.db.$queryRawUnsafe<Array<{ total: bigint; members: bigint }>>(`
       SELECT COALESCE(SUM(c."amountCents" - c."allocatedCents" - c."adjustedCents"), 0)::bigint AS total,
              COUNT(DISTINCT c."memberId")::bigint AS members
       FROM "charges" c
-      JOIN "members" mb ON mb."id" = c."memberId" AND mb."deletedAt" IS NULL
       WHERE c."organizationId" = $1::uuid
         AND c."status" IN ('OPEN','PARTIALLY_PAID','OVERDUE')
         AND c."lostOn" IS NOT NULL
@@ -160,6 +164,8 @@ export class PortfolioRepository extends TenantRepository {
   async topDebtors(limit: number, branchId?: string | null): Promise<Array<{
     memberId: string; memberCode: string; fullName: string;
     branchId: string | null; outstandingCents: bigint; oldestDueDate: Date;
+    /** Dado de baja en su ficha: sigue debiendo (D-12), pero ya no está en el padrón vivo. */
+    archived: boolean;
   }>> {
     const filtro = branchId ? `AND c."branchId" = $3::uuid` : '';
     const params: unknown[] = [this.organizationId, limit];
@@ -168,16 +174,16 @@ export class PortfolioRepository extends TenantRepository {
     return this.db.$queryRawUnsafe(`
       SELECT m."id" AS "memberId", m."memberCode",
              m."firstName" || ' ' || m."lastName" AS "fullName",
-             m."homeBranchId" AS "branchId",
+             m."homeBranchId" AS "branchId", (m."deletedAt" IS NOT NULL) AS "archived",
              SUM(c."amountCents" - c."allocatedCents" - c."adjustedCents")::bigint AS "outstandingCents",
              MIN(c."dueDate") AS "oldestDueDate"
       FROM "charges" c
-      JOIN "members" m ON m."id" = c."memberId" AND m."deletedAt" IS NULL
+      JOIN "members" m ON m."id" = c."memberId"
       WHERE c."organizationId" = $1::uuid
         AND c."status" IN ('OPEN','PARTIALLY_PAID','OVERDUE')
         AND c."lostOn" IS NULL
         ${filtro}
-      GROUP BY m."id", m."memberCode", m."firstName", m."lastName", m."homeBranchId"
+      GROUP BY m."id", m."memberCode", m."firstName", m."lastName", m."homeBranchId", m."deletedAt"
       ORDER BY "outstandingCents" DESC
       LIMIT $2`, ...params);
   }

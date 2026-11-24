@@ -63,6 +63,8 @@ export function registerPortfolioRoutes(app: FastifyInstance): void {
           memberCode: d.memberCode,
           fullName: d.fullName,
           branchId: d.branchId,
+          // Dado de baja en su ficha: sigue debiendo y sigue en la cartera (D-12; bloque 4.11).
+          archived: d.archived,
           outstandingCents: cents(d.outstandingCents),
           oldestDueDate: iso(d.oldestDueDate),
         })),

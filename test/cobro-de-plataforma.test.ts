@@ -8,7 +8,7 @@ import {
 } from '../src/modules/tenants/cobro-reglas.js';
 import { primeraVigencia } from '../src/modules/tenants/cobranza-reglas.js';
 import { emitirElMes } from '../src/modules/tenants/platform-billing.jobs.js';
-import { ponerPrecios } from './precios-de-prueba.js';
+import { liberadaElDiaUno, ponerPrecios } from './precios-de-prueba.js';
 import { PlatformBillingRepository } from '../src/modules/tenants/platform-billing.repository.js';
 import { PlatformBillingService } from '../src/modules/tenants/platform-billing.service.js';
 
@@ -102,7 +102,11 @@ describe('cobro de plataforma · API', () => {
     });
     expect(alta.statusCode, alta.body).toBe(201);
     const id = alta.json().organizationId as string;
-    if (liberar) expect((await post(`/platform/organizations/${id}/service`, { status: 'ACTIVE', reason: 'Contrato firmado' })).statusCode).toBe(200);
+    if (liberar) {
+      expect((await post(`/platform/organizations/${id}/service`, { status: 'ACTIVE', reason: 'Contrato firmado' })).statusCode).toBe(200);
+      // D-39 (bloque 4.9): el primer mes se cobra por días; aquí se prueba el mes completo.
+      await liberadaElDiaUno(id);
+    }
     return id;
   }
 
@@ -193,6 +197,8 @@ describe('cobro de plataforma · API', () => {
     expect(sinLiberar.json().reason).toBe('ORG_NOT_IN_USE');
     expect((await get(`/platform/organizations/${id}/billing`)).json().status.code).toBe('SIN_COBRO');
     expect((await post(`/platform/organizations/${id}/service`, { status: 'ACTIVE', reason: 'Contrato firmado' })).statusCode).toBe(200);
+    // D-39 (bloque 4.9): el primer mes se cobra por días; aquí se prueba el mes completo.
+    await liberadaElDiaUno(id);
 
     const futuro = await emitir(masDias(`${mes}-28`, 10).slice(0, 7));
     expect(futuro.statusCode).toBe(409);

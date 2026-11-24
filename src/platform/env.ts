@@ -25,7 +25,6 @@ const schema = z.object({
    */
   SESSION_COOKIE_DOMAIN: z.string().default(''),
   SESSION_TTL_STAFF_HOURS: z.coerce.number().int().positive().default(12),
-  SESSION_TTL_MEMBER_DAYS: z.coerce.number().int().positive().default(30),
   CORS_ORIGINS: z.string().default(CORS_POR_OMISION),
   /**
    * LLAVE DE LOS DATOS SENSIBLES (21-17): 32 bytes en base64. De ella se
@@ -67,6 +66,16 @@ const schema = z.object({
   VAPID_PUBLIC_KEY: z.string().min(20).optional(),
   VAPID_PRIVATE_KEY: z.string().min(20).optional(),
   VAPID_SUBJECT: z.string().default('mailto:soporte@gymflow.mx'),
+  /**
+   * GymFlow como emisor de sus facturas a los gimnasios (D-39, bloque 4.9; `tenants/emisor.ts`).
+   * Datos fiscales reales: van en la configuración del servidor, NUNCA en el repositorio.
+   * Sin la razón social, la factura sale a nombre de «GymFlow» y sin datos de pago.
+   */
+  GYMFLOW_ISSUER_LEGAL_NAME: z.string().optional(),
+  GYMFLOW_ISSUER_RFC: z.string().optional(),
+  GYMFLOW_ISSUER_ADDRESS: z.string().optional(),
+  GYMFLOW_ISSUER_PAYMENT: z.string().optional(),
+  GYMFLOW_ISSUER_CONTACT: z.string().optional(),
   /** Altas digitales SIN revisar que admite una sucursal antes de cerrar el formulario (PS-09). */
   INTAKE_PENDING_MAX_PER_BRANCH: z.coerce.number().int().positive().default(200),
   /**

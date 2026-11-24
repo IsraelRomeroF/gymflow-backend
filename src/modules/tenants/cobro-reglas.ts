@@ -91,6 +91,8 @@ export function estadoDeCobro(entrada: {
   /** El día en que se liberó el software (`AAAA-MM-DD`), si se liberó. */
   liberadaEl: string | null;
   hoy: string;
+  /** D-39: su descuento deja el mes en $0.00, así que no lleva factura y no le «falta». */
+  mesEnCero?: boolean;
 }): { code: EstadoDeCobro; overdueDays: number; pendingCents: bigint } {
   const { facturas, hoy } = entrada;
   const pendientes = facturas.filter((f) => f.status === 'PENDING');
@@ -99,7 +101,7 @@ export function estadoDeCobro(entrada: {
   if (atraso > 0) return { code: 'VENCIDA', overdueDays: atraso, pendingCents };
   const enUso = entrada.serviceStatus === 'ACTIVE';
   if (enUso && entrada.sinPrecio) return { code: 'NO_FACTURABLE', overdueDays: 0, pendingCents };
-  if (enUso && faltaLaDelMes(facturas, hoy)) return { code: 'SIN_FACTURA_DEL_MES', overdueDays: 0, pendingCents };
+  if (enUso && !entrada.mesEnCero && faltaLaDelMes(facturas, hoy)) return { code: 'SIN_FACTURA_DEL_MES', overdueDays: 0, pendingCents };
   if (pendientes.length > 0) return { code: 'POR_VENCER', overdueDays: 0, pendingCents };
   return { code: enUso ? 'AL_CORRIENTE' : 'SIN_COBRO', overdueDays: 0, pendingCents };
 }
@@ -127,6 +129,8 @@ export function motivoDeNoEmitir(entrada: {
   mes: string; hoy: string;
   serviceStatus: string; liberadaEl: string | null;
   yaTieneFactura: boolean; sinPrecio: readonly string[]; totalCents: bigint;
+  /** D-39: el total es cero por un descuento del 100 % o un importe que cubre todo. */
+  porDescuento?: boolean;
 }): { reason: MotivoDeNoEmitir; texto: string } | null {
   if (entrada.serviceStatus !== 'ACTIVE') {
     return { reason: 'NOT_IN_USE', texto: entrada.serviceStatus === 'SUSPENDED' ? 'El servicio está suspendido: no se le factura' : 'El software no está liberado: no se le factura' };
@@ -135,6 +139,6 @@ export function motivoDeNoEmitir(entrada: {
   if (entrada.liberadaEl && entrada.mes < entrada.liberadaEl.slice(0, 7)) return { reason: 'BEFORE_RELEASE', texto: 'Ese mes es anterior a la liberación del software' };
   if (entrada.yaTieneFactura) return { reason: 'ALREADY_INVOICED', texto: 'Ya tiene factura de ese mes' };
   if (entrada.sinPrecio.length > 0) return { reason: 'MISSING_PRICES', texto: `Sin precio: ${entrada.sinPrecio.join(', ')}` };
-  if (entrada.totalCents <= 0n) return { reason: 'ZERO_TOTAL', texto: 'Mensualidad en cero' };
+  if (entrada.totalCents <= 0n) return { reason: 'ZERO_TOTAL', texto: entrada.porDescuento ? 'Con su descuento, ese mes queda en cero' : 'Mensualidad en cero' };
   return null;
 }

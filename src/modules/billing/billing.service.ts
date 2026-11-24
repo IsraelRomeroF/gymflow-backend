@@ -576,7 +576,9 @@ export class BillingService {
     // se confirman juntos. Antes eran tres transacciones y dos escrituras
     // sueltas: un pago podía quedar sin bitácora o con folio gastado (OPT3-05).
     return enUnidadDeDinero(orgId, async () => {
-    const member = await new MemberRepository(orgId).findById(input.memberId);
+    // A un socio dado de baja también se le cobra lo que quedó debiendo (D-12; bloque 4.11):
+    // su deuda sigue en «Por cobrar» y esta es una de sus tres salidas.
+    const member = await new MemberRepository(orgId).findByIdIncludingArchived(input.memberId);
     if (!member) throw notFound('Socio no encontrado');
 
     const branchId = input.branchId ?? ctx.tenant.branchScopeHint ?? null;

@@ -52,6 +52,14 @@ export class ContactChangeRepository extends TenantRepository {
     return batchId;
   }
 
+  /**
+   * Un socio a la vez (bloque 4.11): contar su tope y asentar el cambio nuevo no se pisan entre dos
+   * peticiones simultáneas. Solo dentro de una transacción; se suelta al confirmarla.
+   */
+  async candado(memberId: string): Promise<void> {
+    await this.db.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`contact-change:${this.organizationId}:${memberId}`}, 0))`;
+  }
+
   /** Cada dato cambiado desde `desde`, con su hora y su toque: de aquí sale el tope por periodo. */
   async desde(memberId: string, desde: Date): Promise<Array<{ field: ContactField; batchId: string; createdAt: Date }>> {
     return this.db.memberContactChange.findMany({

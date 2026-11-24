@@ -8,6 +8,9 @@ import {
   type EstadoDeCobro, type FacturaDeMarca, type MotivoDeNoEmitir,
 } from './cobro-reglas.js';
 import { PlatformCollectionsService } from './cobranza.service.js';
+import { emisor, emisorGuardado, receptorGuardado, type Receptor } from './emisor.js';
+import { desglosar, descuentoDe, diasACobrar, prorratear, textoDeAjuste, textoDeDias, ultimoMesDe, type Ajuste, type Desglose, type Impuesto } from './factura-reglas.js';
+import { PlatformInvoiceRulesRepository } from './factura.repository.js';
 import { PlatformBillingRepository, type Factura, type LineaFactura, type MarcaParaCobro, type Pago } from './platform-billing.repository.js';
 import { PlatformPlanRepository, type PlanDePlataforma } from './platform-plan.repository.js';
 import { TenantService } from './tenant.service.js';
@@ -37,8 +40,26 @@ const NO_EMITIR: Record<MotivoDeNoEmitir, { reason: 'ORG_NOT_IN_USE' | 'MONTH_AL
   FUTURE_MONTH: { reason: 'MONTH_NOT_BILLABLE', mensaje: (t) => `${t}: se factura cuando empiece.` },
 };
 
-type Cuota = { lines: LineaFactura[]; totalCents: bigint; sinPrecio: string[] };
-export type PorEmitir = { organizationId: string; tradeName: string; totalCents: string; lines: LineaFactura[] };
+/**
+ * Lo que una marca paga por un mes (D-39, bloque 4.9): sus renglones (con el
+ * del descuento, en negativo, si tiene), el subtotal, el IVA y `totalCents`,
+ * que es LO QUE SE PAGA. `listCents` es el mes completo a precio de lista,
+ * sin descuento ni IVA.
+ */
+type Cuota = Desglose & {
+  lines: LineaFactura[]; sinPrecio: string[]; listCents: bigint; discountCents: bigint;
+  /** El descuento o precio especial que lleva ese mes y hasta la factura de qué mes dura. */
+  discount: { id: string; label: string; lastMonth: string } | null;
+};
+/** Lo que entra a la cuenta de un mes además de precios, plan y contratado. */
+type ReglasDelMes = {
+  /** `AAAA-MM`. */
+  mes: string; ajuste: Ajuste | null; impuesto: Impuesto;
+  /** Solo al EMITIR: desde qué día cuenta cada cosa (cobro por días) y los días de meses anteriores que esta factura recoge. Sin esto, el mes completo. */
+  porDias?: { liberadaEl: string; desde: ReadonlyMap<string, string>; atrasados: readonly LineaFactura[] };
+};
+const desgloseJson = (d: Desglose) => ({ subtotalCents: d.subtotalCents.toString(), taxCents: d.taxCents.toString(), taxRateBps: d.taxRateBps, taxIncluded: d.taxIncluded, totalCents: d.totalCents.toString() });
+export type PorEmitir = ReturnType<typeof desgloseJson> & { organizationId: string; tradeName: string; lines: LineaFactura[]; discountCents: string };
 export type Saltada = { organizationId: string; tradeName: string; reason: string; code: MotivoDeNoEmitir | 'ERROR'; /** Con `MISSING_PRICES`: de qué falta el precio. */ missingPrices?: string[] };
 export type VistaPreviaDeEmision = { month: string; dueDate: string; toIssue: PorEmitir[]; skipped: Saltada[]; totalCents: string };
 export type ResultadoDeEmitirMes = {
@@ -59,6 +80,7 @@ export type ResultadoDeEmitirMes = {
  */
 export class PlatformBillingService {
   private readonly repo = new PlatformBillingRepository();
+  private readonly reglas = new PlatformInvoiceRulesRepository();
   private readonly planes = new PlatformPlanRepository();
   private readonly audit = new AuditService();
   private readonly cadena = new PlatformAuditService();
@@ -92,7 +114,68 @@ export class PlatformBillingService {
     if (marca.platformPlanId) { const vivo = await this.planes.find(marca.platformPlanId); if (vivo) catalogo.set(vivo.id, vivo); }
     const contratados = MODULES.filter((m) => m.kind === 'optional' && vista.contracted(m.key)).map((m) => m.key as string);
     // Lo que vale ESE día (D-38): el precio y el plan de un mes pasado o de uno ya anunciado, no los de hoy a secas.
-    return this.cuota(vigencias.preciosEn(dia), vigencias.agregadosEn(marca, contratados, dia), vigencias.planEn(marca, catalogo, dia));
+    return this.cuota(vigencias.preciosEn(dia), vigencias.agregadosEn(marca, contratados, dia), vigencias.planEn(marca, catalogo, dia), { mes: dia.slice(0, 7), ajuste: vigencias.ajusteEn(marca.id, dia), impuesto: vigencias.impuestoEn(dia) });
+  }
+
+  /**
+   * Lo que saldría en la FACTURA de ese mes para una marca (D-39): la
+   * mensualidad de ese mes, pero cobrando POR DÍAS el primer mes (desde el día
+   * en que se liberó el software) y cada módulo contratado a medio mes, y
+   * recogiendo los días de un módulo que se contrató cuando la factura de su
+   * mes ya estaba emitida. Con `facturas` ya cargadas no vuelve a pedirlas.
+   */
+  private async paraEmitir(marca: MarcaParaCobro, mes: string, vigencias: Vigencias, desde: ReadonlyMap<string, string>): Promise<Cuota> {
+    const { inicio } = periodoDe(mes);
+    const vista = await moduleViewOf(marca.id);
+    const catalogo = new Map<string, PlanDePlataforma>();
+    if (marca.platformPlanId) { const vivo = await this.planes.find(marca.platformPlanId); if (vivo) catalogo.set(vivo.id, vivo); }
+    const contratados = MODULES.filter((m) => m.kind === 'optional' && vista.contracted(m.key)).map((m) => m.key as string);
+    const liberada = liberadaEl(marca);
+    // Solo quien tiene un módulo con fecha de contratación anterior a este mes puede traer días atrasados: los demás no leen sus facturas.
+    const conAtraso = contratados.filter((k) => { const d = desde.get(k); return d !== undefined && d.slice(0, 7) < mes; });
+    const atrasados = conAtraso.length === 0 ? [] : this.diasAtrasados(marca, mes, vigencias, catalogo, conAtraso, desde, await this.repo.invoices(marca.id));
+    return this.cuota(vigencias.preciosEn(inicio), vigencias.agregadosEn(marca, contratados, inicio), vigencias.planEn(marca, catalogo, inicio), {
+      mes, ajuste: vigencias.ajusteEn(marca.id, inicio), impuesto: vigencias.impuestoEn(inicio), porDias: { liberadaEl: liberada, desde, atrasados },
+    });
+  }
+
+  /**
+   * MÓDULO CONTRATADO A MEDIO MES, CON LA FACTURA DE ESE MES YA EMITIDA (D-39).
+   * La factura se emite al empezar el mes; un módulo contratado el día 15 no
+   * venía en ella. Sus días (del 15 al último) se cobran en la SIGUIENTE
+   * factura que se emita, en un renglón aparte, al precio de aquel mes. Se
+   * cobra una sola vez: si la factura de aquel mes ya traía el módulo, o si
+   * otra factura viva ya recogió esos días, no hay nada que recoger. Si aquel
+   * mes no tiene factura viva, tampoco: cuando se emita, traerá el módulo por
+   * días ella misma. Ante la duda, de menos.
+   */
+  private diasAtrasados(marca: MarcaParaCobro, mes: string, vigencias: Vigencias, catalogo: ReadonlyMap<string, PlanDePlataforma>, claves: readonly string[], desde: ReadonlyMap<string, string>, facturas: readonly Factura[]): LineaFactura[] {
+    const vivas = facturas.filter((f) => f.status !== 'VOID');
+    const liberada = liberadaEl(marca);
+    const lineas: LineaFactura[] = [];
+    for (const k of claves) {
+      const contratadoEl = desde.get(k)!;
+      const suMes = contratadoEl.slice(0, 7);
+      if (suMes >= mes) continue;
+      const { inicio } = periodoDe(suMes);
+      const llave = `dias:${k}:${suMes}`;
+      const deSuMes = vivas.find((f) => iso(f.periodStart) === inicio);
+      if (!deSuMes || deSuMes.lines.some((l) => l.key === k)) continue;
+      if (vivas.some((f) => f.lines.some((l) => l.key === llave))) continue;
+      // En aquel mes, ¿era un agregado con precio? Lo que el plan incluía no se cobra aparte.
+      const plan = vigencias.planEn(marca, catalogo, inicio);
+      if (plan && plan.monthlyCents !== null && plan.modules.includes(k)) continue;
+      if (!vigencias.agregadosEn(marca, [k], inicio).includes(k)) continue;
+      const precio = vigencias.preciosEn(inicio).get(k);
+      if (precio === undefined) continue;
+      const { dias, de } = diasACobrar(suMes, contratadoEl > liberada ? contratadoEl : liberada);
+      if (dias <= 0) continue;
+      lineas.push({
+        key: llave, name: `${MODULE_BY_KEY.get(k)?.name ?? k} · ${textoDeDias(suMes, dias, de)}`, monthlyCents: prorratear(precio, dias, de).toString(),
+        kind: 'CATCH_UP', listCents: precio.toString(), days: dias, ofDays: de,
+      });
+    }
+    return lineas;
   }
 
   /**
@@ -108,29 +191,59 @@ export class PlatformBillingService {
     const salida = new Map<string, Cuota & { marca: MarcaParaCobro }>();
     for (const m of marcas) {
       const suya = contratacion.get(m.id);
-      salida.set(m.id, { ...this.cuota(precios, vigencias.agregadosEn(m, opcionales.filter((k) => !suya?.noContratados.has(k)), dia), vigencias.planEn(m, catalogo, dia)), marca: m });
+      salida.set(m.id, { ...this.cuota(precios, vigencias.agregadosEn(m, opcionales.filter((k) => !suya?.noContratados.has(k)), dia), vigencias.planEn(m, catalogo, dia), { mes: dia.slice(0, 7), ajuste: vigencias.ajusteEn(m.id, dia), impuesto: vigencias.impuestoEn(dia) }), marca: m });
     }
     return salida;
   }
 
-  /** La cuenta de la mensualidad, sin consultar nada: precios, lo contratado y el plan ya vienen cargados. */
-  private cuota(precios: Map<string, bigint>, contratados: readonly string[], plan: PlanVigente | null): Cuota {
+  /**
+   * La cuenta de un mes, sin consultar nada: precios, lo contratado, el plan y
+   * las reglas del mes ya vienen cargados. En orden (D-39): renglones a precio
+   * de lista (por días, si toca) → descuento del mes → IVA sobre lo que queda.
+   */
+  private cuota(precios: Map<string, bigint>, contratados: readonly string[], plan: PlanVigente | null, reglas: ReglasDelMes): Cuota {
     const nombre = (k: string) => (k === 'core' ? 'Lo básico (software)' : MODULE_BY_KEY.get(k)!.name);
     const lines: LineaFactura[] = [];
     const sinPrecio: string[] = [];
+    let lista = 0n; let base = 0n;
+    /** Un renglón: completo, o por los días que le tocan de ese mes. Lo que empezó después de ese mes no sale. */
+    const renglon = (key: string, name: string, cents: bigint, desde: string | null) => {
+      const { dias, de } = reglas.porDias ? diasACobrar(reglas.mes, desde) : { dias: 1, de: 1 };
+      if (dias <= 0) return;
+      lista += cents;
+      if (dias >= de) { base += cents; lines.push({ key, name, monthlyCents: cents.toString() }); return; }
+      const cobrado = prorratear(cents, dias, de);
+      base += cobrado;
+      lines.push({ key, name: `${name} · ${textoDeDias(reglas.mes, dias, de)}`, monthlyCents: cobrado.toString(), kind: 'PRORATED', listCents: cents.toString(), days: dias, ofDays: de });
+    };
+    const liberada = reglas.porDias?.liberadaEl ?? null;
+    /** Un módulo cuenta desde que se contrató, y nunca antes de que la marca empezara. */
+    const desdeDe = (k: string): string | null => {
+      const suyo = reglas.porDias?.desde.get(k) ?? null;
+      return suyo && liberada && suyo > liberada ? suyo : liberada;
+    };
     const porModulo = (claves: readonly string[]) => {
       for (const k of claves) {
-        if (precios.has(k)) lines.push({ key: k, name: nombre(k), monthlyCents: precios.get(k)!.toString() });
+        if (precios.has(k)) renglon(k, nombre(k), precios.get(k)!, k === 'core' ? liberada : desdeDe(k));
         else sinPrecio.push(k === 'core' ? 'Lo básico' : MODULE_BY_KEY.get(k)!.name);
       }
     };
     if (plan && plan.monthlyCents !== null) {
-      lines.push({ key: `plan:${plan.id}`, name: `Plan ${plan.name}`, monthlyCents: plan.monthlyCents.toString() });
+      renglon(`plan:${plan.id}`, `Plan ${plan.name}`, plan.monthlyCents, liberada);
       porModulo(contratados.filter((k) => !plan.modules.includes(k)));
     } else {
       porModulo(['core', ...contratados]);
     }
-    return { lines, totalCents: lines.reduce((a, l) => a + BigInt(l.monthlyCents), 0n), sinPrecio };
+    // Los días de un mes anterior que esta factura recoge: se suman, pero el descuento del mes no los toca.
+    let atrasado = 0n;
+    for (const l of reglas.porDias?.atrasados ?? []) { lines.push(l); atrasado += BigInt(l.monthlyCents); }
+    const descuento = reglas.ajuste ? descuentoDe(reglas.ajuste, base, lista) : 0n;
+    if (reglas.ajuste && descuento > 0n) lines.push({ key: `ajuste:${reglas.ajuste.id}`, name: textoDeAjuste(reglas.ajuste), monthlyCents: (-descuento).toString(), kind: 'DISCOUNT' });
+    return {
+      lines, sinPrecio, listCents: lista, discountCents: descuento,
+      discount: reglas.ajuste && descuento > 0n ? { id: reglas.ajuste.id, label: textoDeAjuste(reglas.ajuste), lastMonth: ultimoMesDe(reglas.ajuste) } : null,
+      ...desglosar(base + atrasado - descuento, reglas.impuesto),
+    };
   }
 
   /** La ficha de una marca: sus facturas, su mensualidad de hoy, su estado de cobro y los meses que se le pueden facturar. */
@@ -139,19 +252,27 @@ export class PlatformBillingService {
     const vigencias = await cargarVigencias();
     const [marca, facturas, cuota] = await Promise.all([this.repo.organization(organizationId), this.repo.invoices(organizationId), this.mensualidad(organizationId, { dia: hoy, vigencias })]);
     if (!marca) throw notFound('Marca no encontrada');
-    // Lo que ya está anunciado (D-38): la primera fecha en que su mensualidad será otra.
-    let upcoming: { effectiveFrom: string; lines: LineaFactura[]; totalCents: string } | null = null;
-    for (const fecha of [...new Set(vigencias.pendientes().map((c) => iso(c.effectiveFrom)))].sort()) {
-      const futura = await this.mensualidad(organizationId, { dia: fecha, vigencias });
-      if (futura.totalCents !== cuota.totalCents || futura.lines.map((l) => l.key).join() !== cuota.lines.map((l) => l.key).join()) { upcoming = { effectiveFrom: fecha, lines: futura.lines, totalCents: futura.totalCents.toString() }; break; }
+    // Lo que ya está anunciado (D-38; el IVA, D-39): la primera fecha en que lo anunciado le mueve la mensualidad.
+    // Se compara ese mes CON y SIN lo anunciado: un descuento que para entonces ya caducó no es un cambio anunciado.
+    let upcoming: { effectiveFrom: string; lines: LineaFactura[]; totalCents: string; taxRateBps: number; taxIncluded: boolean } | null = null;
+    const sinAnuncios = vigencias.sinLoAnunciado(hoy);
+    for (const fecha of [...new Set([...vigencias.pendientes().map((c) => iso(c.effectiveFrom)), ...vigencias.ivaPendiente(hoy).map((c) => c.effectiveFrom)])].sort()) {
+      if (fecha <= hoy) continue;
+      const [futura, igual] = await Promise.all([this.mensualidad(organizationId, { dia: fecha, vigencias }), this.mensualidad(organizationId, { dia: fecha, vigencias: sinAnuncios })]);
+      if (futura.totalCents !== igual.totalCents || futura.taxCents !== igual.taxCents || futura.lines.map((l) => l.key).join() !== igual.lines.map((l) => l.key).join()) {
+        upcoming = { effectiveFrom: fecha, lines: futura.lines, totalCents: futura.totalCents.toString(), taxRateBps: futura.taxRateBps, taxIncluded: futura.taxIncluded }; break;
+      }
     }
-    const estado = estadoDeCobro({ facturas: facturas.map(paraEstado), serviceStatus: marca.serviceStatus, sinPrecio: cuota.sinPrecio.length > 0, liberadaEl: liberadaEl(marca), hoy });
+    const estado = estadoDeCobro({ facturas: facturas.map(paraEstado), serviceStatus: marca.serviceStatus, sinPrecio: cuota.sinPrecio.length > 0, liberadaEl: liberadaEl(marca), hoy, mesEnCero: enCeroPorDescuento(cuota) });
     return {
       month: hoy.slice(0, 7),
       invoices: facturas.map((f) => serializar(f, hoy)),
-      monthly: { lines: cuota.lines, totalCents: cuota.totalCents.toString(), missingPrices: cuota.sinPrecio },
+      /** La mensualidad de un mes completo, hoy: renglones (con el del descuento), subtotal, IVA y total (D-39). */
+      monthly: { lines: cuota.lines, ...desgloseJson(cuota), listCents: cuota.listCents.toString(), discountCents: cuota.discountCents.toString(), discount: cuota.discount, missingPrices: cuota.sinPrecio },
       /** La mensualidad que ya se le anunció para una fecha próxima, si cambia. */
       upcoming,
+      /** A nombre de quién sale la factura (de la ficha de marca) y quién la emite (de la configuración del servidor). */
+      fiscal: { receiver: receptorDe(marca), issuer: emisor() },
       serviceStatus: marca.serviceStatus,
       status: { code: estado.code, overdueDays: estado.overdueDays, pendingCents: estado.pendingCents.toString() },
       /** Los meses que el diálogo de emitir ofrece: del más reciente al de la liberación, a lo más doce. */
@@ -184,16 +305,19 @@ export class PlatformBillingService {
     const status = new Map<string, { code: EstadoDeCobro; overdueDays: number; pendingCents: bigint }>();
     for (const m of marcas) {
       const suyas = porMarca.get(m.id) ?? [];
-      let sinPrecio = false;
+      let sinPrecio = false; let enCero = false;
       if (m.serviceStatus === 'ACTIVE') {
         // La misma cuenta que `mensualidad`, con lo ya cargado: contratado = no marcado como «no contratado».
         const cuota = cuotas.get(m.id)!;
-        enUso += 1; total += cuota.totalCents;
+        // El ingreso es lo que GymFlow cobra SIN el IVA (el IVA no es ingreso) y ya con los descuentos del mes (D-39).
+        enUso += 1; total += cuota.subtotalCents;
         sinPrecio = cuota.sinPrecio.length > 0;
+        enCero = enCeroPorDescuento(cuota);
         if (sinPrecio) missing.push({ organizationId: m.id, tradeName: m.tradeName, modules: cuota.sinPrecio });
-        if (!tieneLaDelMes(suyas, hoy)) sinDelMes += 1;
+        // Un mes que su descuento deja en $0.00 no lleva factura: no «le falta».
+        if (!tieneLaDelMes(suyas, hoy) && !enCero) sinDelMes += 1;
       }
-      status.set(m.id, estadoDeCobro({ facturas: suyas, serviceStatus: m.serviceStatus, sinPrecio, liberadaEl: liberadaEl(m), hoy }));
+      status.set(m.id, estadoDeCobro({ facturas: suyas, serviceStatus: m.serviceStatus, sinPrecio, liberadaEl: liberadaEl(m), hoy, mesEnCero: enCero }));
     }
     return { month: hoy.slice(0, 7), monthlyIncome: { totalCents: total, organizations: enUso, missingPrices: missing }, withoutInvoiceThisMonth: sinDelMes, status };
   }
@@ -222,18 +346,19 @@ export class PlatformBillingService {
       // El lote es de las marcas en uso; la suspendida sale «se salta» para que se vea a quién no se le cobra.
       marcas = (await this.repo.organizations()).filter((m) => m.serviceStatus === 'ACTIVE' || m.serviceStatus === 'SUSPENDED');
     }
-    // Los precios y el plan del MES que se factura (D-38): su día 1.
-    const [vigencias, conFactura] = await Promise.all([cargarVigencias(), this.repo.organizationsWithInvoiceFor(inicio)]);
+    // Los precios y el plan del MES que se factura (D-38): su día 1. Y desde cuándo está contratado cada módulo agregado (D-39).
+    const [vigencias, conFactura, desde] = await Promise.all([cargarVigencias(), this.repo.organizationsWithInvoiceFor(inicio), this.reglas.contratadosDesde(opciones.organizationId)]);
+    const vacia: Cuota = { lines: [], sinPrecio: [], listCents: 0n, discountCents: 0n, discount: null, ...desglosar(0n, { rateBps: 0, included: false }) };
     const toIssue: PorEmitir[] = [];
     const skipped: Saltada[] = [];
     for (const m of marcas) {
       const de = { organizationId: m.id, tradeName: m.tradeName };
       try {
         // A la que no está en uso no se le calcula nada: no se le factura.
-        const cuota: Cuota = m.serviceStatus === 'ACTIVE' ? await this.mensualidad(m.id, { dia: inicio, vigencias }) : { lines: [], totalCents: 0n, sinPrecio: [] };
-        const no = motivoDeNoEmitir({ mes, hoy, serviceStatus: m.serviceStatus, liberadaEl: liberadaEl(m), yaTieneFactura: conFactura.has(m.id), sinPrecio: cuota.sinPrecio, totalCents: cuota.totalCents });
+        const cuota: Cuota = m.serviceStatus === 'ACTIVE' ? await this.paraEmitir(m, mes, vigencias, desde.get(m.id) ?? new Map<string, string>()) : vacia;
+        const no = motivoDeNoEmitir({ mes, hoy, serviceStatus: m.serviceStatus, liberadaEl: liberadaEl(m), yaTieneFactura: conFactura.has(m.id), sinPrecio: cuota.sinPrecio, totalCents: cuota.totalCents, porDescuento: enCeroPorDescuento(cuota) });
         if (no) skipped.push({ ...de, reason: no.texto, code: no.reason, ...(no.reason === 'MISSING_PRICES' ? { missingPrices: cuota.sinPrecio } : {}) });
-        else toIssue.push({ ...de, totalCents: cuota.totalCents.toString(), lines: cuota.lines });
+        else { toIssue.push({ ...de, ...desgloseJson(cuota), lines: cuota.lines, discountCents: cuota.discountCents.toString() }); }
       } catch (e) {
         // Una marca que no se puede calcular no tumba a las demás (23-12).
         skipped.push({ ...de, reason: `No se pudo calcular su mensualidad: ${textoDe(e)}`, code: 'ERROR' });
@@ -264,15 +389,28 @@ export class PlatformBillingService {
     const hoy = hoyDeCobro(ahora);
     const { inicio, fin } = periodoDe(mes);
     let factura: Factura;
+    // Los datos fiscales se congelan con la factura (D-39): los del gimnasio, de su ficha; los de GymFlow, de la configuración.
+    const marca = await this.repo.organization(x.organizationId);
+    if (!marca) throw notFound('Marca no encontrada');
     try {
-      factura = await this.repo.issue({ organizationId: x.organizationId, periodStart: inicio, periodEnd: fin, lines: x.lines, totalCents: BigInt(x.totalCents), dueDate: venceEl(hoy), note, byUserId });
+      factura = await this.repo.issue({
+        organizationId: x.organizationId, periodStart: inicio, periodEnd: fin, lines: x.lines, totalCents: BigInt(x.totalCents), dueDate: venceEl(hoy), note, byUserId,
+        subtotalCents: BigInt(x.subtotalCents), taxCents: BigInt(x.taxCents), taxRateBps: x.taxRateBps, taxIncluded: x.taxIncluded, discountCents: BigInt(x.discountCents),
+        receiver: receptorDe(marca), issuer: emisor(),
+      });
     } catch (e) {
       if ((e as { code?: unknown }).code === 'P2002') throw conflict('Ese mes ya tiene factura. Anúlala antes de emitir otra.', 'MONTH_ALREADY_INVOICED');
       throw e;
     }
     await this.audit.record(systemContext(x.organizationId), {
       action: 'platform.invoice.issue', resourceType: 'PlatformInvoice', resourceId: factura.id,
-      afterState: { folio: factura.folio, periodStart: iso(factura.periodStart), totalCents: factura.totalCents.toString(), byPlatformUserId: byUserId },
+      afterState: {
+        folio: factura.folio, periodStart: iso(factura.periodStart), totalCents: factura.totalCents.toString(), byPlatformUserId: byUserId,
+        // D-39: con qué se armó. El descuento queda con su motivo en la bitácora de la marca.
+        subtotalCents: x.subtotalCents, taxCents: x.taxCents, taxRateBps: x.taxRateBps, taxIncluded: x.taxIncluded,
+        ...(x.discountCents !== '0' ? { discountCents: x.discountCents, discount: x.lines.find((l) => l.kind === 'DISCOUNT')?.name ?? null } : {}),
+        ...(x.lines.some((l) => l.kind === 'PRORATED' || l.kind === 'CATCH_UP') ? { byDays: x.lines.filter((l) => l.kind === 'PRORATED' || l.kind === 'CATCH_UP').map((l) => l.name) } : {}),
+      },
     });
     // D-37: el dueño se entera el día que se emite. Si el aviso no sale, la corrida diaria lo crea.
     await this.cobranza.avisarEmision(factura, ahora);
@@ -431,6 +569,11 @@ export class PlatformBillingService {
   }
 }
 
+/** A nombre de quién sale la factura: razón social y RFC de la ficha de marca (bloque 4.6). */
+const receptorDe = (m: MarcaParaCobro): Receptor => ({ legalName: m.legalName, rfc: m.rfc, tradeName: m.tradeName });
+/** El descuento de ese mes deja la mensualidad en $0.00: no hay nada que facturar, y no es que «falte» la factura. */
+const enCeroPorDescuento = (c: Cuota): boolean => c.totalCents <= 0n && c.discountCents > 0n && c.sinPrecio.length === 0;
+
 const textoDe = (e: unknown): string => (e instanceof DomainError ? e.message : e instanceof Error ? e.message.split('\n')[0]!.slice(0, 200) : 'error desconocido');
 
 /** Del mes en curso hacia atrás hasta el de la liberación, a lo más doce: lo que «Generar factura» ofrece. */
@@ -472,6 +615,11 @@ function serializar(f: Factura, hoy: string) {
     id: f.id, organizationId: f.organizationId, folio: f.folio, lines: f.lines, status: f.status,
     state: estadoDeFactura(e, hoy), overdueDays: diasDeAtraso(e, hoy),
     totalCents: f.totalCents.toString(), paidCents: f.paidCents.toString(), balanceCents: saldoDe(f).toString(),
+    // D-39. Una factura anterior no tiene desglose: se emitió por un total y así se lee (subtotal = total, sin IVA).
+    itemized: f.subtotalCents !== null, subtotalCents: (f.subtotalCents ?? f.totalCents).toString(), taxCents: f.taxCents.toString(), taxRateBps: f.taxRateBps, taxIncluded: f.taxIncluded,
+    discountCents: f.discountCents.toString(),
+    /** Los datos fiscales como estaban al emitir; `null` en las anteriores a D-39. */
+    receiver: receptorGuardado(f.receiver), issuer: emisorGuardado(f.issuer),
     periodStart: iso(f.periodStart), periodEnd: iso(f.periodEnd), dueDate: iso(f.dueDate),
     issuedAt: f.issuedAt.toISOString(), issuedOn: diaDeCobroDe(f.issuedAt),
     paidAt: f.paidAt?.toISOString() ?? null, paidOn: f.paidAt ? diaDeCobroDe(f.paidAt) : null,

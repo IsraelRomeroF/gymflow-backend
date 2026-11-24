@@ -1,11 +1,20 @@
 import { uuidv7 } from '@gymflow/core';
 import { GlobalRepository } from '../../platform/db/tenant-repository.js';
 
-export type LineaFactura = { key: string; name: string; monthlyCents: string };
+/**
+ * Un renglón. Desde D-39 (bloque 4.9) puede decir de qué clase es: un mes
+ * completo (CHARGE o nada), cobrado por días (PRORATED), los días de un mes
+ * anterior (CATCH_UP) o el descuento, en negativo (DISCOUNT).
+ */
+export type LineaFactura = { key: string; name: string; monthlyCents: string; kind?: 'CHARGE' | 'PRORATED' | 'CATCH_UP' | 'DISCOUNT'; listCents?: string; days?: number; ofDays?: number };
 export type Factura = {
   id: string; organizationId: string; folio: string; periodStart: Date; periodEnd: Date; lines: LineaFactura[];
   totalCents: bigint; paidCents: bigint; status: string; issuedAt: Date; dueDate: Date; paidAt: Date | null;
   paymentMethod: string | null; paymentRef: string | null; note: string | null; voidReason: string | null;
+  /** D-39: el desglose. `subtotalCents` null = emitida antes de D-39, por un total sin desglose. `totalCents` es siempre lo que se paga. */
+  subtotalCents: bigint | null; taxCents: bigint; taxRateBps: number; taxIncluded: boolean; discountCents: bigint;
+  /** Los datos fiscales del gimnasio y de GymFlow como estaban al emitir. */
+  receiver: unknown; issuer: unknown;
 };
 /** Un pago (o abono) de una factura. `undoneAt` = se deshizo: no cuenta. */
 export type Pago = {
@@ -19,11 +28,14 @@ export type MarcaParaCobro = {
   autoSuspendHoldUntil: Date | null; suspendedAutomatically: boolean;
   /** El plan y la versión que la marca tiene de él (D-38). */
   platformPlanId: string | null; platformPlanSnapshot: unknown;
+  /** Sus datos fiscales, de la ficha de marca (D-27, bloque 4.6): salen en la factura (D-39). */
+  legalName: string; rfc: string | null;
 };
 
 const SELECT = {
   id: true, organizationId: true, folio: true, periodStart: true, periodEnd: true, lines: true, totalCents: true, paidCents: true, status: true,
   issuedAt: true, dueDate: true, paidAt: true, paymentMethod: true, paymentRef: true, note: true, voidReason: true,
+  subtotalCents: true, taxCents: true, taxRateBps: true, taxIncluded: true, discountCents: true, receiver: true, issuer: true,
 } as const;
 const SELECT_PAGO = {
   id: true, invoiceId: true, amountCents: true, paymentMethod: true, paymentRef: true, paidOn: true, note: true,
@@ -31,7 +43,7 @@ const SELECT_PAGO = {
 } as const;
 const SELECT_MARCA = {
   id: true, tradeName: true, serviceStatus: true, activatedAt: true, createdAt: true,
-  autoSuspendHoldUntil: true, suspendedAutomatically: true, platformPlanId: true, platformPlanSnapshot: true,
+  autoSuspendHoldUntil: true, suspendedAutomatically: true, platformPlanId: true, platformPlanSnapshot: true, legalName: true, rfc: true,
 } as const;
 
 /** Un día de calendario (`AAAA-MM-DD`) como lo guarda una columna DATE. */
@@ -151,7 +163,11 @@ export class PlatformBillingRepository extends GlobalRepository {
   }
 
   /** Emite la factura del periodo. El folio es correlativo por año; la unicidad la garantiza la base. */
-  async issue(input: { organizationId: string; periodStart: string; periodEnd: string; lines: LineaFactura[]; totalCents: bigint; dueDate: string; note: string | null; byUserId: string | null }): Promise<Factura> {
+  async issue(input: {
+    organizationId: string; periodStart: string; periodEnd: string; lines: LineaFactura[]; totalCents: bigint; dueDate: string; note: string | null; byUserId: string | null;
+    /** D-39: el desglose y los datos fiscales se congelan con la factura. Sin desglose, el subtotal es el total (sin IVA ni descuento). */
+    subtotalCents?: bigint; taxCents?: bigint; taxRateBps?: number; taxIncluded?: boolean; discountCents?: bigint; receiver?: object | null; issuer?: object | null;
+  }): Promise<Factura> {
     return this.db.$transaction(async (tx) => {
       const anio = input.periodStart.slice(0, 4);
       // Candado por año: dos emisiones a la vez no se pelean el folio.
@@ -162,6 +178,8 @@ export class PlatformBillingRepository extends GlobalRepository {
         data: {
           id: uuidv7(), organizationId: input.organizationId, folio, periodStart: dia(input.periodStart), periodEnd: dia(input.periodEnd),
           lines: input.lines, totalCents: input.totalCents, dueDate: dia(input.dueDate), note: input.note, createdByUserId: input.byUserId,
+          subtotalCents: input.subtotalCents ?? input.totalCents, taxCents: input.taxCents ?? 0n, taxRateBps: input.taxRateBps ?? 0, taxIncluded: input.taxIncluded ?? false, discountCents: input.discountCents ?? 0n,
+          ...(input.receiver ? { receiver: input.receiver } : {}), ...(input.issuer ? { issuer: input.issuer } : {}),
         },
         select: SELECT,
       });

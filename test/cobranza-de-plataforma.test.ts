@@ -3,7 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { masDias } from '@gymflow/core';
 import { makeApp, loginAs, loginPlataforma, correoUnico } from './helpers.js';
 import { gimnasioPropio, type GimnasioPropio } from './gimnasio-propio.js';
-import { ponerPrecios, preciosActuales } from './precios-de-prueba.js';
+import { liberadaElDiaUno, ponerPrecios, preciosActuales } from './precios-de-prueba.js';
 import { closeDb, getDb } from '../src/platform/db/client.js';
 import { PlatformAuditService } from '../src/platform/audit/platform-audit.service.js';
 import { moduleViewOf, forgetModules } from '../src/platform/modules/module-state.js';
@@ -159,6 +159,8 @@ describe('cobranza de plataforma · en la base, con el reloj de prueba', () => {
     });
     expect(alta.statusCode, alta.body).toBe(201);
     const id = alta.json().organizationId as string;
+    // D-39 (bloque 4.9): el primer mes se cobra por días; aquí se prueba la cobranza con el mes completo.
+    await liberadaElDiaUno(id);
     const owner = await db().user.findFirstOrThrow({ where: { organizationId: id, roleAssignments: { some: { role: { key: 'OWNER' } } } }, select: { id: true } });
     return { id, ownerId: owner.id };
   }
