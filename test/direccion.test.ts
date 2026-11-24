@@ -144,7 +144,8 @@ describe('dirección (2.7)', () => {
     expect(p.plan.name).toBeNull();
     expect(p.plan.included).toContain('Caja');
     expect(p.plan.addOns).toEqual([]);
-    expect(p.rules).toMatchObject({ managerAttendsFrontDesk: false, monthsAfterArchive: null });
+    // Sin plazo propio rigen los 24 meses de D-32: la pantalla ya no dice «sin plazo» (3.12).
+    expect(p.rules).toMatchObject({ managerAttendsFrontDesk: false, monthsAfterArchive: 24 });
 
     expect((await get(owner, '/organization/profile')).statusCode).toBe(200);
     expect((await get(recepcion, '/organization/profile')).statusCode).toBe(403);

@@ -3,8 +3,8 @@ import { onlinePaymentsEnabled } from '../../platform/payments-mode.js';
 import { z } from 'zod';
 import { DomainError, formatMoney, money, moduleDisabled, notFound, validation } from '@gymflow/core';
 import {
-  PAGINA_MAXIMA, PortalAttendance, PortalAttendanceSummary, PortalChargesPage, PortalMe, PortalNotices, PortalPaymentsPage,
-  PortalReceipt, PortalSessions, PortalStatement, leerCursor,
+  PAGINA_MAXIMA, PortalAttendance, PortalAttendanceSummary, PortalChargesPage, PortalMe, PortalNotices, PortalNotifications,
+  PortalOffer, PortalPaymentsPage, PortalReceipt, PortalSessions, PortalStatement, leerCursor,
   type PartesDelCursor, type PortalCharge, type PortalPayment,
 } from '@gymflow/core/contracts';
 import type { SessionEndReason } from '@gymflow/core/vocabulario';
@@ -19,6 +19,8 @@ import { moduleViewOf, modulesOf } from '../../platform/modules/module-state.js'
 import { contar, registerModuleUsage } from '../../platform/modules/usage.js';
 import { CIERRE_DEL_SOCIO, MEMBER_IDLE_DAYS, PortalAuthRepository, PortalRepository } from './portal.repository.js';
 import { PORTAL_PAGINA, PortalService, tieneComprobante } from './portal.service.js';
+import { PortalNotificationsService } from './notificaciones.js';
+import { ofertaPara } from './oferta.js';
 import type { Env } from '../../platform/env.js';
 
 const idParam = z.object({ id: z.string().uuid() });
@@ -80,7 +82,7 @@ function pagoDelSocio(p: { id: string; method: PortalPayment['method']; status: 
  * es un usuario (ADR-023). Mezclarlos significaría que un fallo aquí podría
  * conceder permisos de personal, y un fallo así no revienta: autoriza.
  */
-type SesionDeSocio = { organizationId: string; memberId: string; /** La hora tope de la sesión de ESTE teléfono. */ expiresAt: Date };
+type SesionDeSocio = { organizationId: string; memberId: string; /** La hora tope de la sesión de ESTE teléfono. */ expiresAt: Date; /** La sesión de ESTE teléfono: a ella se atan sus notificaciones (3.10). */ sessionId: string };
 /** Una consulta por petición: la puerta de módulos y el handler preguntan lo mismo. */
 const resueltas = new WeakMap<FastifyRequest, Promise<SesionDeSocio>>();
 
@@ -117,7 +119,7 @@ export function requireMemberSession(request: FastifyRequest): Promise<SesionDeS
       const vista = await moduleViewOf(session.organizationId);
       if (vista.serviceStatus !== 'ACTIVE') throw new DomainError('FORBIDDEN', 'El servicio de tu gimnasio no está activo. Pregunta en recepción.');
       if (!vista.org.has('member_portal')) throw moduleDisabled('Portal del socio');
-      return { organizationId: session.organizationId, memberId: session.memberId, expiresAt: session.expiresAt };
+      return { organizationId: session.organizationId, memberId: session.memberId, expiresAt: session.expiresAt, sessionId: session.id };
     })();
     resueltas.set(request, sesion);
   }
@@ -313,6 +315,7 @@ export function registerPortalRoutes(app: FastifyInstance, env: Env): void {
         accessMethods: a.accessMethods.map((m) => ({ ...m, enrolledAt: m.enrolledAt.toISOString() })),
         visitPack: a.visitPack && { ...a.visitPack, expiresOn: a.visitPack.expiresOn ? iso(a.visitPack.expiresOn) : null },
         dayPass: a.dayPass && { branchName: a.dayPass.branchName, validOn: iso(a.dayPass.validOn) },
+        trialPass: a.trialPass && { branchName: a.trialPass.branchName, validOn: iso(a.trialPass.validOn) },
         planEnded: a.planEnded && { ...a.planEnded, periodEnd: iso(a.planEnded.periodEnd) },
         // Lo que el gimnasio le ofrece al socio (ADR-036), ya resuelto: el portal no interpreta claves de módulo.
         // `classes` es el módulo; si además hay clases en el horario lo contesta `/portal/classes/offered`.
@@ -427,7 +430,94 @@ export function registerPortalRoutes(app: FastifyInstance, env: Env): void {
         businessDate: iso(r.pago.businessDate), receivedAt: r.pago.receivedAt.toISOString(),
         reversal: r.pago.reversesPaymentId !== null,
         lines: r.lines.map((l) => ({ concept: l.concept, amountCents: cents(l.amountCents) })),
+        // El aviso del cambio de precio de su plan (D-19), el mismo del comprobante del mostrador.
+        priceNotice: r.priceNotice && { kind: r.priceNotice.kind, planName: r.priceNotice.planName, fromPriceCents: cents(r.priceNotice.fromPriceCents), toPriceCents: cents(r.priceNotice.toPriceCents) },
       };
+    },
+  });
+
+  // ── Fase 3, bloque 3.10 · D-35: qué puede renovar o comprar, a precio de lista ──
+
+  /**
+   * SOLO LECTURA. Los planes, paquetes, pases y clases sueltas que se venden
+   * en su sede, a precio de lista, y lo que costaría renovar el suyo. No hay
+   * ruta que compre desde el teléfono: eso llega con el cobro en línea (fase
+   * 5) y mientras tanto se paga en recepción. Contrato: `PortalOffer`.
+   */
+  route(app, {
+    method: 'GET',
+    url: '/portal/offer',
+    security: { kind: 'member' },
+    schema: respuesta(200, PortalOffer),
+    handler: async (request): Promise<PortalOffer> => {
+      const { organizationId, memberId } = await requireMemberSession(request);
+      return ofertaPara(organizationId, memberId);
+    },
+  });
+
+  // ── Fase 3, bloque 3.10 · D-34: notificaciones gratis que el socio enciende y apaga ──
+  const notificaciones = new PortalNotificationsService();
+  const suscripcion = z.object({
+    endpoint: z.string().url().max(2000),
+    keys: z.object({ p256dh: z.string().min(10).max(500), auth: z.string().min(5).max(200) }),
+  });
+
+  /** Si este servidor notifica, en cuántos de sus teléfonos están encendidas y de qué temas. Contrato: `PortalNotifications`. */
+  route(app, {
+    method: 'GET',
+    url: '/portal/notifications',
+    security: { kind: 'member' },
+    schema: respuesta(200, PortalNotifications),
+    handler: async (request): Promise<PortalNotifications> => {
+      const { organizationId, memberId } = await requireMemberSession(request);
+      return notificaciones.estado(organizationId, memberId);
+    },
+  });
+
+  /** Encender o apagar un tema (pagos, clases). Lo de seguridad y de acceso no se apaga. */
+  route(app, {
+    method: 'PUT',
+    url: '/portal/notifications/preferences',
+    security: { kind: 'member' },
+    schema: respuesta(200, PortalNotifications),
+    handler: async (request): Promise<PortalNotifications> => {
+      const { organizationId, memberId } = await requireMemberSession(request);
+      const body = z.object({ payments: z.boolean().optional(), classes: z.boolean().optional() }).strict()
+        .refine((b) => b.payments !== undefined || b.classes !== undefined, 'Di qué tema enciendes o apagas').parse(request.body);
+      return notificaciones.guardarPreferencias(organizationId, memberId, {
+        ...(body.payments !== undefined ? { payments: body.payments } : {}), ...(body.classes !== undefined ? { classes: body.classes } : {}),
+      });
+    },
+  });
+
+  /** Encender las notificaciones en ESTE teléfono: guarda la suscripción de su navegador, atada a su sesión. */
+  route(app, {
+    method: 'POST',
+    url: '/portal/push-subscriptions',
+    security: { kind: 'member' },
+    config: { rateLimit: { max: 20, timeWindow: '1 hour' } },
+    schema: respuesta(201, PortalNotifications),
+    handler: async (request, reply) => {
+      const { organizationId, memberId, sessionId } = await requireMemberSession(request);
+      const body = suscripcion.parse(request.body);
+      const estado = await notificaciones.suscribir({
+        organizationId, memberId, sessionId, endpoint: body.endpoint, p256dh: body.keys.p256dh, auth: body.keys.auth,
+        userAgent: request.headers['user-agent'] ?? null,
+      });
+      return reply.status(201).send(estado);
+    },
+  });
+
+  /** Apagarlas en ESTE teléfono. */
+  route(app, {
+    method: 'DELETE',
+    url: '/portal/push-subscriptions',
+    security: { kind: 'member' },
+    schema: respuesta(200, PortalNotifications),
+    handler: async (request): Promise<PortalNotifications> => {
+      const { organizationId, memberId } = await requireMemberSession(request);
+      const { endpoint } = z.object({ endpoint: z.string().url().max(2000) }).parse(request.body);
+      return notificaciones.desuscribir(organizationId, memberId, endpoint);
     },
   });
 }

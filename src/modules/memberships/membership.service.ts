@@ -450,7 +450,7 @@ export class MembershipService {
         reason,
         data: { canceledAt: new Date(), cancellationReason: reason, endedAt: new Date() },
       });
-      await emitMembershipClosed({ organizationId: ctx.tenant.organizationId, membershipId: m.id, memberId: m.memberId, outcome: 'CANCELED', reason });
+      await emitMembershipClosed({ organizationId: ctx.tenant.organizationId, membershipId: m.id, memberId: m.memberId, outcome: 'CANCELED', reason, fromStatus: m.status, actorUserId: ctx.tenant.actorUserId ?? null });
       return r;
     });
   }

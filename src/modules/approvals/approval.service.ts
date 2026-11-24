@@ -3,13 +3,14 @@ import {
   APPROVAL_GRANT_TTL_MS, APPROVAL_REASK_LIMIT, APPROVAL_REJECTION_MEMORY_MS, APPROVAL_REQUEST_TTL_MS, APPROVAL_RESOURCE_OPTIONAL, DomainError,
   approvalFailureStep, approvalRejectLockUntil, approvalResourceTypesFor,
   canApprove, forbidden, isAllowed, isApprovalResourceType, monthOfMonthlyCloseResourceId, validation,
-  type ApprovalFailureStep, type ApprovalReach, type ApprovalResourceType, type PermissionKey,
+  type ApprovalFailureStep, type ApprovalReach, type ApprovalResourceType, type Grant, type PermissionKey, type RoleLimits, type TenantContext,
 } from '@gymflow/core';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { systemContext } from '../../platform/jobs/types.js';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 import { AuthUserRepository, GrantRepository, PushService, UserRepository, type AuthService } from '../identity/index.js';
 import { ApprovalGrantRepository, ApprovalReachRepository, ApprovalRequestRepository, ApprovalSignerLockRepository, type RechazoPrevio } from './approval.repository.js';
+import { ApprovalProxyRepository } from './approval-proxy.repository.js';
 import { generateOpaqueToken, hashToken } from '../../platform/crypto.js';
 import type { RequestContext } from '../../platform/context.js';
 
@@ -35,6 +36,17 @@ type CausaDeFallo = 'CONTRASENA' | 'EN_PAUSA' | 'DESCONOCIDO' | 'MISMA_PERSONA' 
 export type FalloDeFirma = { causa: 'CONTRASENA' | 'EN_PAUSA'; failedCount?: number; step?: ApprovalFailureStep; pausedUntil?: Date | null };
 
 type Firmante = { id: string; fullName: string; passwordHash: string };
+
+/**
+ * CON QUÉ AUTORIDAD FIRMA ALGUIEN (D-02). `null`: por su puesto (el dueño).
+ * Con valor: como APODERADO TEMPORAL, con el nombramiento vigente que le dio
+ * el dueño y con la autoridad de ese dueño (sus sedes y sus topes).
+ */
+export type Apoderado = { proxyId: string; ownerUserId: string; ownerName: string; endsAt: Date };
+
+/** Lo que el asiento de una firma dada como apoderado lleva de más: la bitácora lo lee como «firmó como apoderado de …». */
+export const comoApoderado = (a: Apoderado | null): Record<string, unknown> =>
+  (a ? { asProxy: true, proxyId: a.proxyId, proxyOfUserId: a.ownerUserId, proxyOfName: a.ownerName } : {});
 
 /**
  * CÓMO ESTÁ UNA OPERACIÓN (D-03): el «no» que sigue vigente, hasta cuándo no
@@ -84,7 +96,7 @@ export class ApprovalService {
   async issue(ctx: RequestContext, auth: AuthService, input: Operacion & {
     email?: string | undefined; approverUserId?: string | undefined; password: string;
     permission: PermissionKey;
-  }): Promise<{ approvalToken: string; approverName: string; expiresAt: Date }> {
+  }): Promise<{ approvalToken: string; approverName: string; approverProxyOf: string | null; expiresAt: Date }> {
     const actor = ctx.tenant.actorUserId;
     if (!actor) throw new DomainError('UNAUTHENTICATED', 'Sesión requerida');
     const orgId = ctx.tenant.organizationId;
@@ -117,18 +129,21 @@ export class ApprovalService {
       throw forbidden('Nadie se autoriza a sí mismo: tiene que ser otra persona');
     }
     try { this.requireFirmaVigente(aprobador); } catch (e) { await fallo('FIRMA_NO_VIGENTE', aprobador.id); throw e; }
-    try { await this.requireAuthority(orgId, aprobador.id, input.permission, op); } catch (e) { await fallo('SIN_AUTORIDAD', aprobador.id); throw e; }
+    let apoderado: Apoderado | null;
+    try { apoderado = await this.requireAuthority(orgId, aprobador.id, input.permission, op); } catch (e) { await fallo('SIN_AUTORIDAD', aprobador.id); throw e; }
 
-    const { token, expiresAt, grantId } = await this.crearFirma(orgId, aprobador.id, actor, input.permission, op);
+    const { token, expiresAt, grantId } = await this.crearFirma(orgId, aprobador.id, actor, input.permission, op, apoderado);
     // La firma presencial deja rastro (20-02): quién la pidió, quién firmó, qué y cuánto.
     await this.audit.record(ctx, {
       action: 'approval.local.issue', ...recursoDelAsiento(op, grantId), branchId: op.branchId ?? null, approvedByUserId: aprobador.id,
       afterState: {
         permission: input.permission, amountCents: op.amountCents?.toString() ?? null, resourceId: op.resourceId ?? null, grantId, expiresAt: expiresAt.toISOString(),
         ...(op.resourceTypeInferred ? { resourceTypeInferred: true } : {}),
+        // D-02: «firmó como apoderado de …».
+        ...comoApoderado(apoderado),
       },
     });
-    return { approvalToken: token, approverName: aprobador.fullName, expiresAt };
+    return { approvalToken: token, approverName: aprobador.fullName, approverProxyOf: apoderado?.ownerName ?? null, expiresAt };
   }
 
   /**
@@ -262,14 +277,14 @@ export class ApprovalService {
   }
 
   /** Emite la firma de un solo uso, atada a la operación y al importe. */
-  async crearFirma(organizationId: string, approverUserId: string, requestedByUserId: string, permission: PermissionKey, op: Operacion): Promise<{ token: string; expiresAt: Date; grantId: string }> {
+  async crearFirma(organizationId: string, approverUserId: string, requestedByUserId: string, permission: PermissionKey, op: Operacion, apoderado: Apoderado | null = null): Promise<{ token: string; expiresAt: Date; grantId: string }> {
     const token = generateOpaqueToken();
     const expiresAt = new Date(Date.now() + APPROVAL_GRANT_TTL_MS);
     const { id } = await new ApprovalGrantRepository(organizationId).create({
       approverUserId, requestedByUserId, permission,
       tokenHash: hashToken(token),
       branchId: op.branchId ?? null, resourceType: op.resourceType ?? null, resourceId: op.resourceId ?? null,
-      amountCents: op.amountCents ?? null, expiresAt,
+      amountCents: op.amountCents ?? null, expiresAt, proxyId: apoderado?.proxyId ?? null,
     });
     return { token, expiresAt, grantId: id };
   }
@@ -277,6 +292,40 @@ export class ApprovalService {
   /** ¿Puede esta persona firmar esta operación? Sin lanzar: para la bandeja. */
   async puedeFirmar(organizationId: string, userId: string, permission: PermissionKey, op: Operacion): Promise<boolean> {
     try { await this.requireAuthority(organizationId, userId, permission, op); return true; } catch { return false; }
+  }
+
+  /**
+   * Con qué autoridad firma esta persona esta operación: `null` por su puesto,
+   * o su nombramiento de apoderado (D-02). Lanza si no puede firmarla.
+   */
+  firmaComo(organizationId: string, userId: string, permission: PermissionKey, op: Operacion): Promise<Apoderado | null> {
+    return this.requireAuthority(organizationId, userId, permission, op);
+  }
+
+  /**
+   * LA AUTORIDAD CON LA QUE ALGUIEN VE LA BANDEJA (D-02): sus propios
+   * permisos y topes si da la segunda firma por su puesto; los del dueño que
+   * lo nombró si es su apoderado vigente; `null` si no firma nada.
+   */
+  async autoridadDeFirma(tenant: TenantContext): Promise<{ tenant: TenantContext; apoderado: Apoderado | null } | null> {
+    if (tenant.grants.some((g) => g.permission === 'approvals:grant')) return { tenant, apoderado: null };
+    const userId = tenant.actorUserId;
+    if (!userId) return null;
+    const r = await this.autoridadDelApoderado(tenant.organizationId, userId);
+    return r && { tenant: { ...tenant, grants: r.grants, limits: r.limits }, apoderado: r.apoderado };
+  }
+
+  /** El nombramiento vigente de una persona y la autoridad del dueño que la nombró; `null` si no lo tiene o ya no vale. */
+  private async autoridadDelApoderado(organizationId: string, userId: string): Promise<{ apoderado: Apoderado; grants: Grant[]; limits: RoleLimits } | null> {
+    const n = await new ApprovalProxyRepository(organizationId).vigenteDe(userId);
+    if (!n) return null;
+    // Firma con la autoridad de quien lo nombró: si esa persona ya no está
+    // activa en el gimnasio o dejó de dar la segunda firma, el nombramiento no vale.
+    const dueno = await this.users.findById(n.grantedByUserId);
+    if (!dueno || !dueno.isActive || dueno.organizationId !== organizationId) return null;
+    const [grants, limits] = await Promise.all([this.grants.grantsForUser(dueno.id), this.grants.limitsForUser(dueno.id, organizationId)]);
+    if (!grants.some((g) => g.permission === 'approvals:grant')) return null;
+    return { apoderado: { proxyId: n.id, ownerUserId: dueno.id, ownerName: dueno.fullName, endsAt: n.endsAt }, grants, limits };
   }
 
   /**
@@ -328,7 +377,7 @@ export class ApprovalService {
    * firma: el diálogo no escribe los minutos a mano (29-09).
    */
   async whoCanApprove(ctx: RequestContext, permission: PermissionKey, op: Operacion): Promise<{
-    approvers: Array<{ fullName: string; userId: string; pausedUntil: string | null; reach: ApprovalReach }>;
+    approvers: Array<{ fullName: string; userId: string; pausedUntil: string | null; reach: ApprovalReach; proxyOf: string | null }>;
     requestTtlSeconds: number; grantTtlSeconds: number;
     /** D-03: el «no» vigente y el tope de esta operación; null si no se dijo de qué registro se trata. */
     operation: EstadoDeOperacion | null;
@@ -337,9 +386,11 @@ export class ApprovalService {
     // Nadie se autoriza a sí mismo; firma quien tiene la segunda firma: el
     // dueño, desde su teléfono (decisión del 2026-10-05).
     const candidatos = await new UserRepository(orgId).activeExcept(ctx.tenant.actorUserId ?? '');
-    const out: Array<{ fullName: string; userId: string }> = [];
+    const out: Array<{ fullName: string; userId: string; proxyOf: string | null }> = [];
     for (const u of candidatos) {
-      if (await this.puedeFirmar(orgId, u.id, permission, op)) out.push({ fullName: u.fullName, userId: u.id });
+      // Con quién firma cada uno (D-02): por su puesto, o como apoderado del dueño.
+      const firma = await this.requireAuthority(orgId, u.id, permission, op).then((a) => ({ a }), () => null);
+      if (firma) out.push({ fullName: u.fullName, userId: u.id, proxyOf: firma.a?.ownerName ?? null });
     }
     const ids = out.map((a) => a.userId);
     // Cómo se va a enterar cada uno (29-05): aviso en su teléfono, panel abierto o ninguna de las dos.
@@ -356,13 +407,29 @@ export class ApprovalService {
     };
   }
 
-  /** Tiene la segunda firma sobre ESA sucursal (SEC2-05, 2026-10-05). */
-  private async requireAuthority(organizationId: string, userId: string, permission: PermissionKey, op: { branchId?: string | null | undefined; amountCents?: bigint | undefined; percent?: number | undefined }): Promise<void> {
-    const [grants, limits] = await Promise.all([this.grants.grantsForUser(userId), this.grants.limitsForUser(userId, organizationId)]);
-    // La segunda firma la da quien tiene `approvals:grant` (el dueño, 2026-10-05).
-    if (!grants.some((g) => g.permission === 'approvals:grant')) throw forbidden('La segunda firma la da el dueño del gimnasio');
+  /**
+   * QUIÉN DA LA SEGUNDA FIRMA: el único lugar que lo decide.
+   *
+   * Tiene la segunda firma sobre ESA sucursal (SEC2-05, 2026-10-05) quien
+   * tiene `approvals:grant` por su puesto (el dueño), o su APODERADO TEMPORAL
+   * (D-02, fase 3): la persona que el dueño nombró, mientras el nombramiento
+   * esté vigente. El apoderado firma con la autoridad del dueño (sus sedes y
+   * sus topes), nunca lo suyo (eso lo cuida quien llama, igual que para el
+   * dueño) y NO lo que otra persona rechazó mientras ese «no» siga vigente.
+   * Devuelve con qué autoridad firma: `null` por su puesto, o el nombramiento.
+   */
+  private async requireAuthority(organizationId: string, userId: string, permission: PermissionKey, op: { branchId?: string | null | undefined; amountCents?: bigint | undefined; percent?: number | undefined; resourceId?: string | undefined }): Promise<Apoderado | null> {
+    let [grants, limits] = await Promise.all([this.grants.grantsForUser(userId), this.grants.limitsForUser(userId, organizationId)]);
+    let apoderado: Apoderado | null = null;
+    // La segunda firma la da quien tiene `approvals:grant` (el dueño, 2026-10-05)…
+    if (!grants.some((g) => g.permission === 'approvals:grant')) {
+      // …o su apoderado temporal, con la autoridad del dueño que lo nombró (D-02).
+      const r = await this.autoridadDelApoderado(organizationId, userId);
+      if (!r) throw forbidden('La segunda firma la da el dueño del gimnasio');
+      ({ apoderado, grants, limits } = r);
+    }
     const decision = canApprove(
-      { organizationId, actorType: 'USER', actorUserId: userId, grants, limits, requestId: 'approval' },
+      { organizationId, actorType: 'USER', actorUserId: apoderado?.ownerUserId ?? userId, grants, limits, requestId: 'approval' },
       permission,
       // Sin sede (cargo de organización) basta el permiso en cualquier alcance,
       // como antes. El descuento se mide en PORCENTAJE: sin él (al emitir) no
@@ -379,6 +446,19 @@ export class ApprovalService {
         ? 'Quien autoriza no tiene autoridad sobre esta sucursal'
         : decision.outcome === 'DENY' ? decision.detail : 'Quien autoriza no puede cubrir ese importe');
     }
+    // El apoderado no pasa por encima de un «no» ajeno (D-02; regla del
+    // orquestador, la más restrictiva): mientras ese rechazo siga vigente
+    // (24 horas, o hasta que quien firma por su puesto la autorice), esa
+    // operación solo la autoriza el dueño. Su propio «no» sí puede cambiarlo.
+    if (apoderado && op.resourceId) {
+      const { rechazo } = await this.estadoDeLaOperacion(organizationId, permission, op.resourceId);
+      if (rechazo && rechazo.approverUserId !== userId) {
+        throw new DomainError('FORBIDDEN',
+          `${rechazo.approverName ?? 'Quien autoriza'} ya rechazó esta operación: como apoderado no puedes autorizarla`,
+          `Solo ${apoderado.ownerName} puede cambiar ese «no».`, 'APPROVAL_PROXY_BLOCKED_BY_REJECTION');
+      }
+    }
+    return apoderado;
   }
 
   /** Lo que no se firmó en el mostrador también queda (20-02): quién pedía, qué correo se tecleó y por qué no pasó. */

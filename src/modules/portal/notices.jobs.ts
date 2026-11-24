@@ -2,7 +2,7 @@ import { formatMoney, money } from '@gymflow/core';
 import type { JobHandler, JobResult } from '../../platform/jobs/types.js';
 import { onlinePaymentsEnabled } from '../../platform/payments-mode.js';
 import { GlobalRepository } from '../../platform/db/tenant-repository.js';
-import { MemberNoticeRepository } from '../members/index.js';
+import { PortalNotificationsService, esperarEnvios } from './notificaciones.js';
 import { sqlDeSede } from '../../platform/db/filtro-de-sede.js';
 import { BusinessCalendar, type SedesDelDia } from '../../platform/time/business-calendar.js';
 
@@ -71,7 +71,9 @@ class NoticeScanRepository extends GlobalRepository {
 const notices: JobHandler = async (organizationId) => {
   const result: JobResult = { job: 'portal.notices', processed: 0, skipped: 0, batches: 1, truncated: false, errors: [] };
   const scan = new NoticeScanRepository();
-  const avisos = new MemberNoticeRepository(organizationId);
+  // Cada aviso nace en la campana y, si el socio tiene encendidas las notificaciones de ese tema, sale a su teléfono (3.10; D-34 c).
+  const notificaciones = new PortalNotificationsService();
+  const avisos = { emit: (aviso: Parameters<PortalNotificationsService['avisar']>[1]) => notificaciones.avisar(organizationId, aviso) };
   // Con cobro en línea no se manda al socio al mostrador (UX7 Portal 6).
   const enLinea = onlinePaymentsEnabled();
   // Las sedes agrupadas por su fecha de hoy: casi siempre un solo grupo.
@@ -117,6 +119,8 @@ const notices: JobHandler = async (organizationId) => {
   for (const [paso, fn] of pasos) {
     try { result.processed += await fn(); } catch (error) { result.errors.push({ entityId: paso, error: error instanceof Error ? error.message : String(error) }); }
   }
+  // El proceso del cierre diario termina al acabar: antes, que salgan las notificaciones.
+  await esperarEnvios();
   return result;
 };
 

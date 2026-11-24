@@ -1,9 +1,11 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import {
-  conflict, DomainError, formatMoney, forbidden, money, notFound,
+  conflict, DomainError, formatMoney, forbidden, money, notFound, LIMITES_DE_LOS_TOPES_DEL_CAJON, type CashMovementType,
 } from '@gymflow/core';
-import { OpenCashSessionsLite } from '@gymflow/core/contracts';
+import { CashLimits, OpenCashSessionsLite } from '@gymflow/core/contracts';
+import { CashSettingsRepository } from './cash-settings.repository.js';
+import { enUnaTransaccion } from '../../platform/db/unit-of-work.js';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { route } from '../../platform/http/registry.js';
 import { respuesta } from '../../platform/http/respuesta.js';
@@ -312,47 +314,130 @@ export function registerCashRoutes(app: FastifyInstance): void {
     },
   });
 
+  /**
+   * MOVIMIENTOS DEL CAJÓN (D-15, bloque 3.5), en dos rutas porque son dos
+   * permisos y una escritura dice con UNO lo que autoriza:
+   *
+   *  · `/petty-movements` (`cash:petty:record`): entrada de fondo y gasto
+   *    chico. Con motivo y sin firma hasta el tope del gimnasio por turno.
+   *  · `/movements` (`cash:withdraw`): retiro, depósito y corrección, siempre
+   *    con firma. Sigue aceptando fondo y gasto de quien tiene los dos permisos.
+   *
+   * Cuándo se pide la firma y hasta cuánto lo decide el servicio con
+   * `reglaDelCajon`, que ve el turno y los topes; aquí van el permiso, la
+   * sede, el motivo y que la firma, si viene, sea para ESTE turno.
+   */
+  const cuerpoDeMovimiento = <T extends [string, ...string[]]>(tipos: T) => z.object({
+    movementType: z.enum(tipos),
+    amountCents: z.string().regex(/^[0-9]{1,12}$/, 'Importe en centavos, hasta 12 dígitos'),
+    reason: z.string().min(3).max(300),
+    sign: z.union([z.literal(1), z.literal(-1)]).optional(),
+    approvalToken: z.string().min(20).max(200).optional(),
+  });
+  const esChico = (t: string) => t === 'FLOAT_IN' || t === 'EXPENSE';
+
+  async function turnoDe(request: FastifyRequest, id: string): Promise<CashSessionRecord> {
+    const session = await new CashSessionRepository(request.ctx!.tenant.organizationId).findById(id);
+    if (!session) throw notFound('Turno no encontrado');
+    return session;
+  }
+
+  async function mover(request: FastifyRequest, session: CashSessionRecord, body: { movementType: string; amountCents: string; reason: string; sign?: 1 | -1 | undefined; approvalToken?: string | undefined }) {
+    const ctx = request.ctx!;
+    const id = session.id;
+    const aprobador = await request.verifyApprover(body.approvalToken, 'cash:withdraw', { branchId: session.branchId, resourceType: 'CashSession', resourceId: session.id, amountCents: BigInt(body.amountCents) });
+    request.authorize(esChico(body.movementType) ? 'cash:petty:record' : 'cash:withdraw', {
+      branchId: session.branchId,
+      reason: body.reason,
+      amountCents: BigInt(body.amountCents),
+      ...(aprobador ? { approvedByUserId: aprobador } : {}),
+    });
+    return serializeMovement(await service.addMovement(ctx, {
+      sessionId: id,
+      movementType: body.movementType as CashMovementType,
+      amountCents: BigInt(body.amountCents),
+      reason: body.reason,
+      ...(body.sign ? { sign: body.sign } : {}),
+      approvedByUserId: aprobador,
+    }));
+  }
+
   route(app, {
     method: 'POST',
     url: '/cash-sessions/:id/movements',
     security: { kind: 'permission', permission: 'cash:withdraw' },
     handler: async (request, reply) => {
-      const ctx = request.ctx!;
       const { id } = idParam.parse(request.params);
+      const body = cuerpoDeMovimiento(['FLOAT_IN', 'WITHDRAWAL', 'EXPENSE', 'DEPOSIT', 'CORRECTION']).parse(request.body);
+      const session = await turnoDe(request, id);
+      // La sede del turno: quien retira en una sucursal no mueve el cajón de otra.
+      request.requirePermission('cash:withdraw', session.branchId);
+      return reply.status(201).send(await mover(request, session, body));
+    },
+  });
+
+  route(app, {
+    method: 'POST',
+    url: '/cash-sessions/:id/petty-movements',
+    security: { kind: 'permission', permission: 'cash:petty:record' },
+    handler: async (request, reply) => {
+      const { id } = idParam.parse(request.params);
+      const body = cuerpoDeMovimiento(['FLOAT_IN', 'EXPENSE']).parse(request.body);
+      const session = await turnoDe(request, id);
+      request.requirePermission('cash:petty:record', session.branchId);
+      return reply.status(201).send(await mover(request, session, body));
+    },
+  });
+
+  // ── Los topes del cajón (D-15, bloque 3.5) ───────────────────────────────
+  const serializarTopes = (t: { pettyLimitCents: bigint; withdrawalShiftLimitCents: bigint; isDefault: boolean }): CashLimits => ({
+    pettyLimitCents: cents(t.pettyLimitCents), withdrawalShiftLimitCents: cents(t.withdrawalShiftLimitCents), isDefault: t.isDefault,
+    max: { pettyLimitCents: cents(LIMITES_DE_LOS_TOPES_DEL_CAJON.pettyMaxCents), withdrawalShiftLimitCents: cents(LIMITES_DE_LOS_TOPES_DEL_CAJON.withdrawalMaxCents) },
+  });
+
+  /** Los ve quien ve la caja: el diálogo de movimientos dice hasta cuánto se anota sin firma. */
+  route(app, {
+    method: 'GET',
+    url: '/cash/limits',
+    security: { kind: 'permission', permission: 'cash:session:read', anyOf: ['cash:petty:record', 'cash:withdraw'] },
+    schema: respuesta(200, CashLimits),
+    handler: async (request): Promise<CashLimits> => serializarTopes(await new CashSettingsRepository(request.ctx!.tenant.organizationId).get()),
+  });
+
+  /**
+   * Cambiarlos es de la gerencia, SIEMPRE con la firma de la dueña: son los
+   * topes que limitan a la propia gerencia. Valen para todo el gimnasio.
+   */
+  route(app, {
+    method: 'PUT',
+    url: '/cash/limits',
+    security: { kind: 'permission', permission: 'cash:limits:set' },
+    schema: respuesta(200, CashLimits),
+    handler: async (request): Promise<CashLimits> => {
+      const ctx = request.ctx!;
+      const orgId = ctx.tenant.organizationId;
+      const importe = (max: bigint) => z.string().regex(/^[0-9]{1,12}$/, 'Importe en centavos').refine((v) => BigInt(v) <= max, 'Pasa del máximo permitido');
       const body = z.object({
-        movementType: z.enum(['FLOAT_IN', 'WITHDRAWAL', 'EXPENSE', 'DEPOSIT', 'CORRECTION']),
-        amountCents: z.string().regex(/^[0-9]{1,12}$/, 'Importe en centavos, hasta 12 dígitos'),
+        pettyLimitCents: importe(LIMITES_DE_LOS_TOPES_DEL_CAJON.pettyMaxCents),
+        withdrawalShiftLimitCents: importe(LIMITES_DE_LOS_TOPES_DEL_CAJON.withdrawalMaxCents),
         reason: z.string().min(3).max(300),
-        sign: z.union([z.literal(1), z.literal(-1)]).optional(),
         approvalToken: z.string().min(20).max(200).optional(),
       }).parse(request.body);
-
-      const session = await new CashSessionRepository(ctx.tenant.organizationId).findById(id);
-      if (!session) throw notFound('Turno no encontrado');
-
-      // El límite de retiro por turno es acumulado, no por movimiento: si no,
-      // bastaría partir un retiro grande en varios pequeños para esquivarlo.
-      const yaRetirado = await new CashSessionRepository(ctx.tenant.organizationId)
-        .withdrawnByUserCents(id, ctx.tenant.actorUserId ?? '00000000-0000-0000-0000-000000000000');
-      const acumulado = yaRetirado + BigInt(body.amountCents);
-
-      const aprobador = await request.verifyApprover(body.approvalToken, 'cash:withdraw', { branchId: session.branchId, resourceType: 'CashSession', resourceId: session.id, amountCents: BigInt(body.amountCents) });
-      request.authorize('cash:withdraw', {
-        branchId: session.branchId,
-        reason: body.reason,
-        amountCents: acumulado,
-        ...(aprobador ? { approvedByUserId: aprobador } : {}),
+      const aprobador = await request.verifyApprover(body.approvalToken, 'cash:limits:set', { branchId: null, resourceType: 'CashLimits', resourceId: orgId });
+      request.authorize('cash:limits:set', { branchId: null, reason: body.reason, ...(aprobador ? { approvedByUserId: aprobador } : {}) });
+      const repo = new CashSettingsRepository(orgId);
+      const despues = await enUnaTransaccion(async () => {
+        const antes = await repo.get();
+        const nuevo = await repo.set({ pettyLimitCents: BigInt(body.pettyLimitCents), withdrawalShiftLimitCents: BigInt(body.withdrawalShiftLimitCents), userId: ctx.tenant.actorUserId ?? null });
+        await new AuditService().record(ctx, {
+          action: 'cash.limits.update', resourceType: 'Organization', resourceId: orgId,
+          beforeState: { pettyLimitCents: antes.pettyLimitCents.toString(), withdrawalShiftLimitCents: antes.withdrawalShiftLimitCents.toString() },
+          afterState: { pettyLimitCents: nuevo.pettyLimitCents.toString(), withdrawalShiftLimitCents: nuevo.withdrawalShiftLimitCents.toString() },
+          reason: body.reason, approvedByUserId: aprobador,
+        });
+        return nuevo;
       });
-
-      const movimiento = await service.addMovement(ctx, {
-        sessionId: id,
-        movementType: body.movementType,
-        amountCents: BigInt(body.amountCents),
-        reason: body.reason,
-        ...(body.sign ? { sign: body.sign } : {}),
-        approvedByUserId: aprobador,
-      });
-      return reply.status(201).send(serializeMovement(movimiento));
+      return serializarTopes(despues);
     },
   });
 

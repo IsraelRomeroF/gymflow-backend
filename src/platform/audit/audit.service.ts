@@ -1,5 +1,5 @@
 import { ACTIONS_REQUIRING_REASON, validation, verifyAuditChain, type AuditActorType, type ChainVerification } from '@gymflow/core';
-import { AuditRepository, type AuditEntry, type AuditListOptions } from './audit.repository.js';
+import { AuditRepository, type AuditEntry, type AuditListOptions, type ChainCursor } from './audit.repository.js';
 import type { RequestContext } from '../context.js';
 import { BusinessCalendar } from '../time/business-calendar.js';
 import { olvidarTableros } from '../cache.js';
@@ -79,6 +79,11 @@ export class AuditService {
     return this.repo.exceptionSummary(organizationId, opts);
   }
 
+  /** Entradas autorizadas sin rostro, resumidas por quién autorizó, día y sede (D-06; 3.12). */
+  withoutFaceSummary(organizationId: string, opts: Parameters<AuditRepository['withoutFaceSummary']>[1]) {
+    return this.repo.withoutFaceSummary(organizationId, opts);
+  }
+
   /** Las sedes de la organización con su nombre y su zona: el CSV las necesita (20-09). */
   branches(organizationId: string) {
     return this.repo.branches(organizationId);
@@ -86,7 +91,7 @@ export class AuditService {
 
   /** Recorre la cadena completa por tramos y la verifica eslabón por eslabón. */
   async verifyChain(organizationId: string, pageSize = 1000): Promise<ChainVerification> {
-    let after: { at: Date; id: string } | null = null;
+    let after: ChainCursor | null = null;
     let prev: string | null = null;
     let checked = 0;
     for (;;) {
@@ -97,7 +102,7 @@ export class AuditService {
       checked += r.checked;
       prev = r.lastHash;
       const ultimo = tramo.at(-1)!;
-      after = { at: ultimo.at, id: ultimo.content.id };
+      after = { at: ultimo.at, id: ultimo.content.id, chainSeq: ultimo.chainSeq };
     }
   }
 }

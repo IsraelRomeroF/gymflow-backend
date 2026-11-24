@@ -1,3 +1,4 @@
+import { ventaConCorreccion } from './correcciones.routes.js';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { money, notFound } from '@gymflow/core';
@@ -77,7 +78,8 @@ export function registerSaleRoutes(app: FastifyInstance): void {
       const sale = await repo.findById(id);
       if (!sale) throw notFound('Venta no encontrada');
       request.requirePermission('pos:sale:create', sale.branchId);
-      return serializeSale(sale, await repo.lines(id));
+      // Con su corrección (D-13, bloque 3.5): si está «por corregir», si ya se devolvió y qué se puede hacer hoy.
+      return ventaConCorreccion(ctx.tenant.organizationId, sale);
     },
   });
 

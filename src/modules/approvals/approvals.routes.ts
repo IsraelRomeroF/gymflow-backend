@@ -1,11 +1,12 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { APPROVAL_NOTE_MAX, APPROVAL_NOTE_MIN, APPROVAL_RESOURCE_TYPES, PERMISSIONS, type PermissionKey } from '@gymflow/core';
-import { ApprovalApprovers, ApprovalHistory, ApprovalInbox, ApprovalRequest, ApprovalRequestState } from '@gymflow/core/contracts';
+import { ApprovalApprovers, ApprovalHistory, ApprovalInbox, ApprovalProxyAppointment, ApprovalProxyState, ApprovalRequest, ApprovalRequestState } from '@gymflow/core/contracts';
 import { route } from '../../platform/http/registry.js';
 import { respuesta } from '../../platform/http/respuesta.js';
 import { ApprovalService } from './approval.service.js';
 import { RemoteApprovalService, type Pregunta, type RechazoAnterior, type SolicitudConHistoria } from './remote-approval.service.js';
+import { ApprovalProxyService, type NombramientoALaVista } from './approval-proxy.service.js';
 import type { Env } from '../../platform/env.js';
 
 /**
@@ -46,7 +47,7 @@ export function registerApprovalRoutes(app: FastifyInstance, env: Env): void {
         permission: body.permission as PermissionKey, branchId: body.branchId,
         resourceType: body.resourceType, resourceId: body.resourceId, amountCents: body.amountCents,
       });
-      return { approvalToken: r.approvalToken, approverName: r.approverName, expiresAt: r.expiresAt.toISOString() };
+      return { approvalToken: r.approvalToken, approverName: r.approverName, approverProxyOf: r.approverProxyOf, expiresAt: r.expiresAt.toISOString() };
     },
   });
 
@@ -138,7 +139,7 @@ export function registerApprovalRoutes(app: FastifyInstance, env: Env): void {
       const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
       const r = await remotas.status(request.ctx!, id);
       // `delivery`: la firma de una aprobada sigue lista, ya se usó o venció (29-03).
-      return { ...solicitudJson(r), approverName: r.approverName, approvalToken: r.approvalToken, delivery: r.delivery };
+      return { ...solicitudJson(r), approverName: r.approverName, approverProxyOf: r.approverProxyOf, approvalToken: r.approvalToken, delivery: r.delivery };
     },
   });
 
@@ -188,7 +189,7 @@ export function registerApprovalRoutes(app: FastifyInstance, env: Env): void {
         requests: h.requests.map((r) => ({
           id: r.id, permission: r.permission, branchId: r.branchId, resourceType: r.resourceType, resourceId: r.resourceId,
           amountCents: r.amountCents?.toString() ?? null, summary: r.summary, context: r.context, reason: r.reason,
-          status: r.status, requesterName: r.requesterName, approverName: r.approverName, mine: r.mine,
+          status: r.status, requesterName: r.requesterName, approverName: r.approverName, approverProxyOf: r.approverProxyOf, mine: r.mine,
           createdAt: r.createdAt.toISOString(), resolvedAt: r.resolvedAt.toISOString(), rejectReason: r.rejectReason,
           delivery: r.delivery, seenAt: r.seenAt?.toISOString() ?? null, notifiedCount: r.notifiedCount,
           previousRejection: rechazoJson(r.previousRejection), reply: r.reply, question: preguntaJson(r.question),
@@ -248,6 +249,68 @@ export function registerApprovalRoutes(app: FastifyInstance, env: Env): void {
       const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
       const { answer } = z.object({ answer: nota }).parse(request.body);
       await remotas.answer(request.ctx!, id, answer);
+      return { ok: true };
+    },
+  });
+
+  // ── Apoderado temporal (D-02, fase 3, bloque 3.1) ─────────────────────────
+  const apoderados = new ApprovalProxyService();
+  const nombramientoJson = (n: NombramientoALaVista) => ({
+    id: n.id, proxyUserId: n.proxyUserId, proxyName: n.proxyName, grantedByUserId: n.grantedByUserId, grantedByName: n.grantedByName,
+    note: n.note, createdAt: n.createdAt.toISOString(), endsAt: n.endsAt.toISOString(),
+    endedAt: n.endedAt?.toISOString() ?? null, endReason: n.endReason, active: n.active, signedCount: n.signedCount, rejectedCount: n.rejectedCount,
+  });
+
+  /**
+   * El apoderado del gimnasio. Quien da la segunda firma por su puesto (el
+   * dueño) ve el vigente, a quién puede nombrar y los anteriores; el apoderado
+   * ve el suyo; los demás, nada (`current: null`).
+   */
+  route(app, {
+    method: 'GET',
+    url: '/approvals/proxy',
+    security: { kind: 'session' },
+    schema: respuesta(200, ApprovalProxyState),
+    handler: async (request) => {
+      const e = await apoderados.estado(request.ctx!);
+      return { ...e, current: e.current && nombramientoJson(e.current), history: e.history.map(nombramientoJson) };
+    },
+  });
+
+  /**
+   * El dueño nombra a su apoderado, con su contraseña y con fecha de fin (el
+   * último día que vale, completo, en la zona del gimnasio). Nombrar a otra
+   * persona termina el nombramiento anterior.
+   */
+  route(app, {
+    method: 'POST',
+    url: '/approvals/proxy',
+    security: { kind: 'permission', permission: 'approvals:grant' },
+    // Pide contraseña: el mismo límite que el resto de las autorizaciones.
+    config: { rateLimit: { max: env.AUTH_ATTEMPTS_PER_IP, timeWindow: '5 minutes' } },
+    schema: respuesta(201, ApprovalProxyAppointment),
+    handler: async (request, reply) => {
+      request.requirePermission('approvals:grant', null);
+      const body = z.object({
+        proxyUserId: z.string().uuid(),
+        endsOn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'La fecha va como AAAA-MM-DD').refine((d) => !Number.isNaN(Date.parse(`${d}T00:00:00Z`)), 'Esa fecha no existe'),
+        note: z.string().trim().max(APPROVAL_NOTE_MAX).optional(),
+        password: z.string().min(1),
+      }).parse(request.body);
+      const n = await apoderados.nombrar(request.ctx!, body);
+      return reply.status(201).send(nombramientoJson(n));
+    },
+  });
+
+  /** El dueño revoca el nombramiento vigente: desde ese instante el apoderado no firma. */
+  route(app, {
+    method: 'POST',
+    url: '/approvals/proxy/revoke',
+    security: { kind: 'permission', permission: 'approvals:grant' },
+    handler: async (request) => {
+      request.requirePermission('approvals:grant', null);
+      const { reason } = z.object({ reason: z.string().trim().max(APPROVAL_NOTE_MAX).optional() }).parse(request.body ?? {});
+      await apoderados.revocar(request.ctx!, reason);
       return { ok: true };
     },
   });

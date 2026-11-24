@@ -35,6 +35,10 @@ export { EnrollmentService, type ResumenLimpiezaRostros } from './enrollment.ser
 // rostros de exsocios siguen guardados para borrarlos a los 30 días de la baja.
 export { FaceTemplateRepository } from './face-template.repository.js';
 
+// Consumida por: privacy (bloque 3.12, D-32). Los rostros que se borran a los
+// 30 días de apagar Biometría con el aviso confirmado.
+export { rostrosQueBorraApagar } from './rostros-al-apagar.js';
+
 // Consumida por: classes. Al entrar, la clase reservada queda con su llegada.
 export { registerEntryHook, type EntryEvent } from './entry-hooks.js';
 

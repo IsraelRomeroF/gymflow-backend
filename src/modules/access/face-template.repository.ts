@@ -47,6 +47,19 @@ export class FaceTemplateRepository extends TenantRepository {
     });
   }
 
+  /**
+   * Los rostros guardados de enrolamientos sin revocar, de una sucursal o de
+   * todo el gimnasio (3.12): lo que se borraría si Biometría se apaga ahí.
+   * Cuenta también los de exsocios en espera de sus 30 días: están guardados.
+   */
+  async guardadas(branchId?: string | null): Promise<Array<{ enrollmentId: string; memberId: string; branchId: string }>> {
+    return this.db.faceTemplate.findMany({
+      where: this.scope({ ...(branchId ? { branchId } : {}), enrollment: { revokedAt: null } }),
+      select: { enrollmentId: true, memberId: true, branchId: true },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
   /** Borra la plantilla de verdad (no solo la marca): es lo que exige revocar. */
   async deleteForEnrollment(enrollmentId: string): Promise<boolean> {
     const { count } = await this.db.faceTemplate.deleteMany({ where: this.scope({ enrollmentId }) });

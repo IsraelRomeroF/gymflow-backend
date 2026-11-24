@@ -99,6 +99,34 @@ export class MembershipRepository extends TenantRepository {
     return row as MembershipRecord | null;
   }
 
+  /** D-14 (bloque 3.5): si al terminar su periodo se cobra otro igual o vence y se vuelve a vender. Solo en una membresía viva. */
+  async setAutoRenew(id: string, autoRenew: boolean): Promise<MembershipRecord | null> {
+    const r = await this.db.membership.updateMany({ where: this.scope({ id, status: { in: [...LIVE, S.SUSPENDED] } }), data: { autoRenew } });
+    return r.count === 0 ? null : this.findById(id);
+  }
+
+  /**
+   * D-14: las membresías de un plan PAGADO POR ADELANTADO que siguen vivas y
+   * marcadas «se renueva sola»: las que nacieron así sin que nadie lo eligiera.
+   * Con el plan y el socio, para listarlas antes de tocarlas.
+   */
+  async prepagosQueSeRenuevan(): Promise<Array<{
+    id: string; memberId: string; memberCode: string; planName: string; status: string; currentPeriodEnd: Date; createdAt: Date; priceCents: bigint;
+  }>> {
+    const rows = await this.db.membership.findMany({
+      where: this.scope({ autoRenew: true, status: { in: [...LIVE, S.SUSPENDED] }, plan: { billingModel: PrismaBillingModel.PREPAID_PERIOD } }),
+      select: {
+        id: true, memberId: true, status: true, currentPeriodEnd: true, createdAt: true, agreedPriceCents: true,
+        member: { select: { memberCode: true } }, plan: { select: { name: true, priceCents: true } },
+      },
+      orderBy: { currentPeriodEnd: 'asc' },
+    });
+    return rows.map((r) => ({
+      id: r.id, memberId: r.memberId, memberCode: r.member.memberCode, planName: r.plan.name, status: r.status,
+      currentPeriodEnd: r.currentPeriodEnd, createdAt: r.createdAt, priceCents: r.agreedPriceCents ?? r.plan.priceCents,
+    }));
+  }
+
   /** Historial completo: los periodos y sus huecos son visibles a propósito. */
   async listForMember(memberId: string): Promise<MembershipRecord[]> {
     const rows = await this.db.membership.findMany({

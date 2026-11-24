@@ -57,6 +57,14 @@ export class HomeRepository extends TenantRepository {
     return new Set(filas.map((f) => f.consentType as string));
   }
 
+  /** Los tipos de texto con una versión que ya se pidió publicar y espera la firma de la dueña (D-25). */
+  async textosEsperandoFirma(): Promise<Set<string>> {
+    const filas = await this.db.consentSignatureRequest.findMany({
+      where: { organizationId: this.organizationId, status: 'PENDING' }, select: { document: { select: { consentType: true } } },
+    });
+    return new Set(filas.map((f) => f.document.consentType as string));
+  }
+
   /** Clases que faltan hoy (o están en curso) y no tienen coach. */
   async clasesSinCoach(sedes: readonly string[], desde: Date, hasta: Date): Promise<number> {
     if (sedes.length === 0) return 0;

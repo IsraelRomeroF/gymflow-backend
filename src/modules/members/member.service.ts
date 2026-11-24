@@ -8,6 +8,7 @@ import { ConsentDocumentRepository } from './consent-document.repository.js';
 import { enUnaTransaccion } from '../../platform/db/unit-of-work.js';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 import { MemberRepository, type CreateMemberInput, type MemberRecord } from './member.repository.js';
+import { exigirCoachActivo } from './coach-valido.js';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import type { RequestContext } from '../../platform/context.js';
 import { asentarResponsable, prepararResponsable, type GuardianInput, type ResponsibleInput } from './responsible.js';
@@ -92,9 +93,12 @@ export class MemberService {
       responsible?: ResponsibleInput | null | undefined;
       /** El tutor que firma en el mostrador por un menor (D-10): los consentimientos quedan a su nombre. */
       guardian?: GuardianInput | null | undefined;
+      /** D-29: el coach que recepción elige al dar de alta. Después solo lo cambia la gerencia. */
+      coachUserId?: string | null | undefined;
     },
   ): Promise<CreateMemberResult> {
     const orgId = ctx.tenant.organizationId;
+    if (input.coachUserId) await exigirCoachActivo(orgId, input.coachUserId);
 
     const missing = REQUIRED_CONSENTS.filter(
       (type) => !input.consents.some((c) => c.consentType === type && c.granted),
@@ -174,6 +178,15 @@ export class MemberService {
         ...(responsibleColumns ? { responsable: responsibleColumns.responsibleKind, ...(input.guardian ? { firmoSuTutor: true } : {}) } : {}),
       },
     });
+
+    // D-29: el coach elegido al alta queda en su ficha y en la bitácora, en la misma unidad.
+    if (input.coachUserId) {
+      await members.setCoach(member.id, input.coachUserId);
+      await this.audit.record(ctx, {
+        action: 'member.coach.at_signup', resourceType: 'Member', resourceId: member.id,
+        branchId: input.homeBranchId ?? null, afterState: { coachUserId: input.coachUserId },
+      });
+    }
 
     return { status: 'CREATED', member };
     });

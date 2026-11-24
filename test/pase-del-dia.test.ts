@@ -7,6 +7,7 @@ import {
 } from '@gymflow/core/contracts';
 import { makeApp, loginAs, orgFixtures, nombreUnico, telefonoUnico, CONSENTIMIENTOS, aprobacion } from './helpers.js';
 import { closeDb, getDb } from '../src/platform/db/client.js';
+import { altaSinCobro } from './membresia-de-prueba.js';
 
 /**
  * PASE DEL DÍA (auditoría 8, bloque 1.8; hallazgo 4-01; D-20).
@@ -319,10 +320,7 @@ describe('pase del día (1.8)', () => {
     });
     expect(venta.statusCode, venta.body).toBe(422);
     expect(venta.json().message).toMatch(/pase del día/);
-    const aMano = await app.inject({
-      method: 'POST', url: `/members/${memberId}/memberships`, headers: { cookie: gerencia },
-      payload: { reason: 'Corrección de prueba', planId: visita, soldAtBranchId: cen },
-    });
+    const aMano = await altaSinCobro(app, gerencia, memberId, { reason: 'Corrección de prueba', planId: visita, soldAtBranchId: cen });
     expect(aMano.statusCode, aMano.body).toBe(422);
     expect(await getDb().membership.count({ where: { memberId } })).toBe(0);
     expect(await getDb().charge.count({ where: { memberId } })).toBe(0);

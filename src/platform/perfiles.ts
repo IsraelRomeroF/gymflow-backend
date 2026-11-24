@@ -16,6 +16,10 @@
  *   | pruebas   | gymflow_pruebas | 4001 · 4002 · 4003   | sandbox | 127.0.0.1,::1 |
  *   | unitarias | gymflow_test*   | —                    | sandbox | —             |
  *
+ * El uso real puede además abrirse a internet con una DIRECCIÓN FIJA (D-01,
+ * fase 3): mismas base y puertos, más las reglas de «abierto a internet» de
+ * abajo.
+ *
  * Aquí viven las REGLAS (qué combinación vale), no los valores: los pone
  * `scripts/perfil.sh`. Con una combinación inválida la API no arranca y dice
  * qué está mal y cómo se arregla.
@@ -117,7 +121,138 @@ export type Arranque = {
   portalOrigins: readonly string[];
   /** Dirección pública del portal: con ella el portal se abre por túnel o dominio. */
   PORTAL_PUBLIC_URL?: string | undefined;
+  /** Dirección pública del panel (D-01): la que abre la dueña desde su teléfono. */
+  PANEL_PUBLIC_URL?: string | undefined;
+  /** Dominio de las cookies de sesión; vacío = cada cookie vale solo en la dirección que la puso. */
+  SESSION_COOKIE_DOMAIN?: string | undefined;
 };
+
+/**
+ * ENTRAR DESDE FUERA CON DIRECCIÓN FIJA (D-01, fase 3).
+ *
+ * GymFlow sigue en la computadora del gimnasio; un túnel con nombre publica
+ * el panel y el portal en un dominio propio. Desde que una de las dos
+ * direcciones públicas no es de esta computadora ni de la red del gimnasio,
+ * la instalación está ABIERTA A INTERNET y la API solo arranca si todo lo
+ * demás corresponde: https, proxies de confianza (para contar a cada persona
+ * con su IP real), el cobro con tarjeta apagado, y como orígenes los
+ * públicos. Los valores los pone `gymflow.sh` desde `~/.gymflow/uso-real.env`.
+ */
+
+/** `localhost`, 127.x, ::1, las redes privadas (10.x, 172.16–31.x, 192.168.x) y `*.local`. */
+export function esHostLocal(host: string): boolean {
+  const h = host.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h === '::1') return true;
+  const m = /^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(h);
+  if (!m) return false;
+  const [a, b] = [Number(m[1]), Number(m[2])];
+  return a === 127 || a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31) || (a === 169 && b === 254);
+}
+
+/** La URL si se entiende y es http o https; si no, `null`. */
+function direccion(valor: string | undefined): URL | null {
+  if (!valor?.trim()) return null;
+  try {
+    const u = new URL(valor.trim());
+    return u.protocol === 'http:' || u.protocol === 'https:' ? u : null;
+  } catch {
+    return null;
+  }
+}
+
+/** ¿Alguna dirección pública sale de esta computadora y de la red del gimnasio? */
+export function abiertoAInternet(e: Pick<Arranque, 'PANEL_PUBLIC_URL' | 'PORTAL_PUBLIC_URL'>): boolean {
+  return [e.PANEL_PUBLIC_URL, e.PORTAL_PUBLIC_URL].some((v) => {
+    const u = direccion(v);
+    return u !== null && !esHostLocal(u.hostname);
+  });
+}
+
+/** Los túneles sin cuenta de Cloudflare: su dirección cambia en cada arranque. */
+export function esDireccionProvisional(url: string | undefined): boolean {
+  const u = direccion(url);
+  return u !== null && /(^|\.)trycloudflare\.com$/.test(u.hostname);
+}
+
+/** El dominio de cookie como se compara: sin punto inicial y en minúsculas. */
+export function dominioDeCookie(valor: string | undefined): string {
+  return (valor ?? '').trim().toLowerCase().replace(/^\./, '');
+}
+
+/**
+ * ¿La cookie con ese dominio le sirve a quien entró por `host`? Solo si el
+ * host ES el dominio o cuelga de él. Quien entra por `localhost` o por la red
+ * del gimnasio recibe la cookie sin dominio: con dominio, su navegador la
+ * tiraría y el mostrador se quedaría sin poder entrar el día que se va
+ * internet.
+ */
+export function cookieConDominio(host: string | undefined, dominio: string | undefined): boolean {
+  const d = dominioDeCookie(dominio);
+  if (!d || !host) return false;
+  const h = host.trim().toLowerCase().replace(/:\d+$/, '');
+  return h === d || h.endsWith(`.${d}`);
+}
+
+/** Lo que el modo abierto a internet exige, además de lo de cada perfil. */
+function problemasDeDireccionPublica(e: Arranque): string[] {
+  const problemas: string[] = [];
+  const publicas = [
+    { nombre: 'PANEL_PUBLIC_URL', que: 'el panel', a: 'al panel', valor: e.PANEL_PUBLIC_URL },
+    { nombre: 'PORTAL_PUBLIC_URL', que: 'el portal', a: 'al portal', valor: e.PORTAL_PUBLIC_URL },
+  ].filter((p) => p.valor?.trim());
+  const origenes = e.CORS_ORIGINS.split(',').map((o) => o.trim().replace(/\/$/, '')).filter(Boolean);
+  const portal = e.portalOrigins.map((o) => o.replace(/\/$/, ''));
+
+  for (const p of publicas) {
+    const u = direccion(p.valor);
+    if (!u) {
+      problemas.push(`${p.nombre}=«${p.valor}» no es una dirección: va completa, con https:// (por ejemplo https://panel.tu-dominio.mx).`);
+      continue;
+    }
+    if (esHostLocal(u.hostname)) continue;
+    if (u.protocol !== 'https:') {
+      problemas.push(
+        `${p.nombre} abre ${p.que} a internet por http (${u.origin}): por internet solo se entra por https. `
+        + 'El túnel de Cloudflare ya lo da: escribe la dirección con https://.',
+      );
+    }
+    if (!origenes.includes(u.origin)) {
+      problemas.push(`CORS_ORIGINS no incluye ${u.origin} (${p.nombre}): desde esa dirección la API rechazaría ${p.a}. «bash gymflow.sh» lo agrega solo.`);
+    }
+    if (p.nombre === 'PORTAL_PUBLIC_URL' && !portal.includes(u.origin)) {
+      problemas.push(`PORTAL_ORIGINS no incluye ${u.origin}: es la dirección pública del portal. «bash gymflow.sh» lo agrega solo.`);
+    }
+  }
+
+  if (abiertoAInternet(e)) {
+    if (e.trustedProxies.length === 0) {
+      problemas.push(
+        'Con una dirección pública (PANEL_PUBLIC_URL o PORTAL_PUBLIC_URL: el panel o el portal abiertos por un túnel o un dominio) '
+        + 'TRUSTED_PROXIES es obligatoria: sin ella todos los teléfonos comparten un solo cupo de intentos y nadie más puede darse de alta.',
+      );
+    }
+    if (e.paymentProvider === 'sandbox') {
+      problemas.push(
+        'Con una dirección pública el cobro con tarjeta va apagado (PAYMENT_PROVIDER=none): la caja de arena aprueba pagos sin mover dinero '
+        + 'y por internet cualquiera la alcanzaría. El portal dice «Paga en recepción».',
+      );
+    }
+  }
+
+  const dominio = dominioDeCookie(e.SESSION_COOKIE_DOMAIN);
+  if (dominio) {
+    const hosts = publicas.map((p) => direccion(p.valor)?.hostname).filter((h): h is string => !!h);
+    if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(dominio) || /^\d+(\.\d+){3}$/.test(dominio)) {
+      problemas.push(`SESSION_COOKIE_DOMAIN=«${e.SESSION_COOKIE_DOMAIN}» no es un dominio: va sin https:// y sin puerto (por ejemplo tu-dominio.mx). Vacía también vale.`);
+    } else if (abiertoAInternet(e) && !hosts.some((h) => cookieConDominio(h, dominio))) {
+      problemas.push(
+        `SESSION_COOKIE_DOMAIN=«${dominio}» no corresponde a ninguna dirección pública (${hosts.join(', ')}): `
+        + 'el navegador tiraría la cookie y nadie podría entrar desde fuera. Déjala vacía o pon el dominio del que cuelgan.',
+      );
+    }
+  }
+  return problemas;
+}
 
 /**
  * Lo que impide arrancar, en español y con el arreglo. Vacío = la
@@ -177,12 +312,16 @@ export function problemasDeArranque(e: Arranque): string[] {
     problemas.push(`En producción la base no puede abrirse con ${comoSeLlamaLaClave}.`);
   }
 
-  if (e.PORTAL_PUBLIC_URL?.trim() && e.trustedProxies.length === 0) {
+  // Con el portal en otra dirección (aunque sea de esta computadora, como en
+  // las pruebas) los proxies siguen siendo obligatorios (9-05); abierto a
+  // internet lo exige `problemasDeDireccionPublica`, con todo lo demás.
+  if (e.PORTAL_PUBLIC_URL?.trim() && e.trustedProxies.length === 0 && !abiertoAInternet(e)) {
     problemas.push(
       'Con PORTAL_PUBLIC_URL (el portal abierto por un túnel o un dominio) TRUSTED_PROXIES es obligatoria: '
       + 'sin ella todos los teléfonos comparten un solo cupo de intentos y nadie más puede darse de alta.',
     );
   }
 
+  problemas.push(...problemasDeDireccionPublica(e));
   return problemas;
 }

@@ -399,16 +399,17 @@ describe('caja, corte de turno y cartera consolidada', () => {
       method: 'POST', url: `/cash-sessions/${sesion}/movements`, headers: { cookie: owner },
       payload: { movementType: 'WITHDRAWAL', amountCents: '10000', reason: 'Retiro sin firma' },
     });
-    expect(res.statusCode).toBe(422);
+    // D-15 (bloque 3.5): ya no es un 422 genérico; es la misma señal de «pide firma» que el resto (428).
+    expect(res.statusCode).toBe(428);
     expect(res.json().message).toMatch(/segundo usuario/);
   });
 
   it('el límite de retiro por turno es ACUMULADO: no se esquiva partiéndolo', async () => {
     const caja = await nuevaCaja(branchCEN);
     const sesion = await abrirTurno(caja.id, '1500000');
-    // Recepción ya no retira (atiende y consulta, no modifica). El tope se
-    // prueba con la gerencia de sede, poniéndole uno a propósito y
-    // devolviéndolo al final.
+    // El tope por turno se prueba con la gerencia de sede, poniéndole uno a
+    // propósito y devolviéndolo al final (el de recepción, con D-15, está en
+    // `cajon-d15.test.ts`).
     const gerente = await loginAs(app, 'gerente@demo.mx');
     const limites = await db().roleLimitSet.findFirstOrThrow({ where: { organizationId: orgId, role: { key: 'MANAGER' } } });
     await db().roleLimitSet.update({ where: { id: limites.id }, data: { maxCashWithdrawalCents: 500_000n } });
@@ -427,17 +428,18 @@ describe('caja, corte de turno y cartera consolidada', () => {
         method: 'POST', url: `/cash-sessions/${sesion}/movements`, headers: { cookie: gerente },
         payload: { movementType: 'WITHDRAWAL', amountCents: '400000', reason: 'Segundo retiro que rebasa el acumulado' },
       });
-      expect(segundo.statusCode).toBe(428);
-      expect(segundo.json().error).toBe('REQUIRE_APPROVAL');
+      // D-15: quien tiene tope por turno no lo pasa ni con firma: se niega antes de pedirla.
+      expect(segundo.statusCode).toBe(403);
+      expect(segundo.json().reason).toBe('CASH_LIMIT_FORBIDDEN');
     } finally {
       await db().roleLimitSet.update({ where: { id: limites.id }, data: { maxCashWithdrawalCents: limites.maxCashWithdrawalCents } });
     }
-    // Y recepción, ni con firma: retirar efectivo no es suyo.
+    // Y recepción (D-15): retira con la firma de la dueña; sin ella, se le pide.
     const rec = await app.inject({
       method: 'POST', url: `/cash-sessions/${sesion}/movements`, headers: { cookie: reception },
       payload: { movementType: 'WITHDRAWAL', amountCents: '1000', reason: 'Intento de recepción' },
     });
-    expect(rec.statusCode, rec.body).toBe(403);
+    expect(rec.statusCode, rec.body).toBe(428);
   });
 
   // ── Folio ─────────────────────────────────────────────────────────────────

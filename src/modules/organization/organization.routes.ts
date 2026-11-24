@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { conflict, DomainError, forbidden, MODULES, notFound, validation } from '@gymflow/core';
+import { conflict, DomainError, forbidden, mesesDeConservacion, MODULES, notFound, validation } from '@gymflow/core';
 import { GymProfile } from '@gymflow/core/contracts';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { route } from '../../platform/http/registry.js';
@@ -52,10 +52,15 @@ export function registerOrganizationRoutes(app: FastifyInstance): void {
       // Una sucursal con Caja apagada no necesita caja registradora.
       const sinCaja = c.sedesSinCaja.filter((id) => ctx.modules?.at(id).has('cash') ?? true).length;
       const textos = c.textosPublicados.has('PRIVACY_NOTICE') && c.textosPublicados.has('HOUSE_RULES');
+      // El aviso ya se pidió publicar y espera la firma de la dueña (D-25): no es «falta publicar» (3.12).
+      const avisoEsperaFirma = !c.textosPublicados.has('PRIVACY_NOTICE') && c.textosEsperandoFirma.has('PRIVACY_NOTICE');
+      const faltaElReglamento = !c.textosPublicados.has('HOUSE_RULES');
       // Gimnasio de una persona y media (DP-07): si el gerente atiende el mostrador, no hace falta cuenta de recepción.
       const mostrador = c.recepcion > 0 || flags.managerAttendsFrontDesk;
       const pasos = [
-        { key: 'textos', required: true, done: textos, href: '/consentimientos', permission: 'settings:consent:manage' as const, title: 'Publicar el Aviso de privacidad y el Reglamento', text: textos ? 'Publicados: ya se pueden firmar altas.' : 'Sin ellos no se puede dar de alta a nadie: el socio firma al inscribirse.' },
+        { key: 'textos', required: true, done: textos, href: '/consentimientos', permission: 'settings:consent:manage' as const, title: 'Publicar el Aviso de privacidad y el Reglamento', text: textos ? 'Publicados: ya se pueden firmar altas.'
+          : avisoEsperaFirma ? `El Aviso de privacidad ya se pidió publicar y espera la firma de la dueña: no se publica hasta que lo lea y lo firme.${faltaElReglamento ? ' Falta publicar el Reglamento.' : ''} Mientras tanto no se puede dar de alta a nadie.`
+            : 'Sin ellos no se puede dar de alta a nadie: el socio firma al inscribirse.' },
         { key: 'planes', required: true, done: c.planes > 0, href: '/planes', permission: 'catalog:manage' as const, title: 'Crear los planes y sus precios', text: c.planes > 0 ? `${c.planes} ${c.planes === 1 ? 'plan activo' : 'planes activos'}.` : 'Mensualidad, visitas, pase del día: lo que se vende en el mostrador.' },
         ...(activos.has('cash') ? [{ key: 'caja', required: true, done: sinCaja === 0, href: '/sucursales', permission: 'settings:branch' as const, title: 'Una caja en cada sucursal', text: sinCaja === 0 ? 'Todas las sucursales tienen caja.' : `${sinCaja} ${sinCaja === 1 ? 'sucursal sin caja' : 'sucursales sin caja'}: sin caja no se cobra en efectivo.` }] : []),
         { key: 'personal', required: true, done: mostrador, href: '/personal', permission: 'staff:manage' as const, title: 'Dar de alta a quien atiende el mostrador',
@@ -142,7 +147,8 @@ export function registerOrganizationRoutes(app: FastifyInstance): void {
         rules: {
           allowAccessWhilePastDue: acceso.allowAccessWhilePastDue,
           managerAttendsFrontDesk: arranque.managerAttendsFrontDesk,
-          monthsAfterArchive: privacidad.monthsAfterArchive,
+          // El plazo que RIGE (D-32): sin uno propio son los 24 meses de por omisión, no «sin plazo» (3.12).
+          monthsAfterArchive: mesesDeConservacion(privacidad.monthsAfterArchive),
         },
         branches: { open: sedes.filter((b) => b.isActive).length, closed: sedes.filter((b) => !b.isActive).length },
       };

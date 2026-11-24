@@ -57,7 +57,8 @@ describe('jobs · bloque 1.16', () => {
       expect(p.frecuente.map((j) => j.name)).toEqual(ORDEN_FRECUENTE);
       expect(p.plataforma.map((j) => j.name)).toEqual(ORDEN_PLATAFORMA);
       // 11-09: cerrar las clases terminadas y el dinero en tránsito no esperan al cierre.
-      expect(ORDEN_FRECUENTE).toEqual(['payments.process-webhooks', 'payments.resolve-unknown', 'class.close-finished', 'approvals.expire-forgotten']);
+      // D-16 (bloque 3.5): los lugares apartados sin pagar se liberan antes de cerrar clases.
+      expect(ORDEN_FRECUENTE).toEqual(['payments.process-webhooks', 'payments.resolve-unknown', 'class.release-unpaid-holds', 'class.close-finished', 'approvals.expire-forgotten']);
       // 23-12: la factura a las marcas es de plataforma, no de cada gimnasio.
       expect(ORDEN_PLATAFORMA).toEqual(['platform.prices.apply', 'platform.invoices.issue', 'platform.collections', 'audit.verify-platform-chain']);
       // La verificación de la bitácora va al final de los diarios: después de todo lo que escribe en ella.

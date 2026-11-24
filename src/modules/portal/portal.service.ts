@@ -5,17 +5,18 @@ import { generateOpaqueToken, hashToken } from '../../platform/crypto.js';
 import { isModuleOn } from '../../platform/modules/module-state.js';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
-import { ChargeRepository, PaymentRepository, StatementRepository, comoSeSaldo, type ChargeRecord } from '../billing/index.js';
+import { ChargeRepository, PaymentRepository, StatementRepository, comoSeSaldo, precioDeCuotaDe, type ChargeRecord } from '../billing/index.js';
 import type { NoticePriority, PartesDelCursor } from '@gymflow/core/contracts';
 import type { DenialReason, VisitPackStatus } from '@gymflow/core';
 import { MemberRepository, MemberNoticeRepository } from '../members/index.js';
 import { MembershipRepository } from '../memberships/index.js';
-import { PlanRepository } from '../catalog/index.js';
+import { PlanRepository, avisoDePrecioEnRecibo } from '../catalog/index.js';
 import { AccessService, AttendanceRepository, EnrollmentRepository } from '../access/index.js';
 import { VisitPackRepository } from '../memberships/index.js';
 import { prioridadDe, type EstadoParaAvisos } from './notice-priority.js';
 import { BranchRepository, OrganizationRepository } from '../organization/index.js';
 import { PortalRepository, PortalAuthRepository, newInviteCode } from './portal.repository.js';
+import { MemberPushRepository, PortalNotificationsService } from './notificaciones.js';
 import type { Env } from '../../platform/env.js';
 import type { RequestContext } from '../../platform/context.js';
 
@@ -59,6 +60,10 @@ export type PortalMember = {
   accessUsesVisit: boolean;
   visitPack: { status: VisitPackStatus; visitsLeft: number; visitsPurchased: number; expiresOn: Date | null } | null;
   dayPass: { branchName: string; validOn: Date } | null;
+  /** Su pase de prueba de hoy (D-08) y la regla del rostro en su sede (D-06): fase 3, bloque 3.10. */
+  trialPass: { branchName: string; validOn: Date } | null;
+  faceRule: boolean;
+  faceMissing: boolean;
   planEnded: { planName: string | null; how: 'EXPIRED' | 'CANCELED'; paidThrough: string | null; periodEnd: Date } | null;
 };
 
@@ -113,6 +118,8 @@ export class PortalService {
     const member = await new MemberRepository(orgId).findById(memberId);
     if (!member) throw notFound('Socio no encontrado');
     const cerradas = await new PortalAuthRepository().revokeAllForMember(orgId, memberId, 'Cerrado desde recepción');
+    // Un teléfono perdido tampoco sigue recibiendo sus avisos (3.10).
+    await new MemberPushRepository().removeAllForMember(orgId, memberId);
     await this.audit.record(ctx, {
       action: 'portal.sessions.revoke', resourceType: 'Member', resourceId: memberId,
       branchId: member.homeBranchId, afterState: { sessionsRevoked: cerradas },
@@ -122,6 +129,7 @@ export class PortalService {
 
   /** El socio, desde su teléfono: "cerrar en todos" (teléfono perdido). */
   async logoutEverywhere(organizationId: string, memberId: string): Promise<number> {
+    await new MemberPushRepository().removeAllForMember(organizationId, memberId);
     return new PortalAuthRepository().revokeAllForMember(organizationId, memberId, 'El socio cerró sesión en todos sus teléfonos');
   }
 
@@ -163,7 +171,8 @@ export class PortalService {
     // Con la fecha y la hora de SU gimnasio (25-11): «Hoy a las 16:31» seguía diciendo «hoy» una semana después.
     const socio = await new MemberRepository(canje.organizationId).findById(canje.memberId);
     const zona = await new BusinessCalendar(canje.organizationId).timezoneFor(socio?.homeBranchId ?? null);
-    await new MemberNoticeRepository(canje.organizationId).emit({
+    // Sale también a los teléfonos donde ya tenía las notificaciones encendidas (3.10): es justo quien debe enterarse.
+    await new PortalNotificationsService().avisar(canje.organizationId, {
       memberId: canje.memberId, kind: 'NEW_DEVICE', dedupeKey: `NEW_DEVICE:${session.id}`,
       title: 'Tu portal se activó en un teléfono',
       body: `${cuandoSeActivo(new Date(), zona)}. Si no fuiste tú, cierra la sesión en todos tus teléfonos desde Cuenta y avisa en recepción.`,
@@ -207,6 +216,12 @@ export class PortalService {
       membership ? null : this.planTerminado(membresias, organizationId, memberId),
     ]);
     const pase = puerta?.subject?.dayPass ?? null;
+    const dePrueba = puerta?.subject?.trialPass ?? null;
+    // Lo que de verdad se le va a cobrar (DM-05; 3.10): la misma puerta que emite su cuota, que
+    // también mira el precio propio de la sede cuando la membresía no tiene pactado (pendiente de 3.6).
+    const cuota = membership && plan && membership.autoRenew && (membership.status === 'ACTIVE' || membership.status === 'TRIALING')
+      && (plan.billingModel === 'RECURRING' || plan.billingModel === 'PREPAID_PERIOD')
+      ? await precioDeCuotaDe(organizationId, membership, plan) : null;
 
     return {
       memberId: member.id,
@@ -220,11 +235,7 @@ export class PortalService {
       // «Pagado hasta» de verdad (auditoría 8, 3-01): el fin del periodo no dice si se pagó.
       paidThrough: membership ? ((p) => (p ? p.toISOString().slice(0, 10) : null))((await membresias.paidThroughFor([membership.id])).get(membership.id) ?? null) : null,
       graceUntil: membership?.graceUntil ?? null,
-      nextPayment: membership && plan && membership.autoRenew && (membership.status === 'ACTIVE' || membership.status === 'TRIALING')
-        && (plan.billingModel === 'RECURRING' || plan.billingModel === 'PREPAID_PERIOD') && (membership.agreedPriceCents ?? plan.priceCents) > 0n
-        // Lo que de verdad se le va a cobrar (DM-05): su precio pactado, no el de lista.
-        ? { amountCents: membership.agreedPriceCents ?? plan.priceCents, date: membership.currentPeriodEnd }
-        : null,
+      nextPayment: cuota !== null && cuota > 0n && membership ? { amountCents: cuota, date: membership.currentPeriodEnd } : null,
       gymName: org?.tradeName ?? '',
       homeBranchName: member.homeBranchId ? nombreSede.get(member.homeBranchId) ?? null : null,
       timezone: (member.homeBranchId ? sedes.find((b) => b.id === member.homeBranchId)?.timezone : null) ?? org?.timezone ?? 'America/Mexico_City',
@@ -238,6 +249,9 @@ export class PortalService {
       visitPack: paquete,
       // El pase que armó la puerta ya es el pagado de hoy (1.8); aquí solo se le pone el nombre de su sede.
       dayPass: pase ? { branchName: nombreSede.get(pase.branchId) ?? 'Otra sucursal', validOn: await new BusinessCalendar(organizationId).today(pase.branchId) } : null,
+      trialPass: dePrueba ? { branchName: nombreSede.get(dePrueba.branchId) ?? 'Otra sucursal', validOn: await new BusinessCalendar(organizationId).today(dePrueba.branchId) } : null,
+      faceRule: puerta?.reglaDelRostro ?? false,
+      faceMissing: puerta?.faltaElRostro ?? false,
       planEnded: terminada,
     };
   }
@@ -252,7 +266,7 @@ export class PortalService {
     const acceso = new AccessService();
     const enCasa = await acceso.veredictoParaElSocio(organizationId, memberId, sedeDeCasa);
     if (enCasa.decision.outcome === 'GRANTED') return { ...enCasa, branchId: sedeDeCasa };
-    const otras = new Set([enCasa.subject?.dayPass?.branchId, enCasa.subject?.classPass?.branchId].filter((b): b is string => !!b && b !== sedeDeCasa));
+    const otras = new Set([enCasa.subject?.dayPass?.branchId, enCasa.subject?.classPass?.branchId, enCasa.subject?.trialPass?.branchId].filter((b): b is string => !!b && b !== sedeDeCasa));
     for (const branchId of otras) {
       const ahi = await acceso.veredictoParaElSocio(organizationId, memberId, branchId);
       if (ahi.decision.outcome === 'GRANTED') return { ...ahi, branchId };
@@ -403,6 +417,7 @@ export class PortalService {
     if (!socio) throw notFound('Socio no encontrado');
     const tocados = await Promise.all(asignaciones.map((a) => cargos.findById(a.chargeId)));
     return {
+      priceNotice: await this.avisoDePrecio(organizationId, pago, tocados),
       gymName: org?.tradeName ?? '',
       branchName: pago.branchId ? sedes.find((b) => b.id === pago.branchId)?.name ?? null : null,
       memberName: `${socio.firstName} ${socio.lastName}`,
@@ -412,7 +427,31 @@ export class PortalService {
     };
   }
 
+  /**
+   * El aviso del cambio de precio de su plan en el comprobante (D-19; fase 3,
+   * bloque 3.10), igual que en el del mostrador (`billing/payments.routes.ts`):
+   * la regla es de `catalog` (`avisoDePrecioEnRecibo`); aquí solo se le dan las
+   * cuotas de periodo de esa membresía y cuáles cubre este pago.
+   */
+  private async avisoDePrecio(
+    organizationId: string, pago: { memberId: string; amountCents: bigint; createdAt: Date }, tocados: ReadonlyArray<ChargeRecord | null>,
+  ): Promise<{ kind: 'UPCOMING' | 'APPLIED'; planName: string | null; fromPriceCents: bigint; toPriceCents: bigint } | null> {
+    const membresiaId = tocados.find((c) => c?.membershipId && c.chargeType === 'MEMBERSHIP_PERIOD')?.membershipId ?? null;
+    if (!membresiaId || pago.amountCents <= 0n) return null;
+    const pagadas = new Set(tocados.filter((c) => c?.membershipId === membresiaId && c.chargeType === 'MEMBERSHIP_PERIOD').map((c) => c!.id));
+    const cuotas = (await new ChargeRepository(organizationId).listForMember(pago.memberId))
+      .filter((c) => c.membershipId === membresiaId && c.chargeType === 'MEMBERSHIP_PERIOD')
+      .map((c) => ({ createdAt: c.createdAt, cubierta: pagadas.has(c.id) }));
+    const aviso = await avisoDePrecioEnRecibo(organizationId, { membershipId: membresiaId, pagadoEn: pago.createdAt, cuotas });
+    if (!aviso) return null;
+    const membresia = await new MembershipRepository(organizationId).findById(membresiaId);
+    const plan = membresia ? await new PlanRepository(organizationId).findById(membresia.planId) : null;
+    return { ...aviso, planName: plan?.name ?? null };
+  }
+
+  /** Salir en ESTE teléfono: se cierra su sesión y deja de recibir notificaciones ahí (3.10). */
   async revokeSession(token: string, reason: string): Promise<void> {
+    await new MemberPushRepository().removeForSessionToken(hashToken(token));
     await new PortalAuthRepository().revokeSession(hashToken(token), reason);
   }
 }

@@ -1,7 +1,7 @@
 import {
   uuidv7, money, planAllocation, verifyAllocationPlan, statusOfCharge,
   type PaymentMethodType, type PaymentStatus, type AllocatableCharge, notFound, validation, conflict } from '@gymflow/core';
-import { PrismaPaymentMethodType, PrismaPaymentStatus, PrismaChargeStatus, PrismaAdjustmentType } from '@gymflow/db';
+import { PrismaPaymentMethodType, PrismaPaymentStatus, PrismaChargeStatus, PrismaAdjustmentType, type Prisma } from '@gymflow/db';
 import { TenantRepository } from '../../platform/db/tenant-repository.js';
 import { isUniqueViolation } from '../../platform/db/prisma-errors.js';
 
@@ -281,12 +281,7 @@ export class PaymentRepository extends TenantRepository {
    */
   async aplicarSaldoAFavor(memberId: string, today: Date, createdByUserId: string | null = null): Promise<{ aplicadoCents: bigint; chargeIds: string[] }> {
     return this.db.$transaction(async (tx) => {
-      const creditos = await tx.$queryRaw<Array<{ id: string; unappliedCents: bigint }>>`
-        SELECT "id", "unappliedCents" FROM "payments"
-        WHERE "organizationId" = ${this.organizationId}::uuid AND "memberId" = ${memberId}::uuid
-          AND "status" = 'SUCCEEDED' AND "amountCents" > 0 AND "unappliedCents" > 0
-        ORDER BY "receivedAt" ASC, "id" ASC
-        FOR UPDATE`;
+      const creditos = await this.creditosDisponibles(tx, memberId);
       if (creditos.length === 0) return { aplicadoCents: 0n, chargeIds: [] };
       const abiertos = await tx.$queryRaw<Array<{
         id: string; dueDate: Date; amountCents: bigint; allocatedCents: bigint; adjustedCents: bigint; issuedAt: Date | null;
@@ -326,6 +321,80 @@ export class PaymentRepository extends TenantRepository {
         if (usado > 0n) await tx.payment.update({ where: { id: cr.id }, data: { unappliedCents: { decrement: usado } } });
       }
       return { aplicadoCents: aplicado, chargeIds: [...tocados] };
+    });
+  }
+
+  /**
+   * Los pagos del socio que todavía tienen dinero A FAVOR, del más antiguo al
+   * más nuevo, bloqueados para escribir. De lo que cada pago dejó sin aplicar
+   * se descuenta lo que ya se DEVOLVIÓ de él (sus contra-asientos de
+   * reembolso llevan esa parte en su propio `unappliedCents`): antes, lo
+   * reembolsado del saldo a favor seguía contando aquí y se podía volver a
+   * aplicar a una cuota, aunque el total del socio dijera $0 (bloque 3.5).
+   */
+  private async creditosDisponibles(tx: Prisma.TransactionClient, memberId: string): Promise<Array<{ id: string; unappliedCents: bigint }>> {
+    const filas = await tx.$queryRaw<Array<{ id: string; unappliedCents: bigint }>>`
+      SELECT "id", "unappliedCents" FROM "payments"
+      WHERE "organizationId" = ${this.organizationId}::uuid AND "memberId" = ${memberId}::uuid
+        AND "status" = 'SUCCEEDED' AND "amountCents" > 0 AND "unappliedCents" > 0
+      ORDER BY "receivedAt" ASC, "id" ASC
+      FOR UPDATE`;
+    if (filas.length === 0) return [];
+    const devuelto = await tx.payment.groupBy({
+      by: ['reversesPaymentId'],
+      where: { organizationId: this.organizationId, reversesPaymentId: { in: filas.map((f) => f.id) }, status: P.SUCCEEDED, amountCents: { lt: 0n } },
+      _sum: { unappliedCents: true },
+    });
+    const porPago = new Map(devuelto.map((d) => [d.reversesPaymentId, d._sum.unappliedCents ?? 0n]));
+    return filas.map((f) => ({ id: f.id, unappliedCents: f.unappliedCents - (porPago.get(f.id) ?? 0n) })).filter((f) => f.unappliedCents > 0n);
+  }
+
+  /**
+   * DEVOLVER SALDO A FAVOR en dinero (D-13, bloque 3.5): el socio pide lo que
+   * tiene a favor (lo pagado y no usado de un plan cancelado, un excedente).
+   * Se consume de sus pagos con saldo, del más antiguo al más nuevo, y por
+   * cada uno queda un contra-asiento de reembolso por el método en que el
+   * dinero SALE (efectivo del turno abierto, o transferencia con referencia),
+   * que es lo que mueve el cajón y los ingresos del día.
+   */
+  async returnCredit(input: {
+    memberId: string; amountCents: bigint; method: PaymentMethodType; branchId: string | null; reason: string;
+    businessDate: Date; createdByUserId: string | null; cashSessionId?: string | null; folio?: string | null;
+    returnRef?: string | null; idempotencyKey: string;
+  }): Promise<{ entries: PaymentRecord[]; created: boolean }> {
+    return this.db.$transaction(async (tx) => {
+      const previas = await tx.payment.findMany({
+        where: { organizationId: this.organizationId, idempotencyKey: { startsWith: `${input.idempotencyKey}#` } }, select: SELECT, orderBy: { createdAt: 'asc' },
+      });
+      if (previas.length > 0) return { entries: previas as PaymentRecord[], created: false };
+      const creditos = await this.creditosDisponibles(tx, input.memberId);
+      const disponible = creditos.reduce((a, c) => a + c.unappliedCents, 0n);
+      if (input.amountCents <= 0n || input.amountCents > disponible) {
+        throw conflict(`Tiene ${disponible} centavos a favor: no se puede devolver más que eso`, 'NO_CREDIT');
+      }
+      let resto = input.amountCents;
+      const entries: PaymentRecord[] = [];
+      for (const cr of creditos) {
+        if (resto <= 0n) break;
+        const parte = cr.unappliedCents < resto ? cr.unappliedCents : resto;
+        resto -= parte;
+        const entrada = await tx.payment.create({
+          data: {
+            id: uuidv7(), organizationId: this.organizationId, memberId: input.memberId, branchId: input.branchId,
+            method: M[input.method], status: P.SUCCEEDED, amountCents: -parte, unappliedCents: parte,
+            businessDate: input.businessDate, reversesPaymentId: cr.id, reversalReason: `Devolución de saldo a favor: ${input.reason}`.slice(0, 400), isRefund: true,
+            cashSessionId: input.cashSessionId ?? null,
+            // Un folio por operación: va en el primer asiento (el folio es único por gimnasio).
+            folio: entries.length === 0 ? input.folio ?? null : null,
+            externalRef: input.returnRef ?? null,
+            idempotencyKey: `${input.idempotencyKey}#${entries.length}`,
+            createdByUserId: input.createdByUserId,
+          },
+          select: SELECT,
+        });
+        entries.push(entrada as PaymentRecord);
+      }
+      return { entries, created: true };
     });
   }
 
@@ -426,6 +495,18 @@ export class PaymentRepository extends TenantRepository {
     });
   }
 
+  /** Los asientos de una operación que deja varios (la devolución de saldo a favor): su llave más `#n`. */
+  async findByIdempotencyPrefix(prefix: string): Promise<PaymentRecord[]> {
+    const rows = await this.db.payment.findMany({ where: this.scope({ idempotencyKey: { startsWith: prefix } }), select: SELECT, orderBy: { createdAt: 'asc' } });
+    return rows as PaymentRecord[];
+  }
+
+  /** Lo ya devuelto de un cobro (la suma de sus contra-asientos), en positivo. */
+  async returnedCents(paymentId: string): Promise<bigint> {
+    const r = await this.db.payment.aggregate({ where: this.scope({ reversesPaymentId: paymentId }), _sum: { amountCents: true } });
+    return -(r._sum.amountCents ?? 0n);
+  }
+
   /** ¿Ya tiene contra-asientos (reversa o reembolsos)? Impide devolver dos veces. */
   async hasCounterEntries(paymentId: string): Promise<boolean> {
     const n = await this.db.payment.count({ where: this.scope({ reversesPaymentId: paymentId }) });
@@ -446,6 +527,13 @@ export class PaymentRepository extends TenantRepository {
    */
   async recordRefund(input: {
     paymentId: string; amountCents: bigint; reason: string; businessDate: Date; createdByUserId: string | null;
+    /**
+     * D-13 (bloque 3.5): la devolución parcial de un cobro de MOSTRADOR. El
+     * efectivo (o el total de la terminal) sale del turno abierto HOY, con su
+     * folio; la transferencia lleva la clave de rastreo de la devolución. El
+     * reembolso de una tarjeta en línea no trae nada de esto.
+     */
+    cashSessionId?: string | null; folio?: string | null; returnRef?: string | null; idempotencyKey?: string | null;
   }): Promise<{ refundEntry: PaymentRecord; chargeIds: string[] }> {
     return this.db.$transaction(async (tx) => {
       const [bloqueo] = await tx.$queryRaw<Array<{ id: string }>>`
@@ -460,7 +548,7 @@ export class PaymentRepository extends TenantRepository {
       });
       const yaDevuelto = previos.reduce((a, p) => a - p.amountCents, 0n);
       if (input.amountCents <= 0n || input.amountCents > original.amountCents - yaDevuelto) {
-        throw validation('El reembolso excede lo que queda de ese pago');
+        throw validation('El reembolso excede lo que queda de ese pago', undefined, 'RETURN_EXCEEDS_PAYMENT');
       }
 
       // 1. Lo que quedó a favor.
@@ -474,6 +562,9 @@ export class PaymentRepository extends TenantRepository {
           method: original.method, status: P.SUCCEEDED, amountCents: -input.amountCents,
           unappliedCents: deFavor > 0n ? deFavor : 0n, businessDate: input.businessDate,
           reversesPaymentId: original.id, reversalReason: `Reembolso: ${input.reason}`, isRefund: true,
+          cashSessionId: input.cashSessionId ?? null, folio: input.folio ?? null,
+          ...(input.returnRef ? { externalRef: input.returnRef } : {}),
+          ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
           createdByUserId: input.createdByUserId,
         },
         select: SELECT,

@@ -8,6 +8,7 @@ import { mergeLimits } from './role.repository.js';
 import { STAFF_MAX_SESSION_HOURS, SessionRepository, finDe, topeDe, type SesionViva, type TopesDeSesion } from './session.repository.js';
 import { finDeSesion, motivoDeRevocacion, textoDeFin, type FinDeSesion } from './fin-de-sesion.js';
 import { equipoDe } from './equipo.js';
+import { KnownDeviceRepository } from './known-device.repository.js';
 import { moduleViewOf } from '../../platform/modules/module-state.js';
 import type { Env } from '../../platform/env.js';
 
@@ -87,11 +88,14 @@ export type LoginResult = {
   status: 'AUTHENTICATED'; token: string; expiresAt: Date; userId: string; organizationId: string | null;
   /** Entró con una contraseña temporal: solo le sirve para elegir la suya. */
   mustChangePassword: boolean;
+  /** La llave de ESTE equipo, para su cookie: con ella se le reconoce la próxima vez (D-01). */
+  deviceKey: string;
 };
 
 export class AuthService {
   private readonly users = new AuthUserRepository();
   private readonly sessions = new SessionRepository();
+  private readonly equipos = new KnownDeviceRepository();
 
   constructor(private readonly env: Env) {}
 
@@ -122,8 +126,11 @@ export class AuthService {
   async login(
     email: string,
     password: string,
-    /** `anterior`: la cookie que ya traía este navegador; esa sesión se queda sin cookie y se cierra. */
-    meta: { ip?: string | undefined; userAgent?: string | undefined; anterior?: string | undefined },
+    /**
+     * `anterior`: la cookie que ya traía este navegador; esa sesión se queda sin cookie y se cierra.
+     * `equipo`: la llave de equipo conocido que trae este navegador, si ya entró antes (D-01).
+     */
+    meta: { ip?: string | undefined; userAgent?: string | undefined; anterior?: string | undefined; equipo?: string | undefined },
   ): Promise<LoginResult> {
     const user = await this.users.findByEmail(email);
 
@@ -146,9 +153,17 @@ export class AuthService {
      * Ahora la respuesta es la genérica, y quien tiene la contraseña correcta
      * entra si lo hace desde una IP en la que ya había entrado: el bloqueo
      * frena al que adivina, no al titular en su equipo de siempre.
+     *
+     * D-01 (fase 3): o desde un EQUIPO en el que ya había entrado. Con la
+     * dirección fija la dueña entra desde su teléfono con datos, que cambia
+     * de IP cada rato: por la IP nunca era «su equipo de siempre» y cualquiera
+     * la dejaba fuera tecleando mal su contraseña. El límite es por persona.
      */
     if (user.lockedUntil && user.lockedUntil > new Date()) {
-      const titular = ok && !!meta.ip && await this.sessions.knownIp(user.id, meta.ip);
+      const titular = ok && (
+        (!!meta.ip && await this.sessions.knownIp(user.id, meta.ip))
+        || (!!meta.equipo && await this.equipos.conocido(user.id, hashToken(meta.equipo)))
+      );
       if (!titular) throw new DomainError('UNAUTHENTICATED', 'El correo o la contraseña no coinciden');
     }
 
@@ -197,6 +212,9 @@ export class AuthService {
       deviceLabel: equipoDe(meta.userAgent) ?? undefined,
     });
     if (meta.anterior) await this.sessions.revokeByTokenHash(hashToken(meta.anterior), 'replaced');
+    // Este equipo queda como conocido de esta cuenta (D-01): la llave que ya traía, o una nueva.
+    const deviceKey = meta.equipo && /^[A-Za-z0-9_-]{20,200}$/.test(meta.equipo) ? meta.equipo : generateOpaqueToken();
+    await this.equipos.anotar(user.id, hashToken(deviceKey), equipoDe(meta.userAgent) ?? null).catch(() => undefined);
 
     return {
       status: 'AUTHENTICATED',
@@ -205,6 +223,7 @@ export class AuthService {
       userId: user.id,
       organizationId: user.organizationId,
       mustChangePassword: user.mustChangePassword,
+      deviceKey,
     };
   }
 

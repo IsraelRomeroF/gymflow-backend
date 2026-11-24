@@ -8,7 +8,8 @@ import { enUnaTransaccion } from '../../platform/db/unit-of-work.js';
 import { DemasiadosIntentos } from '../../platform/http/rate-limit.js';
 import { cifrarSensible, descifrarSensible } from '../../platform/sensitive.js';
 import type { RequestContext } from '../../platform/context.js';
-import { ApprovalService, type Operacion } from './approval.service.js';
+import { ApprovalService, comoApoderado, type Apoderado, type Operacion } from './approval.service.js';
+import { ApprovalProxyRepository } from './approval-proxy.repository.js';
 import { AuthUserRepository, PushService, UserRepository, type AuthService } from '../identity/index.js';
 import { ApprovalGrantRepository, ApprovalReachRepository, ApprovalRequestRepository, type RechazoPrevio, type Solicitud } from './approval.repository.js';
 
@@ -30,6 +31,8 @@ export type SolicitudConHistoria = Omit<Solicitud, 'question'> & ConHistoria;
 export type EstadoDeSolicitud = SolicitudConHistoria & {
   approvalToken: string | null;
   approverName: string | null;
+  /** D-02: quien contestó lo hizo como apoderado de esta persona. */
+  approverProxyOf: string | null;
   /** Solo en una aprobada: su firma sigue lista, ya se usó o venció sin usarse. */
   delivery: ApprovalDelivery | null;
   /** Lo que le queda a una pendiente, en segundos, según el reloj del servidor. */
@@ -39,6 +42,8 @@ export type EstadoDeSolicitud = SolicitudConHistoria & {
 /** Una solicitud ya resuelta, como se lee en «Resueltas hoy» (20-05). */
 export type SolicitudResuelta = SolicitudConHistoria & {
   requesterName: string | null; approverName: string | null; context: string | null;
+  /** D-02: quien contestó lo hizo como apoderado de esta persona. */
+  approverProxyOf: string | null;
   mine: boolean; resolvedAt: Date; delivery: ApprovalDelivery | null;
 };
 
@@ -87,6 +92,17 @@ export class RemoteApprovalService {
     const operacion = await this.firmas.estadoDeLaOperacion(orgId, input.permission, op.resourceId!);
     if (operacion.proximaSolicitud) {
       const quienes = approvers.map((a) => a.fullName).join(' o ');
+      // La solicitud no se crea, pero que se insistió queda en la bitácora (3.12): es lo que el
+      // dueño quiere saber («me la pidieron una cuarta vez»). El asiento va sobre la operación.
+      await this.audit.record(ctx, {
+        action: 'approval.remote.over_limit', resourceType: 'ApprovalRequest', resourceId: null, branchId: op.branchId ?? null,
+        ...(input.reason ? { reason: input.reason } : {}),
+        afterState: {
+          permission: input.permission, summary: input.summary, amountCents: op.amountCents?.toString() ?? null,
+          resourceType: op.resourceType ?? null, resourceId: op.resourceId ?? null,
+          attempt: operacion.pedidas + 1, nextRequestAt: operacion.proximaSolicitud.toISOString(),
+        },
+      });
       throw new DemasiadosIntentos(
         (operacion.proximaSolicitud.getTime() - Date.now()) / 1000,
         `Ya se pidió ${APPROVAL_REASK_LIMIT.max} veces en una hora: habla con ${quienes}. Se puede volver a pedir a las ${await this.firmas.horaLocal(orgId, op.branchId, operacion.proximaSolicitud)}.`,
@@ -151,7 +167,8 @@ export class RemoteApprovalService {
     const approverName = s.approverUserId ? (await this.users.findById(s.approverUserId))?.fullName ?? null : null;
     const secondsLeft = s.status === 'PENDING' ? Math.max(0, Math.ceil((s.expiresAt.getTime() - Date.now()) / 1000)) : 0;
     const [conHistoria] = await this.conHistoria(orgId, [s]);
-    return { ...conHistoria!, approvalToken, approverName, delivery, secondsLeft };
+    const approverProxyOf = (await this.apoderadosDe(orgId, [s])).get(s.id) ?? null;
+    return { ...conHistoria!, approvalToken, approverName, approverProxyOf, delivery, secondsLeft };
   }
 
   async cancel(ctx: RequestContext, id: string): Promise<void> {
@@ -180,10 +197,16 @@ export class RemoteApprovalService {
     const solicitudes = new ApprovalRequestRepository(orgId);
     const pendientes = await solicitudes.pendingNotRequestedBy(yo);
     // Con los permisos y topes de la SESIÓN, en memoria: antes se volvían a
-    // leer de la base por cada solicitud (OPT3-02).
-    const mias = pendientes.filter((s) => isAllowed(canApprove(ctx.tenant, s.permission as PermissionKey, {
+    // leer de la base por cada solicitud (OPT3-02). El apoderado (D-02) mira
+    // con la autoridad del dueño que lo nombró, y no ve lo que otra persona
+    // ya rechazó: eso solo lo autoriza el dueño.
+    const autoridad = pendientes.length > 0 ? await this.firmas.autoridadDeFirma(ctx.tenant) : null;
+    const alcanza = autoridad ? pendientes.filter((s) => isAllowed(canApprove(autoridad.tenant, s.permission as PermissionKey, {
       organizationId: orgId, branchId: s.branchId ?? undefined, ...(s.amountCents !== null && s.permission !== 'billing:discount:apply' ? { amountCents: s.amountCents } : {}),
-    })));
+    }))) : [];
+    const mias = autoridad?.apoderado
+      ? (await Promise.all(alcanza.map(async (s) => (await this.firmas.puedeFirmar(orgId, yo, s.permission as PermissionKey, opDe(s)) ? s : null)))).filter((s): s is Solicitud => s !== null)
+      : alcanza;
     const [nombres, contexto, historia] = await Promise.all([
       new UserRepository(orgId).namesById(mias.map((s) => s.requestedByUserId)),
       solicitudes.context(mias),
@@ -209,19 +232,22 @@ export class RemoteApprovalService {
     const yo = ctx.tenant.actorUserId!;
     // Lo vencido que nadie volvió a leer se cierra aquí también: si no, faltaría en la lista.
     await this.vencerOlvidadas(orgId);
-    const firma = ctx.tenant.grants.some((g) => g.permission === 'approvals:grant');
+    // Quien da la segunda firma, por su puesto o como apoderado vigente (D-02), ve lo que podía firmar.
+    const autoridad = await this.firmas.autoridadDeFirma(ctx.tenant);
+    const firma = autoridad !== null;
     const solicitudes = new ApprovalRequestRepository(orgId);
     const desde = new Date(Date.now() - APPROVAL_HISTORY_WINDOW_MS);
     const todas = await solicitudes.resolvedSince(desde, firma ? {} : { pedidasPor: yo });
-    const visibles = todas.filter((s) => s.requestedByUserId === yo || isAllowed(canApprove(ctx.tenant, s.permission as PermissionKey, {
+    const visibles = todas.filter((s) => s.requestedByUserId === yo || isAllowed(canApprove(autoridad?.tenant ?? ctx.tenant, s.permission as PermissionKey, {
       organizationId: orgId, branchId: s.branchId ?? undefined, ...(s.amountCents !== null && s.permission !== 'billing:discount:apply' ? { amountCents: s.amountCents } : {}),
     })));
-    const [nombres, contexto, historia, firmas] = await Promise.all([
+    const [nombres, contexto, historia, firmas, apoderados] = await Promise.all([
       new UserRepository(orgId).namesById(visibles.flatMap((s) => [s.requestedByUserId, ...(s.approverUserId ? [s.approverUserId] : [])])),
       solicitudes.context(visibles),
       // En «Resueltas hoy» no se dice «2.ª vez»: basta el «no» al que respondía y lo que se preguntó.
       this.conHistoria(orgId, visibles, { sinIntento: true }),
       new ApprovalReachRepository(orgId).grantStates(visibles.flatMap((s) => (s.status === 'APPROVED' && s.grantId ? [s.grantId] : []))),
+      this.apoderadosDe(orgId, visibles),
     ]);
     const ahora = new Date();
     const entrega = (s: Pick<Solicitud, 'status' | 'grantId'>): ApprovalDelivery | null => {
@@ -237,6 +263,7 @@ export class RemoteApprovalService {
         ...s, mine: s.requestedByUserId === yo, resolvedAt: s.decidedAt ?? s.expiresAt, delivery: entrega(s),
         requesterName: nombres.get(s.requestedByUserId) ?? null,
         approverName: s.approverUserId ? nombres.get(s.approverUserId) ?? null : null,
+        approverProxyOf: apoderados.get(s.id) ?? null,
         context: contexto.get(s.id) ?? null,
       })),
     };
@@ -272,20 +299,32 @@ export class RemoteApprovalService {
       },
     });
     this.firmas.requireFirmaVigente(perfil);
-    if (!(await this.firmas.puedeFirmar(orgId, yo, s.permission as PermissionKey, opDe(s)))) {
-      throw forbidden('No tienes permiso o tope suficiente para autorizar esta operación');
+    // Por su puesto o como apoderado (D-02). Un apoderado que quiere autorizar
+    // lo que otra persona rechazó no pasa, y el intento queda en «Para revisar».
+    let apoderado: Apoderado | null;
+    try {
+      apoderado = await this.firmas.firmaComo(orgId, yo, s.permission as PermissionKey, opDe(s));
+    } catch (e) {
+      if (!(e instanceof DomainError) || e.reason !== 'APPROVAL_PROXY_BLOCKED_BY_REJECTION') {
+        throw forbidden('No tienes permiso o tope suficiente para autorizar esta operación');
+      }
+      await this.audit.record(ctx, {
+        action: 'approval.proxy.blocked', resourceType: 'ApprovalRequest', resourceId: id, branchId: s.branchId,
+        afterState: { permission: s.permission, summary: s.summary, amountCents: importe(s), resourceType: s.resourceType, resourceId: s.resourceId, previousRequestId: s.previousRequestId },
+      });
+      throw e;
     }
 
     // Firma y decisión en UNA unidad: si otra aprobación ganó la solicitud en
     // este instante, la firma de esta se deshace y no queda huérfana (1.17b).
     await enUnaTransaccion(async () => {
-      const { token, grantId } = await this.firmas.crearFirma(orgId, yo, s.requestedByUserId, s.permission as PermissionKey, opDe(s));
-      const hecho = await new ApprovalRequestRepository(orgId).decide(id, { status: 'APPROVED', approverUserId: yo, deliveryToken: cifrarSensible(token), grantId });
+      const { token, grantId } = await this.firmas.crearFirma(orgId, yo, s.requestedByUserId, s.permission as PermissionKey, opDe(s), apoderado);
+      const hecho = await new ApprovalRequestRepository(orgId).decide(id, { status: 'APPROVED', approverUserId: yo, deliveryToken: cifrarSensible(token), grantId, proxyId: apoderado?.proxyId ?? null });
       if (!hecho) throw conflict('Otra persona ya contestó esta solicitud');
     });
     await this.audit.record(ctx, {
       action: 'approval.remote.approve', resourceType: 'ApprovalRequest', resourceId: id, branchId: s.branchId,
-      afterState: { permission: s.permission, summary: s.summary, amountCents: importe(s), resourceType: s.resourceType, resourceId: s.resourceId },
+      afterState: { permission: s.permission, summary: s.summary, amountCents: importe(s), resourceType: s.resourceType, resourceId: s.resourceId, ...comoApoderado(apoderado) },
     });
   }
 
@@ -294,13 +333,13 @@ export class RemoteApprovalService {
     const yo = ctx.tenant.actorUserId!;
     const s = await this.find(orgId, id);
     if (s.requestedByUserId === yo) throw forbidden('Para retirarla, cancélala desde donde la pediste');
-    if (!(await this.firmas.puedeFirmar(orgId, yo, s.permission as PermissionKey, opDe(s)))) throw notFound('Solicitud no encontrada');
-    const hecho = await new ApprovalRequestRepository(orgId).decide(id, { status: 'REJECTED', approverUserId: yo, rejectReason: reason });
+    const apoderado = await this.firmaOEscondida(orgId, yo, s);
+    const hecho = await new ApprovalRequestRepository(orgId).decide(id, { status: 'REJECTED', approverUserId: yo, rejectReason: reason, proxyId: apoderado?.proxyId ?? null });
     if (!hecho) throw conflict('La solicitud ya no está pendiente');
     // El «no autorizó» dice también cuánto (29-04).
     await this.audit.record(ctx, {
       action: 'approval.remote.reject', resourceType: 'ApprovalRequest', resourceId: id, branchId: s.branchId, reason,
-      afterState: { permission: s.permission, summary: s.summary, amountCents: importe(s), resourceType: s.resourceType, resourceId: s.resourceId },
+      afterState: { permission: s.permission, summary: s.summary, amountCents: importe(s), resourceType: s.resourceType, resourceId: s.resourceId, ...comoApoderado(apoderado) },
     });
   }
 
@@ -315,14 +354,14 @@ export class RemoteApprovalService {
     const yo = ctx.tenant.actorUserId!;
     const s = await this.find(orgId, id);
     if (s.requestedByUserId === yo) throw forbidden('La pregunta la hace quien autoriza');
-    if (!(await this.firmas.puedeFirmar(orgId, yo, s.permission as PermissionKey, opDe(s)))) throw notFound('Solicitud no encontrada');
+    const apoderado = await this.firmaOEscondida(orgId, yo, s);
     if (s.status !== 'PENDING') throw conflict('La solicitud ya no está pendiente');
     if (s.question && !s.answer) throw conflict('Ya hay una pregunta esperando respuesta');
     const hecho = await new ApprovalRequestRepository(orgId).ask(id, { question, byUserId: yo, expiresAt: new Date(Date.now() + APPROVAL_REQUEST_TTL_MS) });
     if (!hecho) throw conflict('La solicitud ya no está pendiente');
     await this.audit.record(ctx, {
       action: 'approval.remote.ask', resourceType: 'ApprovalRequest', resourceId: id, branchId: s.branchId,
-      afterState: { permission: s.permission, summary: s.summary, amountCents: importe(s), resourceType: s.resourceType, resourceId: s.resourceId, question },
+      afterState: { permission: s.permission, summary: s.summary, amountCents: importe(s), resourceType: s.resourceType, resourceId: s.resourceId, question, ...comoApoderado(apoderado) },
     });
     // A quien la pidió, por si dejó la pantalla: el diálogo y la franja también lo dicen.
     void new PushService().sendToUsers(orgId, [s.requestedByUserId], {
@@ -381,6 +420,23 @@ export class RemoteApprovalService {
           : null,
       };
     });
+  }
+
+  /** Quien no puede firmarla no sabe que existe: 404. Si puede, con qué autoridad (D-02). */
+  private async firmaOEscondida(orgId: string, yo: string, s: Solicitud): Promise<Apoderado | null> {
+    try { return await this.firmas.firmaComo(orgId, yo, s.permission as PermissionKey, opDe(s)); } catch { throw notFound('Solicitud no encontrada'); }
+  }
+
+  /** De quién era apoderado quien contestó cada solicitud (D-02): su nombre, por id de solicitud. */
+  private async apoderadosDe(orgId: string, sols: readonly Solicitud[]): Promise<Map<string, string>> {
+    const conNombramiento = sols.filter((s) => s.proxyId);
+    if (conNombramiento.length === 0) return new Map();
+    const duenos = await new ApprovalProxyRepository(orgId).duenosDe(conNombramiento.map((s) => s.proxyId!));
+    const nombres = await new UserRepository(orgId).namesById([...duenos.values()]);
+    return new Map(conNombramiento.flatMap((s) => {
+      const nombre = nombres.get(duenos.get(s.proxyId!) ?? '');
+      return nombre ? [[s.id, nombre] as const] : [];
+    }));
   }
 
   /** Cierra y asienta las que vencieron sin respuesta y nadie volvió a leer (29-04). */

@@ -372,13 +372,15 @@ describe('clases', () => {
     expect(cargo.amountCents).toBe(15000n);
   });
 
-  it('cancelar FUERA DE PLAZO libera el lugar pero NO anula el cargo', async () => {
-    // Una hora antes: dentro de la ventana de corte de dos horas.
+  it('cancelar FUERA DE PLAZO libera el lugar pero NO anula el cargo ya pagado', async () => {
+    // Una hora antes: dentro de la ventana de corte de dos horas. Con menos de una hora ya no se
+    // aparta sin pagar (D-16, bloque 3.5): la clase suelta se paga al apartarla.
     const claseId = await crearClase({ capacity: 5, startsInHours: 1 });
     const reserva = await app.inject({
       method: 'POST', url: `/classes/schedules/${claseId}/bookings`,
-      headers: { cookie }, payload: { memberId: await crearSocio(planSinClases) },
+      headers: { cookie }, payload: { memberId: await crearSocio(planSinClases), payment: { method: 'SPEI_TRANSFER', externalRef: `CLASE-${uuidv7().slice(-8)}` } },
     });
+    expect(reserva.statusCode, reserva.body).toBe(201);
 
     const cancel = await app.inject({
       method: 'POST', url: `/classes/bookings/${reserva.json().id}/cancel`,
@@ -761,10 +763,14 @@ describe('clases', () => {
     const nombre = nombreUnico('Suelta');
     const sinPlan = await db.member.create({ data: { id: uuidv7(), organizationId: orgId, memberCode: `SLT-${Date.now() % 1_000_000}`, firstName: nombre, lastName: 'Suelta', nameKey: normalizedNameKey(`${nombre} suelta`), homeBranchId: branchId, joinedAt: new Date() } });
     const coach = await db.user.findFirstOrThrow({ where: { email: 'coach@demo.mx' }, select: { id: true, fullName: true } });
-    const claseId = await crearClase({ capacity: 5, startsInHours: 0.5, coachUserId: coach.id });
+    // D-16 (bloque 3.5): se aparta con tiempo (a menos de una hora solo pagando en el momento) y
+    // después se acerca la clase, para probar la puerta con la clase apartada y todavía sin pagar.
+    const claseId = await crearClase({ capacity: 5, startsInHours: 3, coachUserId: coach.id });
     const res = await app.inject({ method: 'POST', url: `/classes/schedules/${claseId}/bookings`, headers: { cookie }, payload: { memberId: sinPlan.id } });
     expect(res.statusCode, res.body).toBe(201);
     expect(res.json().warnings).toContain('DROP_IN_ONLY');
+    const pronto = new Date(Date.now() + 1_800_000);
+    await db.classSchedule.update({ where: { id: claseId }, data: { startsAt: pronto, endsAt: new Date(pronto.getTime() + 3_600_000) } });
     const recepcion = await loginAs(app, 'recepcion@demo.mx');
     const puerta = () => app.inject({ method: 'POST', url: '/access/attempts', headers: { cookie: recepcion }, payload: { branchId, memberId: sinPlan.id, credentialKind: 'MANUAL', reason: 'Prueba de la puerta' } });
     // Sin pagar, no entra.

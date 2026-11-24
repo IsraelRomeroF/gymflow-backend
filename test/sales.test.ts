@@ -267,7 +267,7 @@ describe('catálogo de planes y venta de membresías', () => {
     expect(m2.status).toBe('ACTIVE');
   });
 
-  it('recepción ya NO puede activar ni renovar sin cobrar por las rutas viejas', async () => {
+  it('el camino sin cobro ya no existe: ni recepción, ni la gerencia, ni la dueña activan o renuevan gratis (D-12)', async () => {
     const plan = (await crearPlan()).json();
     const memberId = await nuevoSocio();
     const venta = (await app.inject({
@@ -276,16 +276,20 @@ describe('catálogo de planes y venta de membresías', () => {
     })).json();
     const id = venta.membership.id as string;
 
-    for (const ruta of ['activate', 'renew']) {
-      const r = await app.inject({
-        method: 'POST', url: `/memberships/${id}/${ruta}`, headers: { cookie: recepcion },
-        payload: { reason: 'Intento de activar sin cobrar' },
+    for (const quien of [recepcion, owner]) {
+      for (const ruta of ['activate', 'renew', 'change-plan', 'reactivate']) {
+        const r = await app.inject({
+          method: 'POST', url: `/memberships/${id}/${ruta}`, headers: { cookie: quien },
+          payload: { reason: 'Intento de mover la membresía sin cobrar', planId: plan.id },
+        });
+        expect(r.statusCode, `${ruta}: ${r.body}`).toBe(404);
+      }
+      const alta = await app.inject({
+        method: 'POST', url: `/members/${memberId}/memberships`, headers: { cookie: quien },
+        payload: { reason: 'Intento de alta sin venta', planId: plan.id, soldAtBranchId: branchId },
       });
-      expect(r.statusCode, `${ruta}: ${r.body}`).toBe(403);
+      expect(alta.statusCode, alta.body).toBe(404);
     }
-    // El dueño puede corregir, pero con motivo.
-    const sinMotivo = await app.inject({ method: 'POST', url: `/memberships/${id}/activate`, headers: { cookie: owner } });
-    expect(sinMotivo.statusCode).toBe(422);
     const m = await getDb().membership.findUniqueOrThrow({ where: { id } });
     expect(m.status).toBe('PENDING');
   });

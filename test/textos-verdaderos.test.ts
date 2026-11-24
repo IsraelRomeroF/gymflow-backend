@@ -163,7 +163,8 @@ describe('textos verdaderos (0.5)', () => {
     const portal = `gf_portal=${enroll.cookies.find((c) => c.name === 'gf_portal')!.value}`;
     const lista = (await app.inject({ method: 'GET', url: '/portal/consents', headers: { cookie: portal } })).json().consents as Array<{ consentType: string; needsResign: boolean; currentVersion: string | null; revocable: boolean }>;
     const bio = lista.find((c) => c.consentType === 'BIOMETRIC')!;
-    expect(bio).toMatchObject({ needsResign: true, currentVersion: nueva, revocable: false });
+    // Fase 3, bloque 3.10 (D-32): el socio ya puede retirar su rostro desde el teléfono; antes era `revocable: false`.
+    expect(bio).toMatchObject({ needsResign: true, currentVersion: nueva, revocable: true });
     expect(lista.filter((c) => c.consentType !== 'BIOMETRIC').every((c) => !c.needsResign)).toBe(true);
   });
 
@@ -232,8 +233,11 @@ describe('textos verdaderos (0.5)', () => {
       })).id;
     };
     // Sin membresía, la clase es suelta: lleva cargo.
-    const reservar = async (claseId: string) => {
-      const r = await app.inject({ method: 'POST', url: `/classes/schedules/${claseId}/bookings`, headers: { cookie: gerencia }, payload: { memberId: await socio() } });
+    // `pagando`: con menos de una hora la clase suelta solo se aparta pagándola (D-16, bloque 3.5).
+    const reservar = async (claseId: string, pagando = false) => {
+      const r = await app.inject({ method: 'POST', url: `/classes/schedules/${claseId}/bookings`, headers: { cookie: gerencia }, payload: {
+        memberId: await socio(), ...(pagando ? { payment: { method: 'SPEI_TRANSFER', externalRef: `CLASE-${Date.now()}` } } : {}),
+      } });
       expect(r.statusCode, r.body).toBe(201);
       expect(r.json().chargeId).toBeTruthy();
       return r.json() as { id: string; chargeId: string };
@@ -247,8 +251,8 @@ describe('textos verdaderos (0.5)', () => {
     const a1 = await db.auditLog.findFirstOrThrow({ where: { organizationId: orgId, action: 'class.booking.cancel', resourceId: temprano.id } });
     expect(a1.reason).toBe('Se equivocó de horario');
 
-    // Dentro de las 2 h previas, sin motivo: el cargo NO se anula y la respuesta lo dice.
-    const tarde = await reservar(await clase(1));
+    // Dentro de las 2 h previas, sin motivo: el cargo (ya pagado al apartar) NO se anula y la respuesta lo dice.
+    const tarde = await reservar(await clase(1), true);
     const q2 = await app.inject({ method: 'POST', url: `/classes/bookings/${tarde.id}/cancel`, headers: { cookie: gerencia }, payload: {} });
     expect(q2.statusCode, q2.body).toBe(200);
     expect(q2.json()).toMatchObject({ late: true, chargeVoided: false, lateChargeKept: true });

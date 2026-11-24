@@ -10,6 +10,8 @@ import { IntakeRepository } from '../intake/index.js';
 import { EnrollmentService } from '../access/index.js';
 import { PaymentMethodRepository } from '../payments/index.js';
 import { TrainingRepository } from '../training/index.js';
+import { olvidarTextosDeMensajes } from '../outbound/index.js';
+import { MemberPushRepository } from '../portal/index.js';
 import { OrganizationRepository } from '../organization/index.js';
 import { PrivacyRequestsService } from './privacy-requests.service.js';
 
@@ -216,6 +218,10 @@ export class PrivacyService {
     await new PaymentMethodRepository(orgId).revokeAllForMember(memberId, 'Anonimización ARCO');
     await new ProspectRepository(orgId).anonymizeConverted(memberId);
     await new TrainingRepository(orgId).scrubNotesForMember(memberId);
+    // Fase 3, bloque 3.10 (pendiente de 2.9 y 3.9): el texto de los mensajes que ya se le mandaron
+    // llevaba su nombre, y la suscripción de notificaciones identifica a su teléfono. Los dos se van.
+    await olvidarTextosDeMensajes(orgId, memberId);
+    await new MemberPushRepository().removeAllForMember(orgId, memberId);
     if (!await members.anonymize(memberId)) throw conflict('Ese socio ya estaba anonimizado');
 
     // Sin nombre en la bitácora: se identifica por el código, que ya no dice quién es.

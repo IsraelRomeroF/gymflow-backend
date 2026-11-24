@@ -1,17 +1,19 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import {
-  grantsAccess, notFound, visitBalance, type MembershipStatus, type VisitLedgerEntry } from '@gymflow/core';
+  grantsAccess, notFound, precioDeCuota, visitBalance, type MembershipStatus, type VisitLedgerEntry } from '@gymflow/core';
 import { AccessSummaryResponse, MemberMemberships, type Membership } from '@gymflow/core/contracts';
 import { enUnidadDeDinero } from '../../platform/db/unit-of-work.js';
 import { route } from '../../platform/http/registry.js';
 import { respuesta } from '../../platform/http/respuesta.js';
 import { OrganizationRepository } from '../organization/index.js';
+import { PlanRepository } from '../catalog/index.js';
 import { AccessSummaryRepository } from './access-summary.repository.js';
 import { MemberRepository } from '../members/index.js';
 import { MembershipRepository } from './membership.repository.js';
 import { VisitPackRepository } from './visitpack.repository.js';
 import { MembershipService } from './membership.service.js';
+import { cambiarRenovacion } from './anualidades.js';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 
@@ -23,12 +25,16 @@ export function registerMembershipRoutes(app: FastifyInstance): void {
   const audit = new AuditService();
 
   /**
-   * Las rutas de esta sección mueven una membresía SIN cobrarla. El mostrador
-   * no las usa —vende, renueva y cambia de plan por billing, que cobra—, y
-   * sin esta barrera cualquiera con permiso de vender podía activar o renovar
-   * gratis llamando a la API. Quedan para correcciones del dueño, con motivo.
+   * EL CAMINO SIN COBRO SE QUITÓ (D-12, auditoría 8, bloque 3.5). Aquí vivían
+   * cinco rutas que movían una membresía sin cobrarla (`POST
+   * /members/:id/memberships`, `/memberships/:id/activate`, `/renew`,
+   * `/change-plan` y `/reactivate`), con el permiso `memberships:override` y
+   * un motivo: regalaban días sin decir cuánto se dejaba de cobrar. Una
+   * cortesía o una corrección es ahora una venta, una renovación o un cambio
+   * de plan por `billing` (que emite el cargo) más un descuento o una
+   * condonación CON MONTO sobre ese cargo: la gerencia sola hasta una
+   * mensualidad del socio, arriba con la firma de la dueña.
    */
-  const override = z.object({ reason: z.string().min(3).max(300) });
 
   /**
    * La membresía es de la sucursal donde se vendió: congelarla, cancelarla o
@@ -40,64 +46,7 @@ export function registerMembershipRoutes(app: FastifyInstance): void {
     if (!m) throw notFound('Membresía no encontrada');
     return m.soldAtBranchId;
   }
-  /**
-   * Una CORRECCIÓN SIN COBRO: se autoriza, se hace y se asienta, y las tres
-   * cosas quedan o no queda ninguna (A5-N5, 28-10). Antes el asiento
-   * `membership.override.*` se escribía ANTES de hacerla: si la corrección
-   * fallaba (estado que no lo admite, plan inexistente), «Para revisar»
-   * mostraba una corrección que nunca ocurrió.
-   */
-  async function autorizarCorreccion<T>(
-    request: FastifyRequest, accion: string, membershipId: string | null, reason: string,
-    hacer: () => Promise<T>, idDe: (r: T) => string,
-  ): Promise<T> {
-    request.authorize('memberships:override', { reason, branchId: membershipId ? await sedeDe(request, membershipId) : null });
-    const ctx = request.ctx!;
-    return enUnidadDeDinero(ctx.tenant.organizationId, async () => {
-      const r = await hacer();
-      // Al final de la unidad, con la membresía ya movida; en un alta, el id es el de la que nació.
-      await audit.record(ctx, {
-        action: `membership.override.${accion}`,
-        resourceType: 'Membership',
-        resourceId: membershipId ?? idDe(r),
-        reason,
-      });
-      return r;
-    });
-  }
-
   // ── Membresías ────────────────────────────────────────────────────────────
-  route(app, {
-    method: 'POST',
-    url: '/members/:id/memberships',
-    security: { kind: 'permission', permission: 'memberships:override' },
-    handler: async (request, reply) => {
-      const ctx = request.ctx!;
-      const { id } = idParam.parse(request.params);
-      const body = z.object({
-        planId: z.string().uuid(),
-        soldAtBranchId: z.string().uuid().optional(),
-        startDate: z.string().date().optional(),
-        billingAnchorDay: z.number().int().min(1).max(31).optional(),
-        autoRenew: z.boolean().optional(),
-        branchIds: z.array(z.string().uuid()).optional(),
-        reason: z.string().min(3).max(300),
-      }).parse(request.body);
-
-      request.authorize('memberships:create', { branchId: body.soldAtBranchId ?? null });
-      const membership = await autorizarCorreccion(request, 'create', null, body.reason, () => service.create(ctx, {
-        memberId: id,
-        planId: body.planId,
-        soldAtBranchId: body.soldAtBranchId ?? null,
-        ...(body.startDate ? { startDate: new Date(`${body.startDate}T00:00:00.000Z`) } : {}),
-        ...(body.billingAnchorDay !== undefined ? { billingAnchorDay: body.billingAnchorDay } : {}),
-        ...(body.autoRenew !== undefined ? { autoRenew: body.autoRenew } : {}),
-        ...(body.branchIds ? { branchIds: body.branchIds } : {}),
-      }), (m) => m.id);
-      return reply.status(201).send(serialize(membership));
-    },
-  });
-
   route(app, {
     method: 'GET',
     url: '/members/:id/memberships',
@@ -118,10 +67,13 @@ export function registerMembershipRoutes(app: FastifyInstance): void {
       // El historial muestra los periodos Y SUS HUECOS: es lo que permite
       // medir retención por cohortes sin reconstruir nada.
       // Contrato `MemberMemberships` del núcleo: si el serializador cambia un campo, esto deja de compilar.
+      // Lo que paga por periodo y si «conserva su precio» (D-19; heredado de 3.6): la ficha lo dice junto a la membresía.
+      const precios = new Map(await Promise.all(list.map(async (m) => [m.id, await precioPorPeriodo(ctx.tenant.organizationId, m)] as const)));
       return list.map((m) => ({
-        ...serialize(m),
+        ...serializeMembership(m),
         paidThrough: ((p) => (p ? iso(p) : null))(pagado.get(m.id) ?? null),
         missedPeriods: atrasos.get(m.id) ?? null,
+        ...precioYMarca(m, precios.get(m.id) ?? null),
       })) satisfies MemberMemberships;
     },
   });
@@ -138,7 +90,7 @@ export function registerMembershipRoutes(app: FastifyInstance): void {
       if (!m) throw notFound('Membresía no encontrada');
       const pagado = (await repo.paidThroughFor([m.id])).get(m.id) ?? null;
       const atrasos = m.status === 'SUSPENDED' ? await service.cuantosPeriodosAtrasados(ctx, m) : null;
-      return { ...serialize(m, { paidThrough: pagado, missedPeriods: atrasos }), branchAccess: await repo.branchAccess(id) };
+      return { ...serializeMembership(m, { paidThrough: pagado, missedPeriods: atrasos }), ...precioYMarca(m, await precioPorPeriodo(ctx.tenant.organizationId, m)), branchAccess: await repo.branchAccess(id) };
     },
   });
 
@@ -157,17 +109,6 @@ export function registerMembershipRoutes(app: FastifyInstance): void {
 
   route(app, {
     method: 'POST',
-    url: '/memberships/:id/activate',
-    security: { kind: 'permission', permission: 'memberships:override' },
-    handler: async (request) => {
-      const { id } = idParam.parse(request.params);
-      const { reason } = override.parse(request.body ?? {});
-      return serialize(await autorizarCorreccion(request, 'activate', id, reason, () => service.activate(request.ctx!, id), (m) => m.id));
-    },
-  });
-
-  route(app, {
-    method: 'POST',
     url: '/memberships/:id/freeze',
     security: { kind: 'permission', permission: 'memberships:freeze' },
     handler: async (request) => {
@@ -175,7 +116,7 @@ export function registerMembershipRoutes(app: FastifyInstance): void {
       const body = z.object({ days: z.number().int().min(1).max(365), reason: z.string().min(3).max(300) })
         .parse(request.body);
       request.authorize('memberships:freeze', { reason: body.reason, branchId: await sedeDe(request, id) });
-      return serialize(await service.freeze(request.ctx!, id, body.days, body.reason));
+      return serializeMembership(await service.freeze(request.ctx!, id, body.days, body.reason));
     },
   });
 
@@ -186,31 +127,7 @@ export function registerMembershipRoutes(app: FastifyInstance): void {
     handler: async (request) => {
       const { id } = idParam.parse(request.params);
       request.requirePermission('memberships:freeze', await sedeDe(request, id));
-      return serialize(await service.unfreeze(request.ctx!, id));
-    },
-  });
-
-  route(app, {
-    method: 'POST',
-    url: '/memberships/:id/change-plan',
-    security: { kind: 'permission', permission: 'memberships:override' },
-    handler: async (request) => {
-      const { id } = idParam.parse(request.params);
-      const body = z.object({ planId: z.string().uuid(), reason: z.string().min(3).max(300) }).parse(request.body);
-      const result = await autorizarCorreccion(request, 'change-plan', id, body.reason,
-        () => service.changePlan(request.ctx!, id, body.planId, body.reason), (r) => r.membership.id);
-      return { membership: serialize(result.membership), proration: result.proration };
-    },
-  });
-
-  route(app, {
-    method: 'POST',
-    url: '/memberships/:id/renew',
-    security: { kind: 'permission', permission: 'memberships:override' },
-    handler: async (request) => {
-      const { id } = idParam.parse(request.params);
-      const { reason } = override.parse(request.body ?? {});
-      return serialize(await autorizarCorreccion(request, 'renew', id, reason, () => service.renew(request.ctx!, id), (m) => m.id));
+      return serializeMembership(await service.unfreeze(request.ctx!, id));
     },
   });
 
@@ -222,20 +139,24 @@ export function registerMembershipRoutes(app: FastifyInstance): void {
       const { id } = idParam.parse(request.params);
       const { reason } = reasonBody.parse(request.body);
       request.authorize('memberships:cancel', { reason, branchId: await sedeDe(request, id) });
-      return serialize(await service.cancel(request.ctx!, id, reason));
+      return serializeMembership(await service.cancel(request.ctx!, id, reason));
     },
   });
 
+  /**
+   * D-14 (bloque 3.5): si al terminar su periodo se cobra otro igual («se
+   * renueva sola») o vence y se vuelve a vender. Se elige al vender; aquí se
+   * cambia después, con motivo. Es del que cambia el plan de una membresía.
+   */
   route(app, {
-    method: 'POST',
-    url: '/memberships/:id/reactivate',
-    security: { kind: 'permission', permission: 'memberships:override' },
-    handler: async (request, reply) => {
+    method: 'PUT',
+    url: '/memberships/:id/auto-renew',
+    security: { kind: 'permission', permission: 'memberships:change_plan' },
+    handler: async (request) => {
       const { id } = idParam.parse(request.params);
-      const { planId, reason } = z.object({ planId: z.string().uuid(), reason: z.string().min(3).max(300) }).parse(request.body);
-      // Crea una membresía NUEVA: la antigüedad vive en el socio, no aquí.
-      const nueva = await autorizarCorreccion(request, 'reactivate', id, reason, () => service.reactivate(request.ctx!, id, planId), (m) => m.id);
-      return reply.status(201).send(serialize(nueva));
+      const body = z.object({ autoRenew: z.boolean(), reason: z.string().min(3).max(300) }).parse(request.body);
+      request.authorize('memberships:change_plan', { reason: body.reason, branchId: await sedeDe(request, id) });
+      return serializeMembership(await cambiarRenovacion(request.ctx!, { membershipId: id, autoRenew: body.autoRenew, reason: body.reason }));
     },
   });
 
@@ -407,7 +328,7 @@ export function registerMembershipRoutes(app: FastifyInstance): void {
   });
 }
 
-function serialize(m: {
+export function serializeMembership(m: {
   id: string; memberId: string; planId: string; soldAtBranchId: string | null;
   status: string; startDate: Date; currentPeriodStart: Date; currentPeriodEnd: Date;
   billingAnchorDay: number; graceUntil: Date | null; autoRenew: boolean;
@@ -443,6 +364,28 @@ function serialize(m: {
     cancellationReason: m.cancellationReason,
     /** El acceso se DERIVA del estado, nunca se almacena (docs/05 §12). */
     grantsAccess: grantsAccess(m.status as MembershipStatus),
+  };
+}
+
+/**
+ * Lo que paga por periodo: lo pactado o, sin pactado, el precio del plan en su
+ * sede (la misma regla que la cuota: `precioDeCuota` del núcleo). `null` si el
+ * plan ya no existe.
+ */
+async function precioPorPeriodo(organizationId: string, m: { planId: string; soldAtBranchId: string | null; agreedPriceCents: bigint | null }): Promise<bigint | null> {
+  if (m.agreedPriceCents !== null) return m.agreedPriceCents;
+  const planes = new PlanRepository(organizationId);
+  const plan = await planes.findById(m.planId);
+  if (!plan) return null;
+  const sede = m.soldAtBranchId ? (await planes.availabilityFor(plan.id)).find((a) => a.branchId === m.soldAtBranchId) : undefined;
+  return precioDeCuota({ agreedPriceCents: null, planPriceCents: plan.priceCents, branchPriceCents: sede?.priceOverrideCents ?? null });
+}
+
+function precioYMarca(m: { priceProtected: boolean; priceProtectedReason?: string | null }, precio: bigint | null) {
+  return {
+    ...(precio === null ? {} : { periodPriceCents: precio.toString() }),
+    priceProtected: m.priceProtected,
+    priceProtectedReason: m.priceProtected ? m.priceProtectedReason ?? null : null,
   };
 }
 

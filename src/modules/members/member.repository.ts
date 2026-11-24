@@ -151,6 +151,15 @@ export class MemberRepository extends TenantRepository {
     return count === 1;
   }
 
+  /**
+   * «Hacerme su coach» (D-29): lo pone SOLO si el socio sigue sin coach. Dos
+   * coaches con el mismo código, o la gerencia asignando a la vez: gana el primero.
+   */
+  async setCoachIfNone(memberId: string, coachUserId: string): Promise<boolean> {
+    const { count } = await this.db.member.updateMany({ where: this.scope({ id: memberId, deletedAt: null, coachUserId: null }), data: { coachUserId } });
+    return count === 1;
+  }
+
   /** Cuántos socios tienen a esta persona como coach en su ficha (bloque 2.6, 12-07). */
   async countCoachedBy(coachUserId: string): Promise<number> {
     return this.db.member.count({ where: this.scope({ coachUserId, deletedAt: null }) });

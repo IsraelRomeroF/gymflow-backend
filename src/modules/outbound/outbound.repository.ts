@@ -1,5 +1,5 @@
 import { Prisma } from '@gymflow/db';
-import { uuidv7 } from '@gymflow/core';
+import { DIAS_DE_AVISO_DE_PREPAGO, uuidv7 } from '@gymflow/core';
 import type { OutboundKind } from '@gymflow/core/contracts';
 import { TenantRepository } from '../../platform/db/tenant-repository.js';
 import { sqlDeSede } from '../../platform/db/filtro-de-sede.js';
@@ -9,6 +9,15 @@ import type { SedesDelDia } from '../../platform/time/business-calendar.js';
 export const DIAS_DE_VIGENCIA = 10;
 /** Con cuántos días de anticipación se avisa de un pago o de un plan que termina. */
 export const DIAS_DE_ANTICIPACION = 3;
+
+/**
+ * D-14 (fase 3, bloque 3.5; edición puntual): el plan PAGADO POR ADELANTADO que
+ * no se renueva solo se avisa 15 días antes de terminar, no 3: es una
+ * anualidad que hay que volver a vender, y el socio necesita tiempo. Lo demás
+ * (`ms` es la membresía y `p` su plan en las dos consultas que lo usan) sigue
+ * con la anticipación de siempre.
+ */
+const ANTICIPACION_DEL_FIN = Prisma.sql`(CASE WHEN p."billingModel" = 'PREPAID_PERIOD' AND ms."autoRenew" = false THEN ${DIAS_DE_AVISO_DE_PREPAGO} ELSE ${DIAS_DE_ANTICIPACION} END)::int`;
 /** Hasta cuántos días después de vencido se recuerda un pago. */
 export const DIAS_DE_VENCIDO = 7;
 /** Cuántos hechos de cada tipo se atienden por corrida; si se llena, la siguiente sigue. */
@@ -24,7 +33,18 @@ export type OutboundRow = {
   /** Solo PRICE_CHANGE (D-19, bloque 3.6): de cuánto a cuánto cambió lo que paga por periodo. */
   priceFromCents: bigint | null; priceToCents: bigint | null;
   resolvedByName: string | null;
+  /**
+   * Celular compartido (D-09; fase 3, bloque 3.10): quién responde por el
+   * número del socio. `MEMBER` = otro socio (su nombre viene en
+   * `responsibleMember*`); `ADULT` = un adulto que no es socio; `SELF` o
+   * `null` = el número es suyo.
+   */
+  responsibleKind: string | null; responsibleName: string | null; responsiblePhoneE164: string | null;
+  responsibleMemberFirstName: string | null; responsibleMemberLastName: string | null; responsibleMemberAnonymized: boolean | null;
 };
+
+/** Lo que queda en `body` de un mensaje mandado cuando su socio se anonimiza: la fila sigue (quién y cuándo), el texto no. */
+export const TEXTO_RETIRADO = 'Texto retirado: el socio fue anonimizado.';
 
 /** A quién se le puede leer la lista: sus sedes de dinero y sus sedes de Retención. */
 export type AlcanceDeMensajes = {
@@ -52,7 +72,8 @@ const DESDE = Prisma.sql`
   LEFT JOIN "charges" c ON c."id" = o."chargeId" AND c."organizationId" = o."organizationId"
   LEFT JOIN "memberships" ms ON ms."id" = o."membershipId" AND ms."organizationId" = o."organizationId"
   LEFT JOIN "plans" p ON p."id" = ms."planId"
-  LEFT JOIN "membership_price_changes" pc ON pc."id" = o."priceChangeId" AND pc."organizationId" = o."organizationId"`;
+  LEFT JOIN "membership_price_changes" pc ON pc."id" = o."priceChangeId" AND pc."organizationId" = o."organizationId"
+  LEFT JOIN "members" r ON r."id" = m."responsibleMemberId" AND r."organizationId" = m."organizationId"`;
 
 const COLUMNAS = Prisma.sql`
   o."id", o."kind", o."status", o."memberId", o."branchId", o."createdAt", o."resolvedAt", o."body", o."engagementState",
@@ -60,6 +81,8 @@ const COLUMNAS = Prisma.sql`
   c."concept", (c."amountCents" - c."allocatedCents" - c."adjustedCents") AS "dueCents", c."dueDate",
   p."name" AS "planName", ms."currentPeriodEnd" AS "periodEnd",
   pc."fromPriceCents" AS "priceFromCents", pc."toPriceCents" AS "priceToCents",
+  m."responsibleKind", m."responsibleName", m."responsiblePhoneE164",
+  r."firstName" AS "responsibleMemberFirstName", r."lastName" AS "responsibleMemberLastName", (r."anonymizedAt" IS NOT NULL) AS "responsibleMemberAnonymized",
   (SELECT u."fullName" FROM "users" u WHERE u."id" = o."resolvedByUserId") AS "resolvedByName"`;
 
 /**
@@ -78,7 +101,7 @@ const hechoVivo = (hoy: Date) => Prisma.sql`COALESCE((
   OR (o."kind" = 'PAYMENT_OVERDUE' AND c."status" = 'OVERDUE' AND (c."amountCents" - c."allocatedCents" - c."adjustedCents") > 0)
   OR (o."kind" = 'MEMBERSHIP_SUSPENDED' AND ms."status" = 'SUSPENDED')
   OR (o."kind" = 'MEMBERSHIP_ENDING' AND ms."status" = 'ACTIVE' AND ms."autoRenew" = false
-     AND ms."currentPeriodEnd" > ${hoy}::date AND ms."currentPeriodEnd" <= ${hoy}::date + ${DIAS_DE_ANTICIPACION}::int)
+     AND ms."currentPeriodEnd" > ${hoy}::date AND ms."currentPeriodEnd" <= ${hoy}::date + ${ANTICIPACION_DEL_FIN})
   OR (o."kind" = 'WE_MISS_YOU'
      AND EXISTS (SELECT 1 FROM "memberships" v WHERE v."memberId" = o."memberId" AND v."organizationId" = o."organizationId" AND v."status" IN ('TRIALING', 'ACTIVE', 'PAST_DUE'))
      AND NOT EXISTS (SELECT 1 FROM "attendance_events" a WHERE a."organizationId" = o."organizationId" AND a."memberId" = o."memberId" AND a."at" > o."createdAt")
@@ -159,6 +182,20 @@ export class OutboundRepository extends TenantRepository {
       data: { status: como, resolvedAt: new Date(), resolvedByUserId: userId, body },
     });
     return count === 1;
+  }
+
+  /**
+   * AL ANONIMIZAR A UN EXSOCIO (fase 3, bloque 3.10; pendiente de 2.9 y de
+   * 3.9): el texto de lo que ya se le mandó llevaba su nombre («Hola Ana, te
+   * escribimos de…»). La fila queda —quién lo mandó y cuándo—; el texto se
+   * retira. Devuelve cuántos textos retiró. Se puede llamar dos veces.
+   */
+  async olvidarTextos(memberId: string): Promise<number> {
+    const { count } = await this.db.outboundMessage.updateMany({
+      where: this.scope({ memberId, body: { not: null }, NOT: { body: TEXTO_RETIRADO } }),
+      data: { body: TEXTO_RETIRADO },
+    });
+    return count;
   }
 
   // ── El job ───────────────────────────────────────────────────────────────
@@ -269,7 +306,7 @@ export class OutboundRepository extends TenantRepository {
         JOIN "members" m ON m."id" = ms."memberId" AND m."deletedAt" IS NULL AND m."phoneE164" IS NOT NULL
        WHERE ms."organizationId" = ${this.organizationId}::uuid AND ms."status" = 'ACTIVE'
          AND p."billingModel" IN ('RECURRING', 'PREPAID_PERIOD') AND (ms."currentPeriodEnd" - ms."currentPeriodStart") >= 7
-         AND ms."currentPeriodEnd" > ${hoy}::date AND ms."currentPeriodEnd" <= ${hoy}::date + ${DIAS_DE_ANTICIPACION}::int
+         AND ms."currentPeriodEnd" > ${hoy}::date AND ms."currentPeriodEnd" <= ${hoy}::date + ${ANTICIPACION_DEL_FIN}
          AND ${this.sinMensaje(Prisma.sql`(CASE WHEN ms."autoRenew" THEN 'PAYMENT_DUE_SOON:M:' ELSE 'MEMBERSHIP_ENDING:' END) || ms."id"::text || ':' || to_char(ms."currentPeriodEnd", 'YYYY-MM-DD')`)}
          AND ${sqlDeSede(Prisma.sql`m."homeBranchId"`, sedes)} LIMIT ${LOTE}`;
   }

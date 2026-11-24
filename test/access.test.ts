@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { ACCESS_POLICY_VERSION } from '@gymflow/core';
 import { makeApp, loginAs, orgFixtures, nombreUnico, telefonoUnico } from './helpers.js';
 import { closeDb, getDb } from '../src/platform/db/client.js';
+import { activarSinCobro, altaSinCobro } from './membresia-de-prueba.js';
 
 const db = () => getDb();
 const sello = () => Date.now().toString(36).slice(-5) + Math.random().toString(36).slice(2, 4);
@@ -37,14 +38,9 @@ describe('control de acceso', () => {
 
   async function conMembresiaActiva(plan = planId): Promise<string> {
     const memberId = await nuevoSocio();
-    const m = await app.inject({
-      method: 'POST', url: `/members/${memberId}/memberships`, headers: { cookie: owner },
-      payload: { reason: 'Fixture de prueba', planId: plan, soldAtBranchId: branchId },
-    });
+    const m = await altaSinCobro(app, owner, memberId, { reason: 'Fixture de prueba', planId: plan, soldAtBranchId: branchId });
     expect(m.statusCode, m.body).toBe(201);
-    await app.inject({
-      method: 'POST', url: `/memberships/${m.json().id}/activate`, headers: { cookie: owner }, payload: { reason: 'Fixture de prueba' },
-    });
+    await activarSinCobro(app, owner, m.json().id);
     return memberId;
   }
 

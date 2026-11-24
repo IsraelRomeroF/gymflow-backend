@@ -47,7 +47,7 @@ export function registerPortalPrivacyRoutes(app: FastifyInstance): void {
         consents: consents.map((c) => ({
           id: c.id, consentType: c.consentType, documentVersion: c.documentVersion, granted: c.granted,
           grantedAt: c.grantedAt.toISOString(), revokedAt: c.revokedAt ? c.revokedAt.toISOString() : null,
-          /** Lo obligatorio (aviso, reglamento) no se retira sin dejar de ser socio, y la biometría se quita en recepción. */
+          /** Lo obligatorio (aviso, reglamento) no se retira sin dejar de ser socio. El rostro sí, desde la fase 3 (bloque 3.10; D-32). */
           revocable: REVOCABLES_POR_EL_SOCIO.includes(c.consentType as ConsentType) && c.granted && !c.revokedAt,
           /** Firmó un texto biométrico anterior al vigente: lo vuelve a firmar en recepción (6-03, 21-09). */
           needsResign: vigentePorFirma.has(c.id),
@@ -59,8 +59,9 @@ export function registerPortalPrivacyRoutes(app: FastifyInstance): void {
 
   /**
    * Retirar un permiso opcional. El mismo servicio que usa la ficha, con los
-   * mismos efectos (21-11): salud borra la nota y el cargo recurrente deja
-   * todas las tarjetas sin cobrar solas.
+   * mismos efectos (21-11): salud borra la nota, el cargo recurrente deja
+   * todas las tarjetas sin cobrar solas y el biométrico (D-32; fase 3, bloque
+   * 3.10) revoca su rostro o huella y borra la plantilla en el acto.
    */
   route(app, {
     method: 'POST',
@@ -70,7 +71,8 @@ export function registerPortalPrivacyRoutes(app: FastifyInstance): void {
       const { organizationId, memberId } = await requireMemberSession(request);
       const { type } = z.object({ type: z.string().min(2).max(40) }).parse(request.params);
       if (!(CONSENT_TYPES as readonly string[]).includes(type) || !REVOCABLES_POR_EL_SOCIO.includes(type as ConsentType)) {
-        throw validation('Ese permiso se retira en recepción: implica quitar tu rostro o dejar de ser socio.');
+        // 3.10: el rostro ya lo retira el socio; lo que queda fuera es lo obligatorio.
+        throw validation('Ese permiso es obligatorio para ser socio: para retirarlo hay que darte de baja en recepción.');
       }
       await retirarConsentimiento(ctxDeSocio(request, organizationId), {
         memberId, consentType: type as ConsentType, motivo: 'Lo retiró el socio desde su teléfono', via: 'portal', permitidos: REVOCABLES_POR_EL_SOCIO,

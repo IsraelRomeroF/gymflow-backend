@@ -189,24 +189,16 @@ describe('dinero · fase 1.3', () => {
     expect(await getDb().membershipEvent.count({ where: { membershipId: m.id, eventType: 'FROZEN' } })).toBe(0);
   });
 
-  it('una corrección sin cobro que falla NO deja asiento en la bitácora; la que ocurre deja uno, después de hacerse (A5-N5)', async () => {
+  it('ya no hay corrección sin cobro: las rutas responden 404 y nada queda asentado como `membership.override.*` (D-12; antes A5-N5)', async () => {
     const memberId = await socio();
     const venta = await vender(memberId);
-    const asientos = () => getDb().auditLog.findMany({
-      where: { organizationId: orgId, resourceId: venta.membership.id, action: { startsWith: 'membership.override.' } }, orderBy: { at: 'asc' },
-    });
-    // Ya está activa: «activar» no aplica y responde 409. Antes quedaba `membership.override.activate` asentado.
-    const falla = await app.inject({ method: 'POST', url: `/memberships/${venta.membership.id}/activate`, headers: { cookie: gerencia }, payload: { reason: 'Corrección que no aplica' } });
-    expect(falla.statusCode, falla.body).toBe(409);
-    expect(await asientos()).toHaveLength(0);
-
-    const bien = await app.inject({ method: 'POST', url: `/memberships/${venta.membership.id}/renew`, headers: { cookie: gerencia }, payload: { reason: 'Cortesía autorizada por la dueña' } });
-    expect(bien.statusCode, bien.body).toBe(200);
-    const hechos = await asientos();
-    expect(hechos.map((a) => a.action)).toEqual(['membership.override.renew']);
-    // El asiento de la corrección va DESPUÉS del de la transición que la hizo.
-    const transicion = await getDb().auditLog.findFirstOrThrow({ where: { organizationId: orgId, resourceId: venta.membership.id, action: 'membership.renew' } });
-    expect(hechos[0]!.at.getTime()).toBeGreaterThanOrEqual(transicion.at.getTime());
+    for (const ruta of ['activate', 'renew']) {
+      const r = await app.inject({ method: 'POST', url: `/memberships/${venta.membership.id}/${ruta}`, headers: { cookie: gerencia }, payload: { reason: 'Cortesía sin monto' } });
+      expect(r.statusCode, r.body).toBe(404);
+    }
+    expect(await getDb().auditLog.count({ where: { organizationId: orgId, resourceId: venta.membership.id, action: { startsWith: 'membership.override.' } } })).toBe(0);
+    const m = await getDb().membership.findUniqueOrThrow({ where: { id: venta.membership.id } });
+    expect(m.currentPeriodStart.toISOString().slice(0, 10)).toBe(venta.membership.currentPeriodStart);
   });
 
   // ── Llaves obligatorias ───────────────────────────────────────────────────

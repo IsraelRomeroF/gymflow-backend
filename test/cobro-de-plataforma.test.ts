@@ -453,7 +453,8 @@ describe('cobro de plataforma · API', () => {
     await conDominio.ready();
     try {
       const cookie = await loginPlataforma(conDominio);
-      const salir = await conDominio.inject({ method: 'POST', url: '/platform/logout', headers: { cookie } });
+      // Bloque 3.1 (D-01): el dominio se le pone (y se le quita) a quien entró por él; por `localhost` la cookie va sin dominio.
+      const salir = await conDominio.inject({ method: 'POST', url: '/platform/logout', headers: { cookie, host: 'consola.gymflow.test' } });
       const borrada = salir.cookies.find((c) => c.name === 'gf_session')!;
       expect(borrada).toMatchObject({ value: '', domain: 'gymflow.test', path: '/' });
     } finally { await conDominio.close(); }

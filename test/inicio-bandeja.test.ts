@@ -7,6 +7,7 @@ import { gimnasioPropio, socioPropio, abrirTurno, sesionesDe, type GimnasioPropi
 import { closeDb, getDb } from '../src/platform/db/client.js';
 import { ModuleStateRepository } from '../src/platform/modules/module-state.repository.js';
 import { forgetModules } from '../src/platform/modules/module-state.js';
+import { altaSinCobro } from './membresia-de-prueba.js';
 
 /**
  * EL INICIO COMO BANDEJA (auditoría 8, bloque 2.1; 1-01, 5-05, 5-12).
@@ -45,10 +46,7 @@ describe('el inicio como bandeja (2.1)', () => {
   /** Un socio con su membresía suspendida: la puerta lo rechaza y el mostrador SÍ puede levantarlo. */
   async function suspendido(finDelPeriodo = new Date(Date.now() + 10 * 86_400_000), sede = g.sedes[0]!): Promise<string> {
     const memberId = await socioPropio(g, sede);
-    const mem = await app.inject({
-      method: 'POST', url: `/members/${memberId}/memberships`, headers: { cookie: s.gerente },
-      payload: { reason: 'Fixture de la bandeja', planId: g.planMensual, soldAtBranchId: sede.id },
-    });
+    const mem = await altaSinCobro(app, s.gerente, memberId, { reason: 'Fixture de la bandeja', planId: g.planMensual, soldAtBranchId: sede.id });
     expect(mem.statusCode, mem.body).toBe(201);
     const inicio = new Date(finDelPeriodo.getTime() - 30 * 86_400_000);
     await getDb().membership.update({ where: { id: mem.json().id }, data: { status: 'SUSPENDED', currentPeriodStart: inicio, currentPeriodEnd: finDelPeriodo } });

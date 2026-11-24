@@ -31,6 +31,8 @@ export type BookingRecord = {
   status: 'BOOKED' | 'CANCELED' | 'ATTENDED' | 'NO_SHOW';
   chargeId: string | null; bookedAt: Date; canceledAt: Date | null;
   lateCancel: boolean; checkedInAt: Date | null;
+  /** D-16 (bloque 3.5): hasta cuándo se guarda el lugar de una clase suelta sin pagar. Nulo = no es un apartado. */
+  holdUntil: Date | null;
 };
 
 const TYPE_SELECT = {
@@ -46,7 +48,7 @@ const SCHEDULE_SELECT = {
 
 const BOOKING_SELECT = {
   id: true, classScheduleId: true, memberId: true, branchId: true, status: true,
-  chargeId: true, bookedAt: true, canceledAt: true, lateCancel: true, checkedInAt: true,
+  chargeId: true, bookedAt: true, canceledAt: true, lateCancel: true, checkedInAt: true, holdUntil: true,
 } as const;
 
 /** El cargo de la clase suelta de una reserva, con lo necesario para saber si se debe (11-03). */
@@ -486,10 +488,24 @@ export class ClassRepository extends TenantRepository {
     });
   }
 
-  async attachCharge(bookingId: string, chargeId: string): Promise<void> {
+  /** `holdUntil` (D-16, bloque 3.5): hasta cuándo se guarda el lugar si la clase suelta sigue sin pagar. */
+  async attachCharge(bookingId: string, chargeId: string, holdUntil: Date | null = null): Promise<void> {
     await this.db.classBooking.updateMany({
-      where: this.scope({ id: bookingId }), data: { chargeId },
+      where: this.scope({ id: bookingId }), data: { chargeId, holdUntil },
     });
+  }
+
+  /** Los apartados cuya hora ya pasó y siguen reservados (D-16): los que hay que cobrar o liberar. */
+  async holdsDue(now: Date, limit: number): Promise<BookingRecord[]> {
+    const rows = await this.db.classBooking.findMany({
+      where: this.scope({ status: B.BOOKED, holdUntil: { lte: now } }), select: BOOKING_SELECT, orderBy: { holdUntil: 'asc' }, take: limit,
+    });
+    return rows as BookingRecord[];
+  }
+
+  /** Ya no es un apartado (se pagó, o no había nada que liberar): deja de mirarse. */
+  async clearHold(bookingId: string): Promise<void> {
+    await this.db.classBooking.updateMany({ where: this.scope({ id: bookingId }), data: { holdUntil: null } });
   }
 
   /** Reservas del socio en esa sede cuya clase empieza en ±una hora: la entrada en la puerta vale como llegada. */

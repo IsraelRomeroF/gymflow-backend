@@ -62,6 +62,17 @@ export class PortalRepository extends TenantRepository {
   }
 
   /**
+   * Las clases sueltas que tienen precio (fase 3, bloque 3.10; D-35). Solo
+   * lectura: la tabla es de `classes` (sin importarlo: evita el círculo, como arriba).
+   */
+  clasesConPrecio(): Promise<Array<{ id: string; name: string; dropInPriceCents: bigint }>> {
+    return this.db.classType.findMany({
+      where: this.scope({ isActive: true, deletedAt: null, dropInPriceCents: { gt: 0n } }),
+      select: { id: true, name: true, dropInPriceCents: true }, orderBy: [{ dropInPriceCents: 'asc' }, { name: 'asc' }],
+    });
+  }
+
+  /**
    * Emite una invitación, invalidando la anterior.
    *
    * Dos códigos válidos a la vez significan que uno anda suelto sin que nadie

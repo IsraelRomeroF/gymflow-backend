@@ -44,8 +44,8 @@ const SIN_CLIENTE: Record<string, string> = {
   'POST /charges/:id/charge-card': POR_QUE.tarjeta, 'GET /members/:id/payment-methods': POR_QUE.tarjeta,
   'GET /payments/:id/refunds': POR_QUE.tarjeta,
   'GET /payments/chargebacks': POR_QUE.tarjeta, 'GET /payments/webhooks/dead-letters': POR_QUE.tarjeta, 'POST /payments/attempts/:id/resolve': POR_QUE.tarjeta,
-  'POST /memberships/:id/activate': POR_QUE.vieja, 'POST /memberships/:id/change-plan': POR_QUE.vieja, 'POST /memberships/:id/period-charge': POR_QUE.vieja,
-  'POST /memberships/:id/reactivate': POR_QUE.vieja, 'POST /memberships/:id/renew': POR_QUE.vieja, 'GET /memberships/:id/events': POR_QUE.vieja,
+  // Las cinco rutas sin cobro de `memberships` se quitaron en la fase 3 (bloque 3.5, D-12).
+  'POST /memberships/:id/period-charge': POR_QUE.vieja, 'GET /memberships/:id/events': POR_QUE.vieja,
   'POST /members/:id/charges': POR_QUE.vieja,
   'GET /visit-packs/:id': POR_QUE.paquete, 'POST /visit-packs/:id/adjust': POR_QUE.paquete, 'POST /visit-packs/:id/consume': POR_QUE.paquete,
   'POST /auth/logout-all': POR_QUE.suelta, 'GET /platform/invoices': POR_QUE.suelta,

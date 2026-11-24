@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { makeApp, loginAs, orgFixtures, nombreUnico, telefonoUnico, CONSENTIMIENTOS, sedeDesechable, archivarSede } from './helpers.js';
 import { closeDb, getDb } from '../src/platform/db/client.js';
+import { activarSinCobro, altaSinCobro } from './membresia-de-prueba.js';
 
 const db = () => getDb();
 
@@ -137,11 +138,8 @@ describe('portal del socio', () => {
     const memberId = await nuevoSocio();
     const planes = (await app.inject({ method: 'GET', url: '/plans', headers: { cookie: owner } })).json();
     const plan = planes.find((p: { code: string }) => p.code === 'MEN');
-    const mem = await app.inject({
-      method: 'POST', url: `/members/${memberId}/memberships`, headers: { cookie: owner },
-      payload: { reason: 'Fixture de prueba', planId: plan.id, soldAtBranchId: branchId },
-    });
-    await app.inject({ method: 'POST', url: `/memberships/${mem.json().id}/activate`, headers: { cookie: owner }, payload: { reason: 'Fixture de prueba' } });
+    const mem = await altaSinCobro(app, owner, memberId, { reason: 'Fixture de prueba', planId: plan.id, soldAtBranchId: branchId });
+    await activarSinCobro(app, owner, mem.json().id);
     const cookie = `gf_portal=${(await activar(await invitar(memberId))).cookies.find((c) => c.name === 'gf_portal')!.value}`;
     const me = (await app.inject({ method: 'GET', url: '/portal/me', headers: { cookie } })).json();
     expect(me.membershipStatus).toBe('ACTIVE');
@@ -155,11 +153,8 @@ describe('portal del socio', () => {
     const memberId = await nuevoSocio();
     const planes = (await app.inject({ method: 'GET', url: '/plans', headers: { cookie: owner } })).json();
     const plan = planes.find((p: { code: string }) => p.code === 'MEN');
-    const mem = await app.inject({
-      method: 'POST', url: `/members/${memberId}/memberships`, headers: { cookie: owner },
-      payload: { reason: 'Fixture de prueba', planId: plan.id, soldAtBranchId: branchId },
-    });
-    await app.inject({ method: 'POST', url: `/memberships/${mem.json().id}/activate`, headers: { cookie: owner }, payload: { reason: 'Fixture de prueba' } });
+    const mem = await altaSinCobro(app, owner, memberId, { reason: 'Fixture de prueba', planId: plan.id, soldAtBranchId: branchId });
+    await activarSinCobro(app, owner, mem.json().id);
     await db().membership.update({ where: { id: mem.json().id }, data: { status: 'SUSPENDED' } });
 
     const cookie = `gf_portal=${(await activar(await invitar(memberId))).cookies.find((c) => c.name === 'gf_portal')!.value}`;

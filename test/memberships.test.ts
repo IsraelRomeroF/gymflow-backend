@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { uuidv7, normalizedNameKey } from '@gymflow/core';
 import { makeApp, loginAs, orgFixtures, aprobacion } from './helpers.js';
 import { closeDb, getDb } from '../src/platform/db/client.js';
+import { activarSinCobro, altaSinCobro, cambiarPlanSinCobro, reactivarSinCobro, renovarSinCobro } from './membresia-de-prueba.js';
 
 const iso = (d: Date) => d.toISOString().slice(0, 10);
 const addDays = (d: Date, n: number) => new Date(d.getTime() + n * 86_400_000);
@@ -62,10 +63,7 @@ describe('motor de membresías', () => {
   };
 
   const alta = async (memberId: string, planId = planMensual, body: Record<string, unknown> = {}) =>
-    app.inject({
-      method: 'POST', url: `/members/${memberId}/memberships`, headers: { cookie },
-      payload: { reason: 'Fixture de prueba', planId, soldAtBranchId: branchCen, ...body },
-    });
+    altaSinCobro(app, cookie, memberId, { reason: 'Fixture de prueba', planId, soldAtBranchId: branchCen, ...body });
 
   // ── Ciclo de vida ─────────────────────────────────────────────────────────
 
@@ -82,7 +80,7 @@ describe('motor de membresías', () => {
   it('activar otorga acceso', async () => {
     const memberId = await nuevoSocio();
     const created = (await alta(memberId)).json();
-    const res = await app.inject({ method: 'POST', url: `/memberships/${created.id}/activate`, headers: { cookie }, payload: { reason: 'Fixture de prueba' } });
+    const res = await activarSinCobro(app, cookie, created.id);
     expect(res.statusCode).toBe(200);
     expect(res.json().status).toBe('ACTIVE');
     expect(res.json().grantsAccess).toBe(true);
@@ -146,7 +144,7 @@ describe('motor de membresías', () => {
   it('FROZEN no da acceso, y al reactivar EXTIENDE el periodo', async () => {
     const memberId = await nuevoSocio();
     const created = (await alta(memberId)).json();
-    await app.inject({ method: 'POST', url: `/memberships/${created.id}/activate`, headers: { cookie }, payload: { reason: 'Fixture de prueba' } });
+    await activarSinCobro(app, cookie, created.id);
 
     const antes = (await app.inject({ method: 'GET', url: `/memberships/${created.id}`, headers: { cookie } })).json();
 
@@ -169,7 +167,7 @@ describe('motor de membresías', () => {
   it('congelar EXIGE motivo y respeta el mínimo del plan', async () => {
     const memberId = await nuevoSocio();
     const created = (await alta(memberId)).json();
-    await app.inject({ method: 'POST', url: `/memberships/${created.id}/activate`, headers: { cookie }, payload: { reason: 'Fixture de prueba' } });
+    await activarSinCobro(app, cookie, created.id);
 
     const sinMotivo = await app.inject({
       method: 'POST', url: `/memberships/${created.id}/freeze`, headers: { cookie },
@@ -188,7 +186,7 @@ describe('motor de membresías', () => {
   it('el cupo anual de congelamiento se agota', async () => {
     const memberId = await nuevoSocio();
     const created = (await alta(memberId)).json();
-    await app.inject({ method: 'POST', url: `/memberships/${created.id}/activate`, headers: { cookie }, payload: { reason: 'Fixture de prueba' } });
+    await activarSinCobro(app, cookie, created.id);
 
     await app.inject({
       method: 'POST', url: `/memberships/${created.id}/freeze`, headers: { cookie },
@@ -209,12 +207,9 @@ describe('motor de membresías', () => {
   it('cambio de plan devuelve prorrateo por DÍAS REALES y conserva el ancla', async () => {
     const memberId = await nuevoSocio();
     const created = (await alta(memberId, planMensual, { billingAnchorDay: 31 })).json();
-    await app.inject({ method: 'POST', url: `/memberships/${created.id}/activate`, headers: { cookie }, payload: { reason: 'Fixture de prueba' } });
+    await activarSinCobro(app, cookie, created.id);
 
-    const res = await app.inject({
-      method: 'POST', url: `/memberships/${created.id}/change-plan`, headers: { cookie },
-      payload: { planId: planMulti, reason: 'El socio quiere acceso multisede' },
-    });
+    const res = await cambiarPlanSinCobro(app, cookie, created.id, ({ planId: planMulti, reason: 'El socio quiere acceso multisede' }).planId, ({ planId: planMulti, reason: 'El socio quiere acceso multisede' }).reason);
     expect(res.statusCode).toBe(200);
     const { membership, proration } = res.json();
     expect(membership.planId).toBe(planMulti);
@@ -235,10 +230,8 @@ describe('motor de membresías', () => {
     expect(created.currentPeriodEnd.slice(-2)).toBe('05');
 
     // A partir del SEGUNDO ciclo, la duración ya es la del plan.
-    await app.inject({ method: 'POST', url: `/memberships/${created.id}/activate`, headers: { cookie }, payload: { reason: 'Fixture de prueba' } });
-    const renovada = (await app.inject({
-      method: 'POST', url: `/memberships/${created.id}/renew`, headers: { cookie }, payload: { reason: 'Fixture de prueba' },
-    })).json();
+    await activarSinCobro(app, cookie, created.id);
+    const renovada = (await renovarSinCobro(app, cookie, created.id)).json();
     expect(renovada.currentPeriodStart).toBe(created.currentPeriodEnd); // contiguos
     expect(renovada.currentPeriodEnd.slice(-2)).toBe('05');
   });
@@ -246,11 +239,8 @@ describe('motor de membresías', () => {
   it('cambiar al MISMO plan se rechaza', async () => {
     const memberId = await nuevoSocio();
     const created = (await alta(memberId)).json();
-    await app.inject({ method: 'POST', url: `/memberships/${created.id}/activate`, headers: { cookie }, payload: { reason: 'Fixture de prueba' } });
-    const res = await app.inject({
-      method: 'POST', url: `/memberships/${created.id}/change-plan`, headers: { cookie },
-      payload: { planId: planMensual, reason: 'Sin cambio' },
-    });
+    await activarSinCobro(app, cookie, created.id);
+    const res = await cambiarPlanSinCobro(app, cookie, created.id, ({ planId: planMensual, reason: 'Sin cambio' }).planId, ({ planId: planMensual, reason: 'Sin cambio' }).reason);
     expect(res.statusCode).toBe(422);
   });
 
@@ -267,10 +257,7 @@ describe('motor de membresías', () => {
       payload: { reason: 'Baja temporal' },
     });
 
-    const res = await app.inject({
-      method: 'POST', url: `/memberships/${primera.id}/reactivate`, headers: { cookie },
-      payload: { reason: 'Fixture de prueba', planId: planMulti },
-    });
+    const res = await reactivarSinCobro(app, cookie, primera.id, ({ reason: 'Fixture de prueba', planId: planMulti }).planId);
     expect(res.statusCode).toBe(201);
     expect(res.json().id).not.toBe(primera.id); // es OTRA membresía
 
@@ -286,7 +273,7 @@ describe('motor de membresías', () => {
   it('cada transición deja un evento en la historia del contrato', async () => {
     const memberId = await nuevoSocio();
     const created = (await alta(memberId)).json();
-    await app.inject({ method: 'POST', url: `/memberships/${created.id}/activate`, headers: { cookie }, payload: { reason: 'Fixture de prueba' } });
+    await activarSinCobro(app, cookie, created.id);
     await app.inject({
       method: 'POST', url: `/memberships/${created.id}/cancel`, headers: { cookie },
       payload: { reason: 'Prueba de historial' },

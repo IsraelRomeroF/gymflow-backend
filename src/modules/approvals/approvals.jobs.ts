@@ -1,6 +1,7 @@
 import type { JobHandler, JobResult } from '../../platform/jobs/types.js';
 import type { GymJob } from '../../platform/modules/types.js';
 import { RemoteApprovalService } from './remote-approval.service.js';
+import { ApprovalProxyService } from './approval-proxy.service.js';
 
 /** Lo que `vencerOlvidadas` cierra por pasada (el tope de `pendingExpired`). */
 const LOTE = 50;
@@ -17,6 +18,9 @@ const expireForgotten: JobHandler = async (organizationId) => {
   const result: JobResult = { job: 'approvals.expire-forgotten', processed: 0, skipped: 0, batches: 1, truncated: false, errors: [] };
   result.processed = await new RemoteApprovalService().vencerOlvidadas(organizationId);
   result.truncated = result.processed >= LOTE;
+  // De paso, el nombramiento de apoderado cuya fecha ya pasó (D-02, bloque 3.1): deja de valer
+  // por su fecha; aquí solo se cierra y se asienta «el sistema dio por vencido el nombramiento».
+  result.processed += await new ApprovalProxyService().cerrarVencidos(organizationId);
   return result;
 };
 

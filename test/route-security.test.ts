@@ -86,15 +86,19 @@ describe('declaración de seguridad de las rutas', () => {
       .sort();
     expect(deSocio).toEqual([
       'DELETE /portal/payment-methods/:id',
+      'DELETE /portal/push-subscriptions',
       'GET /portal/attendance',
       'GET /portal/attendance/summary',
       'GET /portal/bookings',
       'GET /portal/classes',
       'GET /portal/classes/offered',
+      'GET /portal/coach',
       'GET /portal/consents',
       'GET /portal/me',
       'GET /portal/me/export',
       'GET /portal/notices',
+      'GET /portal/notifications',
+      'GET /portal/offer',
       'GET /portal/payment-methods',
       'GET /portal/payments/:id/receipt',
       'GET /portal/privacy-requests',
@@ -106,14 +110,17 @@ describe('declaración de seguridad de las rutas', () => {
       'POST /portal/bookings/:id/cancel',
       'POST /portal/charges/:id/pay',
       'POST /portal/classes/:id/book',
+      'POST /portal/coach/code',
       'POST /portal/consents/:type/revoke',
       'POST /portal/logout-all',
       'POST /portal/notices/read',
       'POST /portal/payment-methods',
       'POST /portal/payment-methods/setup',
       'POST /portal/privacy-requests',
+      'POST /portal/push-subscriptions',
       'POST /portal/routine/done',
       'POST /portal/routine/undo',
+      'PUT /portal/notifications/preferences',
     ]);
   });
 

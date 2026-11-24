@@ -402,17 +402,15 @@ describe('el reloj: medianoche por sede, fin de mes y cambio de horario', () => 
   });
 
   /**
-   * DEFECTO (1.17b, anotado en pendientes): la cadena de la bitácora se ENLAZA con «el
-   * último asiento» y se VERIFICA en orden, y las dos cosas se deciden por la hora del
-   * servidor (`at`, en milisegundos, y después el id, que dentro del mismo milisegundo es
-   * al azar). Si el reloj retrocede (una corrección de hora; en WSL2 pasa al despertar la
-   * máquina) los asientos nuevos quedan «antes» del último: el siguiente vuelve a
-   * enlazarse con el mismo y la verificación dice «prevHash no encadena», como si alguien
-   * hubiera tocado la bitácora. Lo mismo con dos asientos en el mismo milisegundo
-   * (medido con el reloj real: 0 pares en 900 asientos seguidos; con el reloj detenido, siempre).
-   * Esta prueba afirma lo correcto y hoy falla; cuando se arregle, vitest avisa.
+   * DEFECTO DE 1.17b, CERRADO EN 3.12. La cadena de la bitácora se ENLAZABA con «el
+   * último asiento» y se VERIFICABA en orden, y las dos cosas se decidían por la hora del
+   * servidor (`at`, y dentro del mismo milisegundo el id, que es al azar). Si el reloj
+   * retrocedía (una corrección de hora; en WSL2 pasa al despertar la máquina) el siguiente
+   * asiento volvía a enlazarse con el mismo y la verificación decía «prevHash no encadena»,
+   * como si alguien hubiera tocado la bitácora. Ahora cada eslabón lleva su número
+   * (`chainSeq`) y la hora ya no decide nada. Más casos en `cadena-secuencia.test.ts`.
    */
-  it.fails('la cadena de la bitácora no depende de que el reloj del servidor nunca retroceda (DEFECTO: dos segundos atrás y la verificación la da por rota)', async () => {
+  it('la cadena de la bitácora no depende de que el reloj del servidor nunca retroceda', async () => {
     const { AuditService } = await import('../src/platform/audit/audit.service.js');
     const { systemContext } = await import('../src/platform/jobs/types.js');
     const propio = await gimnasioPropio({ sedes: [{ name: 'Sede de la cadena', cajas: 1 }] });

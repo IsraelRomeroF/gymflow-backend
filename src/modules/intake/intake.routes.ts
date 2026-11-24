@@ -332,14 +332,16 @@ export function registerIntakeRoutes(app: FastifyInstance, env: Env): void {
     schema: respuesta(201, IntakeResolved),
     handler: async (request, reply) => {
       const { id } = idParam.parse(request.params);
-      const { force, corrections, responsible, guardian } = z.object({
+      const { force, corrections, responsible, guardian, coachUserId } = z.object({
         force: z.boolean().default(false),
         // Lo que recepción completa o corrige en este momento; se suma a lo que ya había guardado.
         ...decisionBody,
+        // D-29 (bloque 3.8): quien aprueba elige el coach, igual que en el alta del mostrador.
+        coachUserId: z.string().uuid().nullish(),
       }).parse(request.body ?? {});
       await autorizarSede(request, id);
       const c = limpias(corrections);
-      const r = await service.approve(request.ctx!, id, { force, responsible, guardian, ...(c ? { corrections: c } : {}) });
+      const r = await service.approve(request.ctx!, id, { force, responsible, guardian, coachUserId, ...(c ? { corrections: c } : {}) });
       return reply.status(201).send(r);
     },
   });

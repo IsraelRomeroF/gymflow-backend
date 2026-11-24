@@ -23,6 +23,25 @@ export async function usageOf(key: string, organizationId: string, branchId?: st
   return provider ? provider(organizationId, branchId) : { inUse: [], blockers: [] };
 }
 
+/**
+ * LO QUE APAGAR UN MÓDULO BORRA pasado un plazo (3.12; D-32). Hoy solo
+ * Biometría: sus rostros. Como el uso, cada módulo cuenta lo suyo y lo
+ * registra aquí; un módulo sin proveedor no borra nada al apagarse.
+ * Con `branchId`, lo de ESA sucursal.
+ */
+type ErasureProvider = (organizationId: string, branchId?: string) => Promise<number>;
+const erasures = new Map<string, ErasureProvider>();
+
+export function registerModuleErasure(key: ModuleKey, provider: ErasureProvider): void {
+  erasures.set(key, provider);
+}
+
+/** Cuántos se borrarían; `null` si apagar ese módulo no borra nada (no es lo mismo que cero). */
+export async function erasureOf(key: string, organizationId: string, branchId?: string): Promise<number | null> {
+  const provider = erasures.get(key);
+  return provider ? provider(organizationId, branchId) : null;
+}
+
 /** "1 producto" / "7 productos"; nada si es cero. */
 export function contar(n: number, singular: string, plural: string): string[] {
   return n > 0 ? [`${n.toLocaleString('es-MX')} ${n === 1 ? singular : plural}`] : [];

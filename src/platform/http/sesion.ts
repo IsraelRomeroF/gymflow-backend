@@ -1,6 +1,7 @@
 import type { FastifyRequest } from 'fastify';
 import { DomainError, type DomainErrorCode } from '@gymflow/core';
 import type { Env } from '../env.js';
+import { cookieConDominio, dominioDeCookie } from '../perfiles.js';
 
 /**
  * Un error de dominio con su porqué ESTABLE (`reason`), además del texto.
@@ -49,7 +50,10 @@ export function llegoPorHttps(request: FastifyRequest): boolean {
  * gimnasio, por http, sigue sin `Secure`: si no, el navegador no la guarda.
  *
  * Borrar una cookie exige los mismos `path` y `domain` con que se puso: por
- * eso salir usa esta misma función, sin `expires`.
+ * eso salir usa esta misma función, sin `expires`. Con `SESSION_COOKIE_DOMAIN`
+ * el dominio depende de por dónde se entró (`request.host`, que detrás del
+ * panel es la dirección que escribió la persona): quien sale por la misma
+ * dirección por la que entró borra la misma cookie.
  */
 export function opcionesDeCookie(request: FastifyRequest, env: Env, expires?: Date) {
   return {
@@ -60,6 +64,8 @@ export function opcionesDeCookie(request: FastifyRequest, env: Env, expires?: Da
     // `Max-Age` además de `Expires`: el navegador la cuenta con SU reloj desde
     // que la recibe, así un reloj adelantado no la tira antes de tiempo.
     ...(expires ? { expires, maxAge: Math.max(0, Math.round((expires.getTime() - Date.now()) / 1000)) } : {}),
-    ...(env.SESSION_COOKIE_DOMAIN ? { domain: env.SESSION_COOKIE_DOMAIN } : {}),
+    // El dominio solo para quien entró por él (D-01): por `localhost` o por la
+    // red del gimnasio la cookie va sin dominio, o el navegador la tiraría.
+    ...(cookieConDominio(request.host, env.SESSION_COOKIE_DOMAIN) ? { domain: dominioDeCookie(env.SESSION_COOKIE_DOMAIN) } : {}),
   };
 }

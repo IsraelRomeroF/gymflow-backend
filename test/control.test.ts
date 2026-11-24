@@ -61,8 +61,8 @@ describe('control: alcance por sucursal y datos de dinero', () => {
     expect(tipo.statusCode, tipo.body).toBe(201);
     const id = tipo.json().id;
     expect((await app.inject({ method: 'PATCH', url: `/classes/types/${id}`, headers: { cookie: coach }, payload: { dropInPriceCents: '1' } })).statusCode).toBe(403);
-    // El nombre y el cupo sí son suyos.
-    expect((await app.inject({ method: 'PATCH', url: `/classes/types/${id}`, headers: { cookie: coach }, payload: { defaultCapacity: 15 } })).statusCode).toBe(200);
+    // El nombre y el cupo de una clase tampoco: armar el horario ya no viene con su puesto (D-28, bloque 3.8).
+    expect((await app.inject({ method: 'PATCH', url: `/classes/types/${id}`, headers: { cookie: coach }, payload: { defaultCapacity: 15 } })).statusCode).toBe(403);
     // Crear una clase con precio también es fijar un precio.
     expect((await app.inject({ method: 'POST', url: '/classes/types', headers: { cookie: coach }, payload: { name: nombreUnico('Coach'), dropInPriceCents: '1' } })).statusCode).toBe(403);
     expect((await app.inject({ method: 'PATCH', url: `/classes/types/${id}`, headers: { cookie: owner }, payload: { dropInPriceCents: '12000' } })).statusCode).toBe(422);

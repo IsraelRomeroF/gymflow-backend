@@ -244,9 +244,16 @@ export function registerAuditRoutes(app: FastifyInstance): void {
       if (query.branchId) request.requirePermission('audit:read', query.branchId);
       const alcance = request.branchScope('audit:read');
       const { from, to } = await periodo(orgId, query);
-      const filas = (await audit.exceptionSummary(orgId, { branchIds: query.branchId ? [query.branchId] : alcance, from, to }))
-        .filter((f) => !query.actorUserId || f.actorUserId === query.actorUserId);
+      const sedes = query.branchId ? [query.branchId] : alcance;
+      const [todas, sinRostro] = await Promise.all([
+        audit.exceptionSummary(orgId, { branchIds: sedes, from, to }),
+        audit.withoutFaceSummary(orgId, { branchIds: sedes, from, to }),
+      ]);
+      const filas = todas.filter((f) => !query.actorUserId || f.actorUserId === query.actorUserId);
       return {
+        // Entradas autorizadas sin rostro (D-06; 3.12): por quién autorizó, día y sede. Sin tope.
+        withoutFace: sinRostro.filter((f) => !query.actorUserId || f.byUserId === query.actorUserId)
+          .map((f) => ({ date: isoDate(f.businessDate), byUserId: f.byUserId, byName: f.byName, branchId: f.branchId, count: f.count })),
         summary: filas.map((f) => ({
           date: isoDate(f.businessDate), actorUserId: f.actorUserId, actorName: f.actorName, branchId: f.branchId,
           count: f.count, limit: f.limit, overLimit: f.limit !== null && f.count > f.limit,

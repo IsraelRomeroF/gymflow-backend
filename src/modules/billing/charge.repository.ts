@@ -243,12 +243,31 @@ export class ChargeRepository extends TenantRepository {
    * ningún pago dejan de ser deuda (DM-03). Lo parcialmente pagado se queda:
    * eso es una decisión de la gerencia (condonar con firma o seguir cobrando).
    */
-  async voidUnpaidForMembership(membershipId: string, reason: string): Promise<number> {
+  async voidUnpaidForMembership(membershipId: string, reason: string, opts: { soloDesde?: Date } = {}): Promise<number> {
     const { count } = await this.db.charge.updateMany({
-      where: this.scope({ membershipId, allocatedCents: 0n, status: { in: [S.OPEN, S.OVERDUE] } }),
+      where: this.scope({
+        membershipId, allocatedCents: 0n, status: { in: [S.OPEN, S.OVERDUE] },
+        // D-12: de una membresía que sí corrió solo se anula lo de periodos que aún no empiezan.
+        ...(opts.soloDesde ? { periodStart: { gt: opts.soloDesde } } : {}),
+      }),
       data: { status: S.VOID, voidedAt: new Date(), voidReason: reason },
     });
     return count;
+  }
+
+  /**
+   * Lo condonado a un socio SIN firma desde una fecha (D-12): lo que ya gastó
+   * de su tope de «una mensualidad». Solo cuentan las condonaciones hechas
+   * por una persona y que nadie más firmó.
+   */
+  async waivedWithoutApprovalSince(memberId: string, since: Date): Promise<bigint> {
+    const [fila] = await this.db.$queryRaw<Array<{ total: bigint | null }>>`
+      SELECT COALESCE(SUM(a."amountCents"), 0)::bigint AS total
+        FROM "charge_adjustments" a JOIN "charges" c ON c."id" = a."chargeId"
+       WHERE a."organizationId" = ${this.organizationId}::uuid AND c."memberId" = ${memberId}::uuid
+         AND a."adjustmentType" = 'WAIVER' AND a."approvedByUserId" IS NULL AND a."createdByUserId" IS NOT NULL
+         AND a."createdAt" >= ${since}`;
+    return fila?.total ?? 0n;
   }
 
   async voidCharge(id: string, reason: string): Promise<ChargeRecord | null> {

@@ -66,6 +66,8 @@ export type DecisionDeAlta = {
   /** D-09: su celular ya es el de otro socio; quién responde por el número. */
   responsible?: ResponsibleInput | undefined;
   guardian?: FirmaDelTutor | undefined;
+  /** D-29 (bloque 3.8): el coach que recepción elige al APROBAR el alta. Al vincular con una ficha que ya existe no se usa. */
+  coachUserId?: string | null | undefined;
 };
 
 /** Mismo celular y otro nombre: comparten celular, no son la misma persona (9-02). */
@@ -491,6 +493,7 @@ export class IntakeService {
         createdByUserId: ctx.tenant.actorUserId ?? '',
         force: opts.force ?? false,
         responsible: opts.responsible,
+        coachUserId: opts.coachUserId ?? null,
         guardian: tutor ? { name: opts.guardian!.name, phoneE164: opts.guardian!.phoneE164 ?? intake.guardianPhoneE164 } : undefined,
         consents: firmas.map((x) => ({
           consentType: x.consentType,

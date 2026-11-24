@@ -80,6 +80,7 @@ function protegerAlDueno(request: FastifyRequest, cuenta: StaffRow): void {
 
 import { PushService } from './push.service.js';
 import { PushSubscriptionRepository } from './push-subscription.repository.js';
+import { KnownDeviceRepository } from './known-device.repository.js';
 
 export function registerStaffRoutes(app: FastifyInstance): void {
   const audit = new AuditService();
@@ -494,6 +495,8 @@ export function registerStaffRoutes(app: FastifyInstance): void {
       const clave = temporal();
       await repo.setPassword(id, await app.auth.hashPassword(clave), ctx.tenant.actorUserId!);
       await sessions.revokeAllForUser(id, 'password_reset');
+      // Sus equipos conocidos se olvidan (D-01): si la contraseña se restablece porque alguien más la tenía, ese equipo no queda «de confianza».
+      await new KnownDeviceRepository().olvidar(id);
       await audit.record(ctx, { action: 'staff.password_reset', resourceType: 'User', resourceId: id, reason });
       return { temporaryPassword: clave };
     },
@@ -509,6 +512,25 @@ export function registerStaffRoutes(app: FastifyInstance): void {
     handler: async (request) => {
       const ctx = request.ctx!;
       return { publicKey: new PushService().publicKey(), subscriptions: ctx.tenant.actorUserId ? await new PushSubscriptionRepository().countForUser(ctx.tenant.actorUserId) : 0 };
+    },
+  });
+
+  /**
+   * «Probar»: un aviso de verdad a los equipos de quien lo pide (D-01, bloque
+   * 3.1). Con la dirección fija es la manera de saber, sin esperar una firma,
+   * que los avisos llegan a ese teléfono. Dice a cuántos equipos salió.
+   */
+  route(app, {
+    method: 'POST',
+    url: '/me/push/test',
+    security: { kind: 'session' },
+    config: { rateLimit: { max: 6, timeWindow: '5 minutes' } },
+    handler: async (request) => {
+      const ctx = request.ctx!;
+      const sent = await new PushService().sendToUsers(ctx.tenant.organizationId, [ctx.tenant.actorUserId!], {
+        title: 'Aviso de prueba de GymFlow', body: 'Si lees esto, los avisos llegan a este equipo.', url: '/seguridad', tag: 'push-test',
+      });
+      return { sent };
     },
   });
 

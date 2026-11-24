@@ -373,7 +373,23 @@ export class CashSessionRepository extends TenantRepository {
       WHERE "organizationId" = ${this.organizationId}::uuid
         AND "cashSessionId" = ${sessionId}::uuid
         AND "createdByUserId" = ${userId}::uuid
-        AND "movementType" IN ('WITHDRAWAL','DEPOSIT','EXPENSE')`;
+        AND "movementType" IN ('WITHDRAWAL','DEPOSIT')`;
+    return rows[0]?.total ?? 0n;
+  }
+
+  /**
+   * Lo anotado SIN firma en el turno, de ese tipo (fondo o gasto), en positivo
+   * (D-15, bloque 3.5): lo que ya se gastó del tope chico. Es del turno, no de
+   * la persona: el tope es del cajón.
+   */
+  async unsignedInSessionCents(sessionId: string, movementType: 'FLOAT_IN' | 'EXPENSE'): Promise<bigint> {
+    const rows = await this.db.$queryRaw<Array<{ total: bigint | null }>>`
+      SELECT COALESCE(SUM(ABS("amountCents")), 0)::bigint AS total
+      FROM "cash_movements"
+      WHERE "organizationId" = ${this.organizationId}::uuid
+        AND "cashSessionId" = ${sessionId}::uuid
+        AND "approvedByUserId" IS NULL
+        AND "movementType"::text = ${movementType}`;
     return rows[0]?.total ?? 0n;
   }
 }

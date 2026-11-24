@@ -3,6 +3,7 @@ import { AuditService } from '../../platform/audit/audit.service.js';
 import { PulseRepository, type Conteo, type PorSede } from './pulse.repository.js';
 import { MovementsService } from './movements.service.js';
 import { AnalyticsService } from './analytics.service.js';
+import { TrialPassRepository } from '../billing/index.js';
 import type { RequestContext } from '../../platform/context.js';
 
 const HORA = 3_600_000;
@@ -72,7 +73,7 @@ export class PulseService {
       entroHoy, entroAyer, entroSemana, horasHoy, horasSemana,
       visitasHoy, visitasAyer, altasHoy, altasMes, bajasMes, mora,
       cortes, cajas, devoluciones, firmas, mes, mesPasado, mesPasadoTodo, tablero, sensibles,
-      puertas, ultimas, horarioCaja, equipo,
+      puertas, ultimas, horarioCaja, equipo, pasesDePrueba, sinRostro,
     ] = await Promise.all([
       repo.entroEntre(hoy, ahora),
       repo.entroEntre(ayer, new Date(ayer.getTime() + transcurrido)),
@@ -102,6 +103,9 @@ export class PulseService {
       repo.ultimasEntradas(hoy, ahora),
       repo.horarioDeCaja(hoy, ahora),
       repo.equipo(hoy, ahora),
+      // Pases de prueba del mes (D-08) y entradas autorizadas sin rostro de los últimos 7 días (D-06): 3.12.
+      Promise.all((sedes ?? [null]).map((s) => new TrialPassRepository(orgId).contar(s, inicioMes, manana))),
+      new AuditService().withoutFaceSummary(orgId, { branchIds: sedes, from: new Date(hoy.getTime() - 6 * DIA), to: ahora }),
     ]);
 
     const enSede = <T extends { branchId: string | null }>(xs: readonly T[]) => xs.filter((x) => sedes === null || (x.branchId !== null && sedes.includes(x.branchId)));
@@ -140,6 +144,7 @@ export class PulseService {
         lastMonthTotalProfitCents: mesPasadoTodo.totals.profitCents,
         newMembers: contar(altasMes, sedes),
         leftMembers: contar(bajasMes, sedes),
+        trialPasses: pasesDePrueba.reduce((a, n) => a + n, 0),
       },
       alerts: {
         shortCounts: enSede(cortes).map((c) => ({ ...c, closedAt: c.closedAt })),
@@ -147,6 +152,7 @@ export class PulseService {
         cashOpenSinceYesterday: enSede(cajas).filter((c) => c.openedAt < hoy),
         pendingApprovals: { count: enSede(firmas).reduce((a, f) => a + f.total, 0), oldest: masVieja(enSede(firmas).map((f) => f.desde)) },
         sensitiveToday: sensibles.length,
+        entriesWithoutFace7d: sinRostro.reduce((a, f) => a + f.count, 0),
       },
       owed: {
         overdueCents: tablero.overdueCents,

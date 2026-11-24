@@ -48,6 +48,14 @@ export class MovementsRepository extends TenantRepository {
          AND s."businessDate" >= ${from}::date AND s."businessDate" < ${to}::date
        GROUP BY 1, 2, 3, 4
       UNION ALL
+      -- Bloque 3.5 (D-13; edición puntual): la devolución de una venta de tienda de otro día
+      -- resta, como reembolso, el día en que se devuelve. La venta original no se mueve.
+      SELECT r."businessDate", r."branchId", 'REFUND', r."method"::text, (-SUM(r."amountCents"))::bigint
+        FROM "pos_sale_returns" r
+       WHERE r."organizationId" = ${this.organizationId}::uuid
+         AND r."businessDate" >= ${from}::date AND r."businessDate" < ${to}::date
+       GROUP BY 1, 2, 3, 4
+      UNION ALL
       SELECT m."businessDate", cs."branchId", 'CASH_' || m."movementType"::text, 'CASH', SUM(m."amountCents")::bigint
         FROM "cash_movements" m JOIN "cash_sessions" cs ON cs."id" = m."cashSessionId"
        WHERE m."organizationId" = ${this.organizationId}::uuid
@@ -83,6 +91,12 @@ export class MovementsRepository extends TenantRepository {
         FROM "pos_sales" s
        WHERE s."organizationId" = ${this.organizationId}::uuid
          AND s."method" IS NOT NULL AND s."businessDate" = ${day}::date
+      UNION ALL
+      -- Bloque 3.5 (D-13; edición puntual): la devolución de una venta de tienda, el día en que se hizo.
+      SELECT r."id", r."createdAt", r."businessDate", r."branchId", 'REFUND', r."method"::text, -r."amountCents",
+             'Devolución de venta de tienda: ' || r."reason", s."folio", s."memberId", r."createdByUserId"
+        FROM "pos_sale_returns" r JOIN "pos_sales" s ON s."id" = r."posSaleId"
+       WHERE r."organizationId" = ${this.organizationId}::uuid AND r."businessDate" = ${day}::date
       UNION ALL
       SELECT m."id", m."at", m."businessDate", cs."branchId", 'CASH_' || m."movementType"::text, 'CASH',
              m."amountCents", m."reason", NULL, NULL, m."createdByUserId"

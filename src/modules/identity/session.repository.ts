@@ -109,6 +109,7 @@ export class SessionRepository extends GlobalRepository {
       failedLogins: number; lockedUntil: Date | null; mustChangePassword: boolean; passwordResetAt: Date | null; passwordResetByUserId: string | null;
       unlockedSections: string[]; platformSections: string[] | null; roleKeys: string[];
       grants: Grant[]; limits: LimitRow[]; permissionOverrides: unknown; assignmentBranches: Array<string | null>; orgHasManager: boolean;
+      isProxy: boolean;
     }>>`
       SELECT s.id, s."userId", s."organizationId", s."activeBranchId", s."expiresAt", s."lastSeenAt", s."stepUpUntil", s."createdAt",
              u."organizationId" AS "userOrganizationId", u.email, u."passwordHash", u."fullName", u."isActive",
@@ -126,6 +127,11 @@ export class SessionRepository extends GlobalRepository {
                WHERE ra."organizationId" = u."organizationId" AND ra."revokedAt" IS NULL AND r.key = 'MANAGER'
                  AND g."isActive" AND g."deletedAt" IS NULL AND g."unlockedSections" @> '["personal"]'::jsonb
              ) AS "orgHasManager",
+             -- ¿Tiene un nombramiento de apoderado vigente? (D-02, bloque 3.1)
+             EXISTS (
+               SELECT 1 FROM approval_proxies ap
+               WHERE ap."proxyUserId" = u.id AND ap."organizationId" = u."organizationId" AND ap."endedAt" IS NULL AND ap."endsAt" > now()
+             ) AS "isProxy",
              COALESCE((
                SELECT json_agg(DISTINCT r.key)
                FROM role_assignments ra JOIN roles r ON r.id = ra."roleId"
@@ -177,7 +183,11 @@ export class SessionRepository extends GlobalRepository {
           if (!r.orgHasManager) grants = [...grants, { permission: 'reports:month:close', branchId: null }];
         }
         const fuera = lockedPermissions(r.unlockedSections, r.roleKeys, r.platformSections);
-        return grants.filter((g) => !fuera.has(g.permission));
+        const vigentes = grants.filter((g) => !fuera.has(g.permission));
+        // D-02 (fase 3, bloque 3.1): mientras su nombramiento esté vigente, el apoderado ve Autorizaciones.
+        // Es solo la entrada a la pantalla: quién firma qué lo decide `ApprovalService.requireAuthority`
+        // leyendo el nombramiento, no este permiso. NO es `approvals:grant`, que abre actos propios del dueño.
+        return r.isProxy ? [...vigentes, { permission: 'approvals:proxy', branchId: null }] : vigentes;
       })(),
       limitRows: r.limits,
       unlockedSections: r.unlockedSections,

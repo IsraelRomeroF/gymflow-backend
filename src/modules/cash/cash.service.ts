@@ -1,7 +1,7 @@
 import {
   canClose, computeVariance, conflict, expectedCash, formatMoney, money,
-  movementRequiresApproval, movementSignIsValid, notFound, signedMovementAmount,
-  summarizeShift, validation,
+  movementSignIsValid, notFound, signedMovementAmount,
+  summarizeShift, validation, DomainError, reglaDelCajon, topeDeRetiroDelPuesto,
   type CashMovementType, type Money, type PaymentMethodType,
 } from '@gymflow/core';
 import { BranchRepository } from '../organization/index.js';
@@ -10,6 +10,8 @@ import { AuditService } from '../../platform/audit/audit.service.js';
 import type { RequestContext } from '../../platform/context.js';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 import { enUnaTransaccion } from '../../platform/db/unit-of-work.js';
+import { CashSettingsRepository } from './cash-settings.repository.js';
+import { MonthlyCloseService } from '../finance/index.js';
 
 /** Documento del turno: lo que recepción firma al cerrar. */
 export type ShiftReport = {
@@ -253,9 +255,27 @@ export class CashService {
       if (!session) throw notFound('Turno no encontrado');
       if (session.status !== 'OPEN') throw conflict('El turno ya está cerrado', 'CASH_SESSION_CLOSED');
 
-      if (movementRequiresApproval(input.movementType) && !input.approvedByUserId) {
-        throw validation(`Un movimiento de tipo ${input.movementType} exige autorización de un segundo usuario`);
-      }
+      // Las cifras de un mes cerrado no cambian (D-22; pendiente de 3.7 que recoge el bloque 3.5):
+      // un turno que quedó abierto de un mes ya cerrado no recibe movimientos; se corta y se abre otro.
+      await new MonthlyCloseService().assertOpen(orgId, session.businessDate);
+
+      // D-15: quién firma qué en el cajón. Fondo y gasto, sin firma hasta el tope chico del
+      // gimnasio (por turno); retiro y depósito, siempre con firma y, recepción, hasta su tope
+      // por turno; corrección, solo la gerencia y con firma. Una sola regla: `reglaDelCajon`.
+      const topes = await new CashSettingsRepository(orgId).get();
+      const regla = reglaDelCajon({
+        tipo: input.movementType,
+        montoCents: input.amountCents,
+        sinFirmaEnElTurnoCents: input.movementType === 'FLOAT_IN' || input.movementType === 'EXPENSE'
+          ? await sessions.unsignedInSessionCents(session.id, input.movementType) : 0n,
+        retiradoEnElTurnoCents: await sessions.withdrawnByUserCents(session.id, userId),
+        topeChicoCents: topes.pettyLimitCents,
+        topeRetiroCents: topes.withdrawalShiftLimitCents,
+        puesto: topeDeRetiroDelPuesto(ctx.tenant.limits.maxCashWithdrawalCents),
+        firmado: !!input.approvedByUserId,
+      });
+      if (regla.outcome === 'DENY') throw new DomainError('FORBIDDEN', regla.porQue, undefined, 'CASH_LIMIT_FORBIDDEN');
+      if (regla.outcome === 'REQUIRE_APPROVAL') throw new DomainError('REQUIRE_APPROVAL', 'Se requiere autorización de un segundo usuario', regla.porQue);
 
       const firmado = signedMovementAmount(
         input.movementType, money(input.amountCents), input.sign,

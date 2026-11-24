@@ -2,14 +2,15 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import {
   DomainError, MODULES, MODULE_BY_KEY, MODULE_GROUPS, canDisableAtBranch, changeModule, dependentsOf, effectiveModules,
-  effectiveModulesAt, notFound, validation,
+  effectiveModulesAt, notFound, rostrosSeBorranAlApagar, validation,
 } from '@gymflow/core';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { enUnaTransaccion } from '../../platform/db/unit-of-work.js';
 import { route } from '../../platform/http/registry.js';
 import { forgetModules, withEntitlements } from '../../platform/modules/module-state.js';
 import { ModuleStateRepository } from '../../platform/modules/module-state.repository.js';
-import { usageOf } from '../../platform/modules/usage.js';
+import { erasureOf, usageOf } from '../../platform/modules/usage.js';
+import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 // Los usuarios son de identidad: quién cambió qué se le pregunta a ella.
 import { UserRepository } from '../identity/index.js';
 import { BranchRepository } from './branch.repository.js';
@@ -21,7 +22,36 @@ const branchParam = z.object({ key: z.string().min(2).max(40), branchId: z.strin
 const changeBody = z.object({
   enabled: z.boolean(),
   reason: z.string().trim().max(300).optional(),
+  /**
+   * Al apagar un módulo que borra datos pasado un plazo (Biometría: los
+   * rostros; 3.12, D-32): el número que el aviso de la pantalla enseñó. Si no
+   * viene o ya no coincide, no se apaga.
+   */
+  erasureAcknowledged: z.number().int().min(0).optional(),
 });
+
+const dia = (d: Date) => d.toISOString().slice(0, 10);
+const diaEnPalabras = (d: Date) => new Intl.DateTimeFormat('es-MX', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' }).format(d);
+
+/**
+ * LO QUE APAGAR BORRARÍA (3.12; D-32, «igual si se apaga Biometría, con aviso»).
+ * `null` si apagar ese módulo ahí no borra nada (no es Biometría, o no hay
+ * ningún rostro guardado). `on` es el día en que se borraría si se apaga hoy.
+ */
+async function avisoDeBorrado(orgId: string, key: string, branchId?: string): Promise<{ count: number; on: Date } | null> {
+  const count = await erasureOf(key, orgId, branchId);
+  if (!count) return null;
+  return { count, on: rostrosSeBorranAlApagar(await new BusinessCalendar(orgId).today(branchId ?? null)) };
+}
+
+/** Sin el aviso confirmado con el número de hoy, no se apaga: nadie borra rostros sin haberlo leído. */
+function exigirAvisoConfirmado(aviso: { count: number; on: Date } | null, confirmado: number | undefined, nombreDelModulo: string, donde: string): void {
+  if (!aviso || confirmado === aviso.count) return;
+  const n = aviso.count;
+  throw new DomainError('CONFLICT',
+    `${nombreDelModulo} tiene ${n.toLocaleString('es-MX')} ${n === 1 ? 'rostro guardado' : 'rostros guardados'}${donde}: al apagarla ${n === 1 ? 'deja de reconocerse y se borra' : 'dejan de reconocerse y se borran'} el ${diaEnPalabras(aviso.on)} si no se vuelve a encender. Confirma el aviso para apagarla.`,
+    undefined, 'MODULE_ERASURE_WARNING');
+}
 
 /**
  * «FALTA CONFIGURAR» (19-08): un módulo encendido sin nada preparado deja a
@@ -38,6 +68,9 @@ const QUE_FALTA: Readonly<Record<string, { text: string; action: string; href: s
   biometrics: { text: 'Ningún socio tiene su rostro registrado todavía: se registra desde su ficha.', action: 'Ir a Socios', href: '/socios' },
   member_portal: { text: 'Ningún socio ha activado el portal en su teléfono: se le invita desde su ficha.', action: 'Ir a Socios', href: '/socios' },
 };
+
+/** Los módulos que al apagarse borran algo pasado un plazo: hoy, solo los rostros de Biometría (D-32). */
+const BORRA_AL_APAGAR: ReadonlySet<string> = new Set(['biometrics']);
 
 const nombre = (key: string) => MODULE_BY_KEY.get(key)?.name ?? key;
 const lista = (nombres: readonly string[]) => new Intl.ListFormat('es', { type: 'conjunction' }).format(nombres);
@@ -77,9 +110,24 @@ export function registerModuleRoutes(app: FastifyInstance): void {
     const apagadoEn = (branchId: string) => new Set(porSede.filter((h) => h.branchId === branchId && !h.enabled).map((h) => h.moduleKey));
     const activosEn = new Map(sedes.map((b) => [b.id, effectiveModulesAt(state, apagadoEn(b.id)) as ReadonlySet<string>]));
 
+    /**
+     * El aviso del borrado (3.12): encendido, cuántos se borrarían y qué día si se
+     * apaga hoy (`pending: false`); apagado con aviso confirmado, cuántos quedan
+     * y el día ya fijado (`pending: true`). `null` si no hay nada que borrar.
+     */
+    const borradoDe = async (key: string, branchId: string | undefined, encendido: boolean, cambio: { enabled: boolean; erasureOn: Date | null; erasureWarned: number | null } | undefined) => {
+      if (encendido) {
+        const aviso = await avisoDeBorrado(orgId, key, branchId);
+        return aviso ? { pending: false, count: aviso.count, on: dia(aviso.on), warned: null } : null;
+      }
+      if (!cambio || cambio.enabled || !cambio.erasureOn) return null;
+      return { pending: true, count: (await erasureOf(key, orgId, branchId)) ?? 0, on: dia(cambio.erasureOn), warned: cambio.erasureWarned };
+    };
+
     const modules = await Promise.all(MODULES.map(async (def) => {
       const cambio = historia.get(def.key);
       const usage = conDetalle && def.kind === 'optional' ? await usageOf(def.key, orgId) : null;
+      const borra = BORRA_AL_APAGAR.has(def.key);
       // Encendido, contratado y sin nada preparado. Altas digitales no cuenta su uso: se mira el enlace.
       const sinPreparar = usage !== null && activos.has(def.key) && contratos.get(def.key) !== false
         && (def.key === 'intake' ? enlaces === 0 : usage.inUse.length === 0 && usage.blockers.length === 0);
@@ -97,7 +145,7 @@ export function registerModuleRoutes(app: FastifyInstance): void {
         // Por sucursal: qué sedes lo usan. Una sede apaga; nunca enciende lo
         // que el gimnasio tiene apagado.
         branches: def.kind === 'optional' && def.scope === 'branch'
-          ? sedes.filter((b) => b.isActive).map((b) => {
+          ? await Promise.all(sedes.filter((b) => b.isActive).map(async (b) => {
               const cambio = porSede.find((h) => h.branchId === b.id && h.moduleKey === def.key);
               return {
                 branchId: b.id, name: b.name, enabled: activosEn.get(b.id)!.has(def.key),
@@ -105,9 +153,13 @@ export function registerModuleRoutes(app: FastifyInstance): void {
                 ...(conDetalle && cambio && !cambio.enabled
                   ? { reason: cambio.reason, at: cambio.updatedAt.toISOString(), byName: cambio.updatedByUserId ? nombres.get(cambio.updatedByUserId) ?? null : null }
                   : {}),
+                // Lo que apagarlo ahí borraría, o lo que ya tiene fecha de borrado (3.12).
+                ...(conDetalle && borra ? { erasure: await borradoDe(def.key, b.id, activosEn.get(b.id)!.has(def.key), cambio) } : {}),
               };
-            })
+            }))
           : [],
+        // Lo mismo para todo el gimnasio: solo Biometría borra algo al apagarse.
+        ...(conDetalle && borra ? { erasure: await borradoDe(def.key, undefined, activos.has(def.key), cambio) } : {}),
         ...(usage
           ? {
               usage,
@@ -152,7 +204,7 @@ export function registerModuleRoutes(app: FastifyInstance): void {
       // De TODO el gimnasio: con alcance de una sede no se cambia.
       request.authorize('settings:org', { branchId: null });
       const { key } = keyParam.parse(request.params);
-      const { enabled, reason } = changeBody.parse(request.body);
+      const { enabled, reason, erasureAcknowledged } = changeBody.parse(request.body);
 
       const def = MODULE_BY_KEY.get(key);
       if (!def) throw notFound('Módulo no encontrado');
@@ -188,17 +240,24 @@ export function registerModuleRoutes(app: FastifyInstance): void {
           throw new DomainError('CONFLICT', `Antes de apagar ${def.name} hay que resolver: ${lista(blockers)}.`, 'MODULE_BLOCKED');
         }
       }
+      // Apagar Biometría borra los rostros a los 30 días (D-32): solo con el aviso leído y confirmado (3.12).
+      const borrado = enabled ? null : await avisoDeBorrado(orgId, key);
+      exigirAvisoConfirmado(borrado, erasureAcknowledged, def.name, '');
 
       await enUnaTransaccion(async () => {
         const quien = ctx.tenant.actorUserId ?? null;
         for (const requisito of cambio.alsoEnabled) await repo.set(requisito, true, quien, null);
-        await repo.set(key, enabled, quien, enabled ? null : reason ?? null);
+        await repo.set(key, enabled, quien, enabled ? null : reason ?? null, borrado ? { on: borrado.on, warned: borrado.count } : null);
         // La bitácora al final de la unidad (ADR-035).
         await audit.record(ctx, {
           action: enabled ? 'settings.module.enable' : 'settings.module.disable',
           resourceType: 'Module',
           beforeState: { module: key, enabled: !enabled },
-          afterState: { module: key, name: def.name, enabled, alsoEnabled: cambio.alsoEnabled.map(nombre) },
+          afterState: {
+            module: key, name: def.name, enabled, alsoEnabled: cambio.alsoEnabled.map(nombre),
+            // Lo que el aviso decía al apagar: cuántos rostros y qué día se borran (3.12).
+            ...(borrado ? { erasureWarned: borrado.count, erasureOn: dia(borrado.on) } : {}),
+          },
           reason: reason ?? null,
         });
       });
@@ -221,7 +280,7 @@ export function registerModuleRoutes(app: FastifyInstance): void {
       const ctx = request.ctx!;
       const orgId = ctx.tenant.organizationId;
       const { key, branchId } = branchParam.parse(request.params);
-      const { enabled, reason } = changeBody.parse(request.body);
+      const { enabled, reason, erasureAcknowledged } = changeBody.parse(request.body);
       const sede = await new BranchRepository(orgId).findById(branchId);
       if (!sede) throw notFound('Sucursal no encontrada');
       request.authorize('settings:branch', { branchId });
@@ -251,14 +310,17 @@ export function registerModuleRoutes(app: FastifyInstance): void {
           throw new DomainError('CONFLICT', `Antes de apagar ${def.name} en ${sede.name} hay que resolver: ${lista(blockers)}.`, 'MODULE_BLOCKED');
         }
       }
+      // Los rostros tomados en esa sucursal se borran a los 30 días: solo con el aviso confirmado (3.12).
+      const borrado = enabled ? null : await avisoDeBorrado(orgId, key, branchId);
+      exigirAvisoConfirmado(borrado, erasureAcknowledged, def.name, ` en ${sede.name}`);
 
       await enUnaTransaccion(async () => {
-        await repo.setBranch(branchId, key, enabled, ctx.tenant.actorUserId ?? null, enabled ? null : reason ?? null);
+        await repo.setBranch(branchId, key, enabled, ctx.tenant.actorUserId ?? null, enabled ? null : reason ?? null, borrado ? { on: borrado.on, warned: borrado.count } : null);
         await audit.record(ctx, {
           action: enabled ? 'settings.module.branch.enable' : 'settings.module.branch.disable',
           resourceType: 'Module', branchId,
           beforeState: { module: key, branchId, enabled: !enabled },
-          afterState: { module: key, name: def.name, branchId, branchName: sede.name, enabled },
+          afterState: { module: key, name: def.name, branchId, branchName: sede.name, enabled, ...(borrado ? { erasureWarned: borrado.count, erasureOn: dia(borrado.on) } : {}) },
           reason: reason ?? null,
         });
       });

@@ -5,6 +5,7 @@ import { registerProductRoutes } from './products.routes.js';
 import { registerSaleRoutes } from './sales.routes.js';
 import { registerInventoryRoutes } from './inventory.routes.js';
 import { registerMemberSalesRoutes } from './member-sales.routes.js';
+import { registerPosCorrectionRoutes } from './correcciones.routes.js';
 
 /**
  * Las rutas del punto de venta, en tres archivos por lo que hacen (auditoría
@@ -21,4 +22,6 @@ export function registerPosRoutes(app: FastifyInstance): void {
   registerInventoryRoutes(app);
   // Las compras de un socio, para su ficha (bloque 2.2; 8-01).
   registerMemberSalesRoutes(app);
+  // «Por corregir» y la devolución de otro día (fase 3, bloque 3.5; D-13).
+  registerPosCorrectionRoutes(app);
 }

@@ -1,4 +1,4 @@
-import { AUDIT_CATEGORIES, AUDIT_SUMMARIZED, computeAuditHash, uuidv7, type AuditActorType, type AuditContent, type ChainLink } from '@gymflow/core';
+import { AUDIT_CATEGORIES, AUDIT_SUMMARIZED, AUDIT_SUMMARIZED_WITHOUT_FACE, computeAuditHash, uuidv7, type AuditActorType, type AuditContent, type ChainLink } from '@gymflow/core';
 import { GlobalRepository } from '../db/tenant-repository.js';
 import { Prisma } from '@gymflow/db';
 import { appendToPlatformChain, platformActorOf } from './platform-audit.repository.js';
@@ -67,6 +67,9 @@ export function filtroParaRevisar(): Prisma.AuditLogWhereInput {
   };
 }
 
+/** Dónde va la verificación de una cadena: el último eslabón revisado. */
+export type ChainCursor = { at: Date; id: string; chainSeq: number | null };
+
 export type AuditWrite = {
   organizationId: string;
   branchId?: string | null;
@@ -102,11 +105,21 @@ export class AuditRepository extends GlobalRepository {
       // no puede deserializar ese tipo como conjunto de resultados.
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${entry.organizationId}, 42))`;
 
-      const tip = await tx.auditLog.findFirst({
+      // LA PUNTA NO SE DECIDE POR LA HORA (3.12): es el eslabón con el número
+      // más alto. Si el reloj del servidor retrocede, el asiento nuevo sigue
+      // enlazándose con el último que se escribió, no con «el más tardío».
+      // Solo una cadena que todavía no tiene ningún eslabón numerado (lo
+      // asentado antes de `chainSeq`) busca su punta como antes, por (at, id).
+      const tip = (await tx.auditLog.findFirst({
+        where: { organizationId: entry.organizationId, chainSeq: { not: null } },
+        orderBy: { chainSeq: 'desc' },
+        select: { hash: true, chainSeq: true },
+      })) ?? (await tx.auditLog.findFirst({
         where: { organizationId: entry.organizationId },
         orderBy: [{ at: 'desc' }, { id: 'desc' }],
-        select: { hash: true },
-      });
+        select: { hash: true, chainSeq: true },
+      }));
+      const chainSeq = (tip?.chainSeq ?? 0) + 1;
 
       const id = uuidv7();
       const at = new Date();
@@ -149,6 +162,7 @@ export class AuditRepository extends GlobalRepository {
           requestId: entry.requestId ?? null,
           prevHash,
           hash,
+          chainSeq,
           at,
           businessDate: entry.businessDate,
         },
@@ -181,23 +195,33 @@ export class AuditRepository extends GlobalRepository {
     });
   }
 
-  /** Cadena completa en orden ascendente, para el job de verificación diaria. */
   /**
-   * Un tramo de la cadena, en el mismo orden en que se encadenó: después de
-   * `after` (at, id), hasta `limit` eslabones. Verificar por tramos mantiene
-   * la memoria constante aunque la bitácora tenga millones de filas (OPT-03).
+   * Un tramo de la cadena, en el mismo orden en que se encadenó, después de
+   * `after`, hasta `limit` eslabones. Verificar por tramos mantiene la memoria
+   * constante aunque la bitácora tenga millones de filas (OPT-03).
+   *
+   * EL ORDEN (3.12): primero lo asentado antes de `chainSeq` (sin número), por
+   * (at, id) como siempre se verificó; después lo numerado, por su número. La
+   * hora del servidor ya no decide el orden de nada que se escriba hoy.
    */
-  async chainPage(organizationId: string, after: { at: Date; id: string } | null, limit: number): Promise<Array<ChainLink & { at: Date }>> {
-    const rows = await this.db.auditLog.findMany({
+  async chainPage(organizationId: string, after: ChainCursor | null, limit: number): Promise<Array<ChainLink & { at: Date; chainSeq: number | null }>> {
+    const anteriores = after && after.chainSeq !== null ? [] : await this.db.auditLog.findMany({
       where: {
-        organizationId,
+        organizationId, chainSeq: null,
         ...(after ? { OR: [{ at: { gt: after.at } }, { at: after.at, id: { gt: after.id } }] } : {}),
       },
       orderBy: [{ at: 'asc' }, { id: 'asc' }],
       take: limit,
     });
+    const numerados = anteriores.length >= limit ? [] : await this.db.auditLog.findMany({
+      where: { organizationId, chainSeq: after && after.chainSeq !== null ? { gt: after.chainSeq } : { not: null } },
+      orderBy: { chainSeq: 'asc' },
+      take: limit - anteriores.length,
+    });
+    const rows = [...anteriores, ...numerados];
     return rows.map((row) => ({
       at: row.at,
+      chainSeq: row.chainSeq,
       prevHash: row.prevHash,
       hash: row.hash,
       content: {
@@ -423,5 +447,29 @@ export class AuditRepository extends GlobalRepository {
         branchId: g.branchId, count: g._count._all, limit: g.actorUserId ? tope.get(g.actorUserId) ?? null : null,
       }))
       .sort((a, b) => b.businessDate.getTime() - a.businessDate.getTime() || b.count - a.count);
+  }
+
+  /**
+   * ENTRADAS AUTORIZADAS SIN ROSTRO (D-06; 3.12), resumidas por QUIÉN AUTORIZÓ,
+   * día y sede. Quien autoriza no siempre es quien registra: si firmó la dueña
+   * desde el mostrador de recepción, el asiento es de recepción y la autoridad
+   * va en `afterState.authorizedByUserId`. No llevan tope.
+   */
+  async withoutFaceSummary(organizationId: string, opts: { branchIds?: readonly string[] | null | undefined; from?: Date | undefined; to?: Date | undefined }): Promise<Array<{
+    businessDate: Date; byUserId: string | null; byName: string | null; branchId: string | null; count: number;
+  }>> {
+    const grupos = await this.db.$queryRaw<Array<{ businessDate: Date; byUserId: string | null; branchId: string | null; count: number }>>`
+      SELECT a."businessDate", COALESCE(a."afterState"->>'authorizedByUserId', a."actorUserId"::text) AS "byUserId", a."branchId"::text AS "branchId", count(*)::int AS "count"
+        FROM audit_logs a
+       WHERE a."organizationId" = ${organizationId}::uuid AND a."action" = ANY(${[...AUDIT_SUMMARIZED_WITHOUT_FACE]}::text[])
+         ${opts.branchIds ? Prisma.sql`AND a."branchId"::text = ANY(${[...opts.branchIds]}::text[])` : Prisma.empty}
+         ${opts.from ? Prisma.sql`AND a."at" >= ${opts.from}` : Prisma.empty}
+         ${opts.to ? Prisma.sql`AND a."at" < ${opts.to}` : Prisma.empty}
+       GROUP BY 1, 2, 3
+       ORDER BY 1 DESC, 4 DESC`;
+    const ids = [...new Set(grupos.map((g) => g.byUserId).filter((x): x is string => !!x && UUID.test(x)))];
+    const users = ids.length ? await this.db.user.findMany({ where: { organizationId, id: { in: ids } }, select: { id: true, fullName: true } }) : [];
+    const nombre = new Map(users.map((u) => [u.id, u.fullName]));
+    return grupos.map((g) => ({ ...g, byName: g.byUserId ? nombre.get(g.byUserId) ?? null : null }));
   }
 }

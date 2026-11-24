@@ -2,11 +2,10 @@
  * UN RELOJ QUE SE PONE EN OTRA FECHA Y SIGUE CAMINANDO (bloque 1.17b).
  *
  * `vi.setSystemTime` deja el reloj CONGELADO en un instante: sirve para
- * preguntar «¿qué día es a las 05:59:59?» (`reloj.test.ts`), pero una prueba
- * larga que escribe en la bitácora no puede correr con él: la cadena de la
- * bitácora se ordena por la hora de cada asiento, y con el reloj detenido
- * todos los asientos caen en el mismo milisegundo (ver el defecto anotado en
- * `reloj.test.ts`).
+ * preguntar «¿qué día es a las 05:59:59?» (`reloj.test.ts`), pero en una prueba
+ * larga todo cae en el mismo milisegundo y las listas que se ordenan por hora
+ * (la bitácora en pantalla, la historia de la ficha) quedan en orden incierto.
+ * (La cadena de la bitácora ya no depende de la hora: bloque 3.12.)
  *
  * `ponerReloj('2026-06-10T18:00:00.000Z')` corre `Date` a ese instante y lo
  * deja avanzar al paso del reloj de verdad. Solo cambia `Date` en este

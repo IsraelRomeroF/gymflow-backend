@@ -5,6 +5,7 @@ import { makeApp, loginAs, orgFixtures, nombreUnico, telefonoUnico, aprobacion }
 import { createPrismaClient } from '@gymflow/db';
 import { closeDb, getDb } from '../src/platform/db/client.js';
 import { generateCycleCharges, markOverdueCharges, reconcileBalances } from '../src/modules/billing/billing.jobs.js';
+import { altaSinCobro } from './membresia-de-prueba.js';
 
 const db = () => getDb();
 const CONSENTS = [
@@ -48,10 +49,7 @@ describe('libro financiero', () => {
     expect(res.statusCode, res.body).toBe(201);
     const memberId = res.json().id as string;
 
-    const mem = await app.inject({
-      method: 'POST', url: `/members/${memberId}/memberships`, headers: { cookie: owner },
-      payload: { reason: 'Fixture de prueba', planId, soldAtBranchId: branchId },
-    });
+    const mem = await altaSinCobro(app, owner, memberId, { reason: 'Fixture de prueba', planId, soldAtBranchId: branchId });
     expect(mem.statusCode, mem.body).toBe(201);
     return { memberId, membershipId: mem.json().id as string };
   }

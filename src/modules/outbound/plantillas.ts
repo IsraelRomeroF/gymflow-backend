@@ -31,6 +31,14 @@ export type DatosDelMensaje = {
   priceToCents: bigint | null;
   /** Con cobro en línea no se manda al socio solo al mostrador. */
   enLinea: boolean;
+  /** Para nombrarlo completo cuando el mensaje va a quien responde por su celular. */
+  lastName?: string | null;
+  /**
+   * Celular compartido (D-09; bloque 3.10): el nombre de pila de quien
+   * responde por el número. Con él, el mensaje la saluda a ella y habla DEL
+   * socio. `null` o ausente = va al propio socio.
+   */
+  para?: string | null;
 };
 
 // Las fechas de calendario son medianoche UTC: leídas en hora de México caían un día antes.
@@ -44,8 +52,16 @@ const TE_EXTRANAMOS: Readonly<Record<string, string>> = {
   DORMANT: 'Hace tiempo que no te vemos y te extrañamos. ¿Cuándo regresas? Si necesitas algo, cuéntanos.',
 };
 
+/** Lo mismo, dicho a quien responde por el celular: se habla DEL socio, sin suponer si es él o ella. */
+const TE_EXTRANAMOS_DE_OTRO: Readonly<Record<string, string>> = {
+  ONBOARDING_AT_RISK: 'Vimos que casi no ha venido desde que se inscribió. ¿Le ayudamos a arrancar? Dinos qué horario le acomoda.',
+  SLIPPING: 'Notamos que ha venido menos estas semanas. ¿Todo bien? Aquí le esperamos para que retome su ritmo.',
+  DORMANT: 'Hace tiempo que no viene al gimnasio. ¿Cuándo regresa? Si necesita algo, cuéntanos.',
+};
+
 /** El mensaje completo, listo para WhatsApp. */
 export function textoDelMensaje(d: DatosDelMensaje): string {
+  if (d.para) return textoParaElResponsable(d, d.para);
   const saludo = `Hola ${d.firstName}, te escribimos de ${d.gimnasio}${d.sede ? ` (${d.sede})` : ''}.`;
   const donde = d.enLinea ? 'desde tu portal o en recepción' : 'en recepción';
   switch (d.kind) {
@@ -69,6 +85,39 @@ export function textoDelMensaje(d: DatosDelMensaje): string {
       const plan = d.planName ? `tu plan ${d.planName}` : 'tu plan';
       const baja = d.priceFromCents !== null && d.priceToCents !== null && d.priceToCents < d.priceFromCents;
       return `${saludo} Te avisamos que a partir de tu siguiente pago ${plan} ${baja ? 'baja a' : 'cuesta'} ${importe(d.priceToCents)}${d.priceFromCents !== null ? ` (antes ${importe(d.priceFromCents)})` : ''}. Cualquier duda, con gusto te atendemos en recepción.`;
+    }
+  }
+}
+
+/**
+ * CELULAR COMPARTIDO (D-09; fase 3, bloque 3.10). El número del socio lo
+ * responde otra persona (su mamá, su pareja): el mismo hecho, dicho a ELLA y
+ * diciendo de quién se habla. Antes le llegaba «Hola Renata, tu pago vence…»
+ * a quien no es Renata, y con dos socios en el mismo número no se sabía de
+ * cuál era cada mensaje. Se saluda por su nombre y se nombra al socio completo.
+ */
+function textoParaElResponsable(d: DatosDelMensaje, para: string): string {
+  const socio = `${d.firstName} ${d.lastName ?? ''}`.trim();
+  const saludo = `Hola ${para}, te escribimos de ${d.gimnasio}${d.sede ? ` (${d.sede})` : ''} por ${socio}, que tiene registrado este celular.`;
+  const donde = d.enLinea ? 'desde su portal o en recepción' : 'en recepción';
+  switch (d.kind) {
+    case 'PAYMENT_DUE_SOON':
+      if (d.dueDate === null) {
+        return `${saludo} Te recordamos que su siguiente pago${d.planName ? ` de ${d.planName}` : ''} es el ${d.periodEnd ? dia(d.periodEnd) : 'próximo día de pago'}. Se puede pagar ${donde}. ¡Gracias!`;
+      }
+      return `${saludo} Te recordamos que su pago de ${d.concept ?? 'su membresía'} por ${importe(d.dueCents)} vence el ${d.dueDate ? dia(d.dueDate) : 'próximo día de pago'}. Se puede pagar ${donde}. ¡Gracias!`;
+    case 'PAYMENT_OVERDUE':
+      return `${saludo} Su pago de ${d.concept ?? 'su membresía'} por ${importe(d.dueCents)} venció el ${d.dueDate ? dia(d.dueDate) : 'día de pago'}. Se puede poner al corriente ${donde} para seguir entrenando sin interrupciones.`;
+    case 'MEMBERSHIP_SUSPENDED':
+      return `${saludo} Su membresía quedó suspendida porque se agotó el plazo para pagar. En cuanto se pague ${donde}, vuelve a entrar.`;
+    case 'MEMBERSHIP_ENDING':
+      return `${saludo} Su plan${d.planName ? ` ${d.planName}` : ''} termina el ${d.periodEnd ? dia(ultimoDia(d.periodEnd)) : 'en unos días'}. Para seguir sin interrupciones, se puede renovar en recepción.`;
+    case 'WE_MISS_YOU':
+      return `${saludo} ${TE_EXTRANAMOS_DE_OTRO[d.engagementState ?? ''] ?? TE_EXTRANAMOS_DE_OTRO.DORMANT!}`;
+    case 'PRICE_CHANGE': {
+      const plan = d.planName ? `su plan ${d.planName}` : 'su plan';
+      const baja = d.priceFromCents !== null && d.priceToCents !== null && d.priceToCents < d.priceFromCents;
+      return `${saludo} Te avisamos que a partir de su siguiente pago ${plan} ${baja ? 'baja a' : 'cuesta'} ${importe(d.priceToCents)}${d.priceFromCents !== null ? ` (antes ${importe(d.priceFromCents)})` : ''}. Cualquier duda, con gusto te atendemos en recepción.`;
     }
   }
 }

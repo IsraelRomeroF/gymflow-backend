@@ -6,6 +6,8 @@ import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 import { BillingService } from './billing.service.js';
 import { idParam, iso, serializeCharge, serializePayment, sedeDeMembresia, pagoBody, aPago, serializarMembresia, dia } from './billing.serializers.js';
 import { conflict, validation, money, discountPercentOf } from '@gymflow/core';
+import { MembershipRepository } from '../memberships/index.js';
+import { perdonDisponible } from './perdon.js';
 
 /** Ventas: cotizar, vender membresías y paquetes, renovar, cambiar de plan, decidir adeudos. */
 export function registerSalesRoutes(app: FastifyInstance): void {
@@ -253,8 +255,12 @@ export function registerSalesRoutes(app: FastifyInstance): void {
         aprobador = await request.verifyApprover(body.approvalToken, 'billing:waiver:apply', {
           branchId: sede, resourceType: 'Membership', resourceId: id, amountCents: openCents,
         });
+        // D-12: olvidar el adeudo es perdonar con monto; dentro de una mensualidad del socio no pide firma.
+        const socioId = (await new MembershipRepository(request.ctx!.tenant.organizationId).findById(id))?.memberId;
+        const tope = socioId ? await perdonDisponible(request.ctx!.tenant.organizationId, socioId) : null;
         request.authorize('billing:waiver:apply', {
           branchId: sede, reason: body.reason, amountCents: openCents,
+          ...(tope ? { waiverAllowanceCents: tope.disponibleCents } : {}),
           ...(aprobador ? { approvedByUserId: aprobador } : {}),
         });
       }

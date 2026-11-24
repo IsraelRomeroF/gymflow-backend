@@ -8,6 +8,7 @@ import {
   makeApp, loginAs, orgFixtures, nombreUnico, telefonoUnico, sedeDesechable, archivarSede, cuentaDePrueba, CONSENTIMIENTOS,
 } from './helpers.js';
 import { closeDb, getDb } from '../src/platform/db/client.js';
+import { activarSinCobro, altaSinCobro } from './membresia-de-prueba.js';
 
 const MS_DIA = 86_400_000;
 
@@ -42,15 +43,10 @@ describe('retención: reglas, cifras para la dueña y contactos por sede', () =>
     });
     expect(alta.statusCode, alta.body).toBe(201);
     const memberId = alta.json().id as string;
-    const mem = await app.inject({
-      method: 'POST', url: `/members/${memberId}/memberships`, headers: { cookie: gerencia },
-      payload: { reason: 'Fixture de prueba', planId, soldAtBranchId: cen },
-    });
+    const mem = await altaSinCobro(app, gerencia, memberId, { reason: 'Fixture de prueba', planId, soldAtBranchId: cen });
     expect(mem.statusCode, mem.body).toBe(201);
     if (opts.activar) {
-      const activa = await app.inject({
-        method: 'POST', url: `/memberships/${mem.json().id}/activate`, headers: { cookie: gerencia }, payload: { reason: 'Fixture de prueba' },
-      });
+      const activa = await activarSinCobro(app, gerencia, mem.json().id);
       expect(activa.statusCode, activa.body).toBe(200);
     }
     await getDb().member.update({ where: { id: memberId }, data: { joinedAt: new Date(Date.now() - opts.altaHaceDias * MS_DIA) } });

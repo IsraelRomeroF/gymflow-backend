@@ -13,6 +13,8 @@ import { InventoryRepository } from './inventory.repository.js';
 import { ProductRepository, type ProductRecord } from './product.repository.js';
 import { isUniqueViolation } from '../../platform/db/prisma-errors.js';
 import { PosSaleRepository, type DatosDeLinea, type PosSaleLineRecord, type PosSaleRecord } from './pos-sale.repository.js';
+import { PosCorrectionRepository } from './correccion.repository.js';
+import { MonthlyCloseService } from '../finance/index.js';
 import type { RequestContext } from '../../platform/context.js';
 
 export type SaleDetail = {
@@ -232,7 +234,7 @@ export class PosService {
     // impide; aquí se explica qué hacer.
     const turno = await new CashSessionRepository(orgId).findById(sale.cashSessionId);
     if (turno && turno.status !== 'OPEN') {
-      throw conflict('El turno de esa venta ya se cerró: no se puede anular. Si devuelves el dinero, regístralo como gasto de caja, con motivo, en el turno abierto', 'CASH_SESSION_CLOSED');
+      throw conflict('El turno de esa venta ya se cerró: no se puede anular. Registra su devolución (con autorización): el dinero sale del turno abierto y el producto vuelve al inventario', 'CASH_SESSION_CLOSED');
     }
 
     const products = new ProductRepository(orgId);
@@ -243,27 +245,36 @@ export class PosService {
       if (p?.tracksInventory) conInventario.add(l.productId);
     }
 
-    const anulada = await repo.voidWithRestock({
-      saleId: input.saleId,
-      branchId: sale.branchId,
-      userId,
-      reason: input.reason,
-      businessDate: hoy,
-      inventoryProductIds: conInventario,
-    });
-    if (!anulada) throw conflict('La venta ya estaba anulada', 'ALREADY_VOIDED');
+    // Las cifras de un mes cerrado no cambian (D-22; pendiente de 3.7 que recoge el bloque 3.5).
+    // Una venta solo se anula el mismo día, así que esto no debería ocurrir: es el candado.
+    await new MonthlyCloseService().assertOpen(orgId, sale.businessDate);
+    if (await new PosCorrectionRepository(orgId).returnOf(sale.id)) throw conflict('Esa venta ya se devolvió', 'SALE_ALREADY_RETURNED');
 
-    await this.audit.record(ctx, {
-      action: 'pos.sale.void',
-      resourceType: 'pos_sale',
-      resourceId: input.saleId,
-      beforeState: { status: sale.status, totalCents: sale.totalCents.toString() },
-      afterState: { status: 'VOIDED' },
-      reason: input.reason,
-      branchId: sale.branchId,
-    });
+    // La anulación, el producto de vuelta, la marca «por corregir» resuelta y el asiento: juntos o nada (28-10).
+    return enUnidadDeDinero(orgId, async () => {
+      const anulada = await repo.voidWithRestock({
+        saleId: input.saleId,
+        branchId: sale.branchId,
+        userId,
+        reason: input.reason,
+        businessDate: hoy,
+        inventoryProductIds: conInventario,
+      });
+      if (!anulada) throw conflict('La venta ya estaba anulada', 'ALREADY_VOIDED');
+      await new PosCorrectionRepository(orgId).resolve(sale.id, 'VOIDED', userId, input.reason);
 
-    return anulada;
+      await this.audit.record(ctx, {
+        action: 'pos.sale.void',
+        resourceType: 'pos_sale',
+        resourceId: input.saleId,
+        beforeState: { status: sale.status, totalCents: sale.totalCents.toString() },
+        afterState: { status: 'VOIDED' },
+        reason: input.reason,
+        branchId: sale.branchId,
+      });
+
+      return anulada;
+    });
   }
 
   // ── Inventario ────────────────────────────────────────────────────────────

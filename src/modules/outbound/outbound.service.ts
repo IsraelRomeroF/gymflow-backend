@@ -10,7 +10,7 @@ import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 import { BranchRepository, OrganizationRepository } from '../organization/index.js';
 import { FollowUpRepository } from '../follow-ups/index.js';
 import { RetentionService } from '../retention/index.js';
-import { LOTE, OutboundRepository, type AlcanceDeMensajes, type Nuevo, type OutboundRow } from './outbound.repository.js';
+import { LOTE, OutboundRepository, TEXTO_RETIRADO, type AlcanceDeMensajes, type Nuevo, type OutboundRow } from './outbound.repository.js';
 import { detalleDelMensaje, textoDelMensaje } from './plantillas.js';
 
 /** Los estados de Retención a los que se les escribe (los mismos que se llaman). */
@@ -23,6 +23,27 @@ function contar(motivos: readonly OutboundKind[]): OutboundCounts {
   const c = enCero();
   for (const k of motivos) if ((OUTBOUND_KINDS as readonly string[]).includes(k)) c[k] += 1;
   return c;
+}
+
+/**
+ * CELULAR COMPARTIDO (D-09; fase 3, bloque 3.10): ¿de quién es el número al
+ * que se manda? Si el celular del socio lo responde otra persona (otro socio,
+ * o un adulto que no es socio y dejó ese mismo número), el mensaje la saluda
+ * a ELLA y dice de quién se habla: quien lee no es el socio. `null` = el
+ * mensaje va al propio socio, como siempre.
+ */
+export function responsableDelNumero(f: Pick<OutboundRow,
+  'phoneE164' | 'responsibleKind' | 'responsibleName' | 'responsiblePhoneE164' | 'responsibleMemberFirstName' | 'responsibleMemberLastName' | 'responsibleMemberAnonymized'>,
+): { nombre: string; completo: string } | null {
+  if (f.responsibleKind === 'MEMBER' && f.responsibleMemberFirstName && !f.responsibleMemberAnonymized) {
+    return { nombre: f.responsibleMemberFirstName, completo: `${f.responsibleMemberFirstName} ${f.responsibleMemberLastName ?? ''}`.trim() };
+  }
+  // El adulto dejó OTRO número: el celular de la ficha es del socio y el mensaje le llega a él.
+  if (f.responsibleKind === 'ADULT' && f.responsibleName?.trim() && (!f.responsiblePhoneE164 || f.responsiblePhoneE164 === f.phoneE164)) {
+    const completo = f.responsibleName.trim();
+    return { nombre: completo.split(/\s+/)[0]!, completo };
+  }
+  return null;
 }
 
 /** Con qué se firma el saludo: el gimnasio y, si tiene varias sedes, la del socio. */
@@ -233,6 +254,8 @@ export class OutboundService {
   private texto(f: OutboundRow, m: Membrete): string {
     return textoDelMensaje({
       kind: f.kind, firstName: f.firstName, gimnasio: m.gimnasio,
+      // Con celular compartido se saluda a quien responde por el número y se dice de quién se habla.
+      lastName: f.lastName, para: responsableDelNumero(f)?.nombre ?? null,
       sede: m.variasSedes && f.homeBranchId ? m.sedes.get(f.homeBranchId) ?? null : null,
       concept: f.concept, dueCents: f.dueCents, dueDate: f.dueDate, planName: f.planName, periodEnd: f.periodEnd,
       priceFromCents: f.priceFromCents, priceToCents: f.priceToCents,
@@ -241,11 +264,14 @@ export class OutboundService {
   }
 
   private json(f: OutboundRow, m: Membrete): OutboundMessage {
+    const paraQuien = f.body === TEXTO_RETIRADO ? null : responsableDelNumero(f)?.completo ?? null;
     return {
       id: f.id, kind: f.kind, status: f.status as OutboundMessage['status'],
       memberId: f.memberId, memberCode: f.memberCode, memberName: `${f.firstName} ${f.lastName}`.trim(),
       branchId: f.homeBranchId, phoneE164: f.phoneE164,
-      detail: detalleDelMensaje(f),
+      // A quién le llega: recepción lo ve en la fila antes de mandar (el texto ya la saluda a ella).
+      detail: [detalleDelMensaje(f), paraQuien ? `le llega a ${paraQuien}, que responde por este celular` : null].filter(Boolean).join(' · '),
+      recipientName: paraQuien,
       // Lo mandado dice lo que se mandó; lo pendiente, lo que se mandaría hoy.
       text: f.body ?? this.texto(f, m),
       createdAt: f.createdAt.toISOString(),
@@ -253,4 +279,9 @@ export class OutboundService {
       resolvedByName: f.resolvedByName,
     };
   }
+}
+
+/** Al anonimizar a un exsocio: retira el texto de lo que ya se le mandó (su nombre iba ahí). Devuelve cuántos. */
+export function olvidarTextosDeMensajes(organizationId: string, memberId: string): Promise<number> {
+  return new OutboundRepository(organizationId).olvidarTextos(memberId);
 }

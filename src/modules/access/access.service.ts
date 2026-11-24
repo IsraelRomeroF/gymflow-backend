@@ -200,26 +200,40 @@ export class AccessService {
    * que no hay doble paso que mirar. Devuelve también el sujeto, para que el
    * portal diga con qué entra (su pase de hoy) sin volver a leerlo.
    */
-  async veredictoParaElSocio(orgId: string, memberId: string, branchId: string, ahora = new Date()): Promise<{ decision: PolicyDecision; subject: AccessSubject | null }> {
+  async veredictoParaElSocio(orgId: string, memberId: string, branchId: string, ahora = new Date()): Promise<{
+    decision: PolicyDecision; subject: AccessSubject | null;
+    /** D-06 (fase 3, bloque 3.10): la regla del rostro pesa en esta sede. */
+    reglaDelRostro: boolean;
+    /** Su plan o su paquete dicen que sí, pero el mostrador lo detendría con `BIOMETRIC_REQUIRED`: hoy necesita a la gerencia. */
+    faltaElRostro: boolean;
+  }> {
     const calendario = new BusinessCalendar(orgId);
-    const [businessDate, tz, settings, revocada] = await Promise.all([
+    const [businessDate, tz, settings, revocada, politica] = await Promise.all([
       calendario.today(branchId, ahora), calendario.timezoneFor(branchId),
       new OrganizationRepository(orgId).accessSettings(), credencialRevocada(orgId, memberId, 'MANUAL'),
+      this.politicaManual({ tenant: { organizationId: orgId } } as RequestContext, branchId, memberId),
     ]);
     const [subject, entradaDeHoy] = await Promise.all([
       this.buildSubject(orgId, memberId, businessDate, ahora, branchId),
       new AccessRepository(orgId).entradaContadaDeHoy(memberId, branchId, businessDate),
     ]);
     const { minuteOfDay, weekday } = localClock(tz, ahora);
-    const decision = evaluateAccess({
+    const pregunta = {
       at: ahora, localMinuteOfDay: minuteOfDay, localWeekday: weekday, branchId,
-      credential: { kind: 'MANUAL', revoked: revocada, expiresAt: null, alreadyUsed: false },
+      credential: { kind: 'MANUAL' as const, revoked: revocada, expiresAt: null, alreadyUsed: false },
       subject, settings,
       // D-07: si ya entró hoy, lo que el teléfono dice es lo de una reentrada (su última visita del paquete ya pagó el día).
       entryToday: entradaDeHoy ? { visitPackId: entradaDeHoy.visitPackId } : null,
-      // La regla del rostro (D-06) no se le aplica aquí: el teléfono contesta por su plan; que le falte el rostro se lo dice recepción.
-    });
-    return { decision, subject };
+    };
+    // `decision` contesta por su plan (así el teléfono no le niega reservar a quien sí puede entrar con autorización).
+    const decision = evaluateAccess(pregunta);
+    // Fase 3, bloque 3.10: la MISMA política con la puerta del rostro (D-06), como la arma `preview`: si solo
+    // eso lo detiene, el teléfono se lo dice («te falta registrar tu rostro») antes de que llegue al mostrador.
+    const conRostro = politica.faceRequired ? evaluateAccess({ ...pregunta, biometricGate: puertaDelRostro(politica, false) }) : decision;
+    return {
+      decision, subject, reglaDelRostro: politica.faceRequired,
+      faltaElRostro: decision.outcome === 'GRANTED' && conRostro.outcome === 'DENIED' && conRostro.reason === 'BIOMETRIC_REQUIRED',
+    };
   }
 
   /** El mismo intento ya resuelto: se devuelve tal cual, sin registrar otro paso. */

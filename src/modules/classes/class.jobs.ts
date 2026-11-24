@@ -41,11 +41,19 @@ async function cerrarTerminadas(organizationId: string): Promise<JobResult> {
   };
 }
 
+/** D-16 (bloque 3.5): libera los lugares apartados sin pagar una hora antes de su clase. No dejan deuda ni falta. */
+async function liberarApartados(organizationId: string): Promise<JobResult> {
+  const r = await new ClassService().releaseUnpaidHolds(organizationId, new Date(), LOTE);
+  return { job: 'class.release-unpaid-holds', processed: r.released, skipped: r.kept, batches: 1, truncated: r.truncated, errors: [] };
+}
+
 export const CLASS_JOBS = [
   { name: 'class.materialize-horizon', handler: generarHorizonte },
   // Cada 15 minutos (11-09): asistió, faltó y el bloqueo se resuelven al
   // terminar la clase, no hasta el siguiente cierre diario.
   { name: 'class.close-finished', handler: cerrarTerminadas, cadence: 'frequent' },
+  // Cada 15 minutos (D-16): el apartado sin pagar se libera una hora antes de la clase.
+  { name: 'class.release-unpaid-holds', handler: liberarApartados, cadence: 'frequent' },
 ] as const;
 
 export { systemContext };

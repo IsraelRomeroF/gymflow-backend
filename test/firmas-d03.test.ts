@@ -190,8 +190,17 @@ describe('firmas · D-03: el «no» pegado a la operación (bloque 3.2)', () => 
     expect(cuarta.json().retryAfterSeconds).toBeGreaterThan(3500);
     expect(cuarta.json().retryAfterSeconds).toBeLessThanOrEqual(3600);
     expect(Number(cuarta.headers['retry-after'])).toBe(cuarta.json().retryAfterSeconds);
+    // 3.12: la cuarta no crea solicitud, pero que se insistió queda en la bitácora y entra a «Para revisar».
+    const insistencias = () => getDb().auditLog.findMany({
+      where: { organizationId: g.organizationId, action: 'approval.remote.over_limit', afterState: { path: ['resourceId'], equals: op } }, orderBy: { chainSeq: 'asc' },
+    });
+    const asentada = await insistencias();
+    expect(asentada).toHaveLength(1);
+    expect(asentada[0]!.afterState).toMatchObject({ permission: 'reports:month:close', attempt: 4, resourceId: op });
+    expect(auditNeedsReview({ action: 'approval.remote.over_limit' })).toBe(true);
     // Otra persona tampoco: el tope es de la operación, no de quien pide. Y otra operación no se entera.
     expect((await cierre(op, {}, s.gerente2)).statusCode).toBe(429);
+    expect(await insistencias(), 'cada insistencia deja su asiento, con quién fue').toHaveLength(2);
     expect((await cierre(otroMes())).statusCode).toBe(201);
     expect(await db().approvalRequest.count({ where: { organizationId: g.organizationId, resourceId: op } })).toBe(3);
 

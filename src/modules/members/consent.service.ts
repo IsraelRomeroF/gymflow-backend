@@ -144,7 +144,7 @@ export async function retirarConsentimiento(ctx: RequestContext, input: RetiroIn
   if (!input.permitidos.includes(tipo)) {
     const porque = CONSECUENCIA_DE_RETIRAR[tipo];
     throw validation(input.via === 'portal'
-      ? 'Ese permiso se retira en recepción: implica quitar tu rostro o dejar de ser socio.'
+      ? 'Ese permiso es obligatorio para ser socio: para retirarlo hay que darte de baja en recepción.'
       : `«${nombre(tipo)}» no se retira por separado. ${porque?.personal ?? ''}`.trim());
   }
   const vivos = await consents.vivosDeTipo(input.memberId, tipo);

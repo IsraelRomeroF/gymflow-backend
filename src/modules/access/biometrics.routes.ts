@@ -2,7 +2,8 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { notFound, conflict } from '@gymflow/core';
 import { route } from '../../platform/http/registry.js';
-import { contar, registerModuleUsage } from '../../platform/modules/usage.js';
+import { contar, registerModuleErasure, registerModuleUsage } from '../../platform/modules/usage.js';
+import { rostrosQueBorraApagar } from './rostros-al-apagar.js';
 import { MemberRepository } from '../members/index.js';
 import { EnrollmentRepository } from './enrollment.repository.js';
 import { EnrollmentService } from './enrollment.service.js';
@@ -15,6 +16,8 @@ export function registerBiometricRoutes(app: FastifyInstance): void {
     inUse: contar(await new EnrollmentRepository(orgId).activeCount(), 'enrolamiento vigente', 'enrolamientos vigentes'),
     blockers: [],
   }));
+  // Apagar Biometría borra los rostros a los 30 días (D-32; 3.12): cuántos hay guardados, para el aviso.
+  registerModuleErasure('biometrics', async (orgId, branchId) => (await rostrosQueBorraApagar(orgId, branchId ?? null)).length);
   /** La plantilla vive en UNA sucursal (ADR-014): se opera desde ahí. */
   async function sedeDeEnrolamiento(request: FastifyRequest, id: string): Promise<string> {
     const sede = await new EnrollmentRepository(request.ctx!.tenant.organizationId).branchOf(id);

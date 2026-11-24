@@ -355,7 +355,9 @@ describe('alta de marcas desde la plataforma', () => {
     const me = (await app.inject({ method: 'GET', url: '/auth/me', headers: { cookie: recepcion } })).json();
     const tiene = (p: string) => me.permissions.includes(p);
     for (const p of ['members:read', 'members:create', 'memberships:create', 'payments:record', 'access:manual_grant', 'cash:session:open', 'pos:sale:create', 'members:intake:review']) expect(tiene(p), p).toBe(true);
-    for (const p of ['members:update', 'memberships:cancel', 'memberships:freeze', 'memberships:change_plan', 'billing:discount:apply', 'billing:waiver:apply', 'cash:withdraw', 'pos:sale:void', 'classes:manage', 'staff:manage', 'catalog:manage']) expect(tiene(p), p).toBe(false);
+    for (const p of ['members:update', 'memberships:cancel', 'memberships:freeze', 'memberships:change_plan', 'billing:discount:apply', 'billing:waiver:apply', 'payments:refund', 'pos:sale:void', 'pos:sale:return', 'cash:limits:set', 'classes:manage', 'staff:manage', 'catalog:manage']) expect(tiene(p), p).toBe(false);
+    // D-15 (fase 3, bloque 3.5): sí anota fondo y gasto chico del cajón, y retira o deposita con la firma de la dueña.
+    for (const p of ['cash:petty:record', 'cash:withdraw']) expect(tiene(p), p).toBe(true);
     // Editar un socio existente ya no es suyo.
     const socio = await getDb().member.findFirst({ where: { organizationId: me.organizationId, status: 'ACTIVE' }, select: { id: true } });
     const editar = await app.inject({ method: 'PATCH', url: `/members/${socio!.id}`, headers: { cookie: recepcion }, payload: { notes: 'x' } });

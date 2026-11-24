@@ -19,7 +19,7 @@ const TEXTOS_OBLIGATORIOS = ['PRIVACY_NOTICE', 'HOUSE_RULES'] as const;
 const VIGENCIA_RIESGO_MS = 60_000;
 
 type Parte = Omit<RenglonDelInicio, 'key'> | null;
-const renglon = (count: number, tone: RenglonDelInicio['tone'], extra: Partial<Pick<RenglonDelInicio, 'amountCents' | 'detail' | 'until'>> = {}): Parte =>
+const renglon = (count: number, tone: RenglonDelInicio['tone'], extra: Partial<Pick<RenglonDelInicio, 'amountCents' | 'detail' | 'until' | 'waiting'>> = {}): Parte =>
   (count > 0 ? { count, tone, amountCents: null, detail: [], until: null, ...extra } : null);
 
 /**
@@ -90,7 +90,9 @@ export function registerHomeRoutes(app: FastifyInstance): void {
           if (!request.holds('settings:consent:manage', null)) return null;
           const publicados = await repo.textosPublicados();
           const faltan = [...TEXTOS_OBLIGATORIOS, ...(modulos.org.has('biometrics') ? ['BIOMETRIC'] : [])].filter((t) => !publicados.has(t));
-          return renglon(faltan.length, 'warn', { detail: faltan });
+          // Lo que ya se pidió publicar y espera la firma de la dueña no es «falta publicar» (3.12, D-25).
+          const esperan = faltan.length > 0 ? await repo.textosEsperandoFirma() : new Set<string>();
+          return renglon(faltan.length, 'warn', { detail: faltan, waiting: faltan.filter((t) => esperan.has(t)) });
         },
         classes: async () => {
           const hoy = medianoche(zona, ahora);

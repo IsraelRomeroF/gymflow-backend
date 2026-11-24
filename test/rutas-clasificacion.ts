@@ -88,7 +88,9 @@ export const CUERPOS: Record<string, Cuerpo> = {
   'POST /consent-documents/:id/sign': () => ({ password: 'no-es-la-contraseña' }),
   'POST /approvals/requests/:id/ask': () => ({ question: '¿De qué socio es?' }),
   'POST /cash-sessions/:id/close': () => ({ countedCashCents: '0' }),
-  'POST /cash-sessions/:id/movements': () => ({ movementType: 'FLOAT_IN', amountCents: '100', reason: MOTIVO }),
+  // D-15 (bloque 3.5): `/movements` es de quien retira; `/petty-movements`, de quien anota fondo y gasto chico.
+  'POST /cash-sessions/:id/movements': () => ({ movementType: 'WITHDRAWAL', amountCents: '100', reason: MOTIVO }),
+  'POST /cash-sessions/:id/petty-movements': () => ({ movementType: 'FLOAT_IN', amountCents: '100', reason: MOTIVO }),
   'POST /charges/:id/adjustments': () => ({ adjustmentType: 'DISCOUNT', amountCents: '100', reason: MOTIVO }),
   'POST /classes/schedules/:id/bookings': (g) => ({ memberId: g.ids.member }),
   'POST /intakes/:id/link': (g) => ({ memberId: g.ids.member }),
@@ -103,9 +105,13 @@ export const CUERPOS: Record<string, Cuerpo> = {
   'POST /members/:id/consents': () => ({ consentType: 'MARKETING', granted: true }),
   'POST /members/:id/credentials': () => ({ kind: 'PIN', pin: '4821' }),
   'POST /members/:id/credit/apply': (g) => ({ branchId: g.sedeB }),
+  // Fase 3 · bloque 3.5 (D-12): el perdón del adeudo valida el motivo de catálogo antes de buscar al socio.
+  'POST /members/:id/debt/waiver': () => ({ reasonCode: 'CORTESIA', reason: MOTIVO }),
+  // D-13: las dos devoluciones validan importe, llave y por dónde sale el dinero antes de buscar el registro.
+  'POST /payments/:id/return': () => ({ amountCents: '100', reason: MOTIVO, requestKey: 'rutas-devolucion-0001' }),
+  'POST /members/:id/credit/return': (g) => ({ amountCents: '100', method: 'CASH', branchId: g.sedeB, reason: MOTIVO, requestKey: 'rutas-saldo-0001' }),
   'POST /members/:id/day-passes': (g) => ({ planId: g.ids.plan, branchId: g.sedeB, saleKey: 'rutas-pase-0001' }),
   'POST /members/:id/follow-ups': () => ({ channel: 'CALL', outcome: 'ANSWERED' }),
-  'POST /members/:id/memberships': (g) => ({ planId: g.ids.plan, reason: MOTIVO, branchId: g.sedeB }),
   // Fase 2 · bloque 2.9 (bandeja de salida): valida el cuerpo antes de buscar al socio; el mensaje se busca después (no existe: 404).
   'POST /members/:id/outbound-messages/mark': (g) => ({ messageId: g.ids.member, as: 'DISMISSED' }),
   'POST /members/:id/memberships/sale': (g) => ({ planId: g.ids.plan, branchId: g.sedeB }),
@@ -113,12 +119,12 @@ export const CUERPOS: Record<string, Cuerpo> = {
   'POST /members/:id/privacy-requests': () => ({ kind: 'ACCESS' }),
   'POST /members/:id/routine': (g) => ({ routineId: g.ids.routine }),
   'POST /members/:id/visit-packs': (g) => ({ planId: g.ids.plan, saleKey: 'rutas-paquete-0001', branchId: g.sedeB }),
-  'POST /memberships/:id/change-plan': (g) => ({ planId: g.ids.plan, reason: MOTIVO }),
   'PUT /memberships/:id/price-protection': () => ({ protected: true, reason: MOTIVO }),
+  // Fase 3 · bloque 3.5 (D-14).
+  'PUT /memberships/:id/auto-renew': () => ({ autoRenew: false, reason: MOTIVO }),
   'POST /memberships/:id/debt-decision': () => ({ decision: 'FORGIVE', reason: MOTIVO }),
   'POST /memberships/:id/freeze': () => ({ days: 7, reason: MOTIVO }),
   'POST /memberships/:id/plan-change': (g) => ({ planId: g.ids.plan, reason: MOTIVO }),
-  'POST /memberships/:id/reactivate': (g) => ({ planId: g.ids.plan, reason: MOTIVO }),
   'POST /memberships/:id/renewal': () => ({ expectedPeriodStart: '2026-01-01' }),
   'POST /payments/:id/refund': () => ({ amountCents: '100', reason: MOTIVO }),
   'POST /privacy/requests/:id/effect': () => ({ note: MOTIVO }),
@@ -174,6 +180,10 @@ export const SIN_404_AJENO: Record<string, { status: number[]; porque: string; s
 
 /** Rutas con permiso que valen para todo el gimnasio: no miran la sede del recurso, y por qué. */
 export const DE_ORGANIZACION: Record<string, string> = {
+    // Bloque 3.5 (D-15): los topes del cajón son del gimnasio, no de una sede; los ve quien ve o mueve la caja en cualquiera.
+    'GET /cash/limits': 'los topes del cajón valen para todo el gimnasio',
+    // Bloque 3.5 (D-12): lo que debe un socio se ve como su estado de cuenta, desde cualquier sede.
+    'GET /members/:id/debt': 'expediente único',
     // El expediente del socio es ÚNICO en la organización: se cobra y se
     // atiende en cualquier sede (cartera consolidada, cobro cruzado).
     'GET /members': 'expediente único', 'GET /members/search': 'expediente único',
@@ -226,6 +236,9 @@ export const DE_ORGANIZACION: Record<string, string> = {
   'GET /consent-documents/signature-requests': 'textos de la organización',
   'POST /consent-documents/:id/sign': 'el aviso de privacidad es de todo el gimnasio: exige `approvals:grant` sobre toda la organización',
   'POST /consent-documents/:id/sign/reject': 'el aviso de privacidad es de todo el gimnasio: exige `approvals:grant` sobre toda la organización',
+  // Fase 3 · bloque 3.1 (D-02): al apoderado lo nombra y lo revoca quien da la segunda firma de todo el gimnasio.
+  'POST /approvals/proxy': 'el apoderado es uno por gimnasio: exige `approvals:grant` sobre toda la organización',
+  'POST /approvals/proxy/revoke': 'el apoderado es uno por gimnasio: exige `approvals:grant` sobre toda la organización',
   'GET /plans/:id/protected-prices': 'catálogo (D-19, bloque 3.6): quiénes conservan su precio en un plan se revisa para todo el gimnasio, con `catalog:manage` sobre la organización',
   'PUT /memberships/:id/price-protection': 'catálogo (D-19, bloque 3.6): marcar que una membresía conserva su precio es una decisión de precio de todo el gimnasio (`catalog:manage` sobre la organización), no del mostrador de una sede',
   // Fase 2 · bloque 2.2 (ficha del socio).
@@ -242,6 +255,8 @@ export const DE_ORGANIZACION: Record<string, string> = {
   'POST /members/:id/routine/personalize': 'la rutina es del socio, no de la sede',
   'GET /coach/today': 'el inicio del coach: sus socios y sus rutinas, siempre de quien pregunta (no recibe un id)',
   'GET /coaches/:id/members': 'cuántos socios tiene un coach: el coach de un socio es de toda la organización',
+  // Fase 3 · bloque 3.8 (coach, D-29).
+  'POST /coach/claim': '«Hacerme su coach»: no recibe un socio, solo el código que el socio dictó; el coach de un socio es de toda la organización',
 };
 
 /** Rutas con parámetro que con un recurso de otra sede no responden 403, y por qué está bien. */

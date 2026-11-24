@@ -5,6 +5,7 @@ import { route } from '../../platform/http/registry.js';
 import { opcionesDeCookie } from '../../platform/http/sesion.js';
 import { moduleViewOf } from '../../platform/modules/module-state.js';
 import { SESSION_COOKIE } from './auth.plugin.js';
+import { EQUIPO_CONOCIDO_DIAS } from './known-device.repository.js';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { PlatformAuditService } from '../../platform/audit/platform-audit.service.js';
 import { AuthUserRepository } from './user.repository.js';
@@ -12,6 +13,14 @@ import { PushSubscriptionRepository } from './push-subscription.repository.js';
 import { GrantRepository } from './role.repository.js';
 import { StaffRepository } from './staff.repository.js';
 import type { Env } from '../../platform/env.js';
+
+/**
+ * La llave de EQUIPO CONOCIDO (D-01): una cookie al azar que el navegador
+ * guarda al entrar con la contraseña correcta. No abre nada por sí sola: con
+ * ella y la contraseña, el titular pasa el bloqueo por intentos fallidos
+ * aunque su IP haya cambiado. No se borra al salir: el equipo sigue siendo suyo.
+ */
+export const DEVICE_COOKIE = 'gf_equipo';
 
 const loginBody = z.object({
   email: z.string().email(),
@@ -41,10 +50,12 @@ export function registerAuthRoutes(app: FastifyInstance, env: Env): void {
         userAgent: request.headers['user-agent'],
         // La sesión que este navegador traía se queda sin cookie: se cierra.
         anterior: request.cookies?.[SESSION_COOKIE],
+        equipo: request.cookies?.[DEVICE_COOKIE],
       });
 
       // `Secure` también cuando llega por https (el túnel), no solo en producción.
       reply.setCookie(SESSION_COOKIE, result.token, opcionesDeCookie(request, env, result.expiresAt));
+      reply.setCookie(DEVICE_COOKIE, result.deviceKey, opcionesDeCookie(request, env, new Date(Date.now() + EQUIPO_CONOCIDO_DIAS * 86_400_000)));
 
       // Entrar a la consola de plataforma queda en SU cadena, con desde dónde (24-19; bloque 1.13).
       if (!result.organizationId) {

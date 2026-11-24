@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { uuidv7, normalizedNameKey, cycleChargeKey } from '@gymflow/core';
 import { makeApp, loginAs, orgFixtures, nombreUnico, aprobacion } from './helpers.js';
 import { closeDb, getDb } from '../src/platform/db/client.js';
+import { activarSinCobro, altaSinCobro } from './membresia-de-prueba.js';
 
 /**
  * SUSPENDIDA QUE VUELVE MESES DESPUÉS.
@@ -44,13 +45,10 @@ describe('adeudo de una suspendida', () => {
     });
     const plan = (await app.inject({ method: 'GET', url: '/plans', headers: { cookie: owner } }))
       .json().find((p: { code: string }) => p.code === 'MEN');
-    const mem = await app.inject({
-      method: 'POST', url: `/members/${socio.id}/memberships`, headers: { cookie: owner },
-      payload: { reason: 'Fixture de prueba', planId: plan.id, soldAtBranchId: branchId },
-    });
+    const mem = await altaSinCobro(app, owner, socio.id, { reason: 'Fixture de prueba', planId: plan.id, soldAtBranchId: branchId });
     expect(mem.statusCode, mem.body).toBe(201);
     const id = mem.json().id as string;
-    await app.inject({ method: 'POST', url: `/memberships/${id}/activate`, headers: { cookie: owner }, payload: { reason: 'Fixture' } });
+    await activarSinCobro(app, owner, id);
     const cargo = await app.inject({ method: 'POST', url: `/memberships/${id}/period-charge`, headers: { cookie: owner } });
     expect(cargo.statusCode, cargo.body).toBe(201);
 
@@ -152,13 +150,16 @@ describe('adeudo de una suspendida', () => {
     expect(await getDb().charge.count({ where: { membershipId } })).toBe(1);
   });
 
-  it('OLVIDAR es del gerente o el dueño, y aun así con una segunda autorización', async () => {
-    const { membershipId } = await suspendidaDesdeHace(2);
+  it('OLVIDAR es de la gerencia: recepción no puede, y un peso arriba de una mensualidad del socio pide la firma de la dueña (D-12)', async () => {
+    const { membershipId, chargeId } = await suspendidaDesdeHace(2);
     const desdeRecepcion = await app.inject({
       method: 'POST', url: `/memberships/${membershipId}/debt-decision`, headers: { cookie: recepcion },
       payload: { decision: 'FORGIVE', reason: 'Vuelve tras lesión' },
     });
     expect(desdeRecepcion.statusCode).toBe(403);
+    // Su mensualidad pactada es un peso menor que lo que debe: olvidar pasa del tope por un peso.
+    const cargo = await getDb().charge.findUniqueOrThrow({ where: { id: chargeId } });
+    await getDb().membership.update({ where: { id: membershipId }, data: { agreedPriceCents: cargo.amountCents - 100n } });
     const r = await app.inject({
       method: 'POST', url: `/memberships/${membershipId}/debt-decision`, headers: { cookie: gerente },
       payload: { decision: 'FORGIVE', reason: 'Vuelve tras lesión' },
@@ -167,6 +168,19 @@ describe('adeudo de una suspendida', () => {
     const m = await getDb().membership.findUniqueOrThrow({ where: { id: membershipId } });
     expect(m.status).toBe('SUSPENDED');
     expect(await getDb().chargeAdjustment.count({ where: { charge: { membershipId } } })).toBe(0);
+  });
+
+  it('OLVIDAR justo una mensualidad lo hace la gerencia sola, sin firma, y queda como condonación con su monto (D-12)', async () => {
+    const { membershipId, chargeId } = await suspendidaDesdeHace(2);
+    const cargo = await getDb().charge.findUniqueOrThrow({ where: { id: chargeId } });
+    const r = await app.inject({
+      method: 'POST', url: `/memberships/${membershipId}/debt-decision`, headers: { cookie: gerente },
+      payload: { decision: 'FORGIVE', reason: 'Vuelve tras lesión' },
+    });
+    expect(r.statusCode, r.body).toBe(200);
+    expect(r.json().forgivenCents).toBe(cargo.amountCents.toString());
+    const ajuste = await getDb().chargeAdjustment.findFirstOrThrow({ where: { chargeId } });
+    expect(ajuste).toMatchObject({ adjustmentType: 'WAIVER', amountCents: cargo.amountCents, approvedByUserId: null });
   });
 
   it('OLVIDAR condona lo que debía y arranca un periodo hoy; paga solo ese', async () => {

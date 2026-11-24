@@ -76,6 +76,12 @@ export class AnalyticsRepository extends TenantRepository {
         WHERE s."organizationId" = ${this.organizationId}::uuid
           AND s."status" = 'COMPLETED'
           AND s."businessDate" >= ${from}::date AND s."businessDate" < ${to}::date
+        UNION ALL
+        -- Bloque 3.5 (D-13; edición puntual): lo devuelto de la tienda resta el día en que se devuelve.
+        SELECT r."branchId", -r."amountCents", 0::bigint
+        FROM "pos_sale_returns" r
+        WHERE r."organizationId" = ${this.organizationId}::uuid
+          AND r."businessDate" >= ${from}::date AND r."businessDate" < ${to}::date
       ) t
       GROUP BY "branchId"`;
   }

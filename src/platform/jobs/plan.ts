@@ -72,6 +72,8 @@ export const ORDEN_DIARIO: readonly string[] = [
 export const ORDEN_FRECUENTE: readonly string[] = [
   'payments.process-webhooks',
   'payments.resolve-unknown',
+  // D-16 (bloque 3.5): antes de cerrar clases, se liberan los lugares apartados sin pagar.
+  'class.release-unpaid-holds',
   'class.close-finished',
   'approvals.expire-forgotten',
 ];

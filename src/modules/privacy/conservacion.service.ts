@@ -1,5 +1,5 @@
 import {
-  CONSERVACION, DomainError, MOTIVO_ROSTRO_TRAS_LA_BAJA, businessDateIn, conflict, corteDeAnonimizacion, forbidden, isoDate, mesesDeConservacion,
+  CONSERVACION, DomainError, MOTIVO_ROSTRO_BIOMETRIA_APAGADA, MOTIVO_ROSTRO_TRAS_LA_BAJA, businessDateIn, conflict, corteDeAnonimizacion, forbidden, isoDate, mesesDeConservacion,
   motivoDeAnonimizacionPorLista, notFound, periodoDeConservacion, rostroSeBorraEl, tocaBorrarRostro, validation,
   type MotivoDeSaltoDeConservacion,
 } from '@gymflow/core';
@@ -9,7 +9,8 @@ import { enUnaTransaccion } from '../../platform/db/unit-of-work.js';
 import { systemContext } from '../../platform/jobs/types.js';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 import type { RequestContext } from '../../platform/context.js';
-import { EnrollmentService, FaceTemplateRepository } from '../access/index.js';
+import { ModuleStateRepository } from '../../platform/modules/module-state.repository.js';
+import { EnrollmentService, FaceTemplateRepository, rostrosQueBorraApagar } from '../access/index.js';
 import { ApprovalService } from '../approvals/index.js';
 import { AuthUserRepository, PushService, UserRepository } from '../identity/index.js';
 import { OrganizationRepository } from '../organization/index.js';
@@ -31,6 +32,8 @@ export type PasadaDeConservacion = {
   arranco: boolean;
   rostrosBorrados: number;
   rostrosEnEspera: number;
+  /** De `rostrosBorrados`, los que se borraron porque Biometría lleva 30 días apagada con aviso (3.12). */
+  rostrosPorBiometriaApagada: number;
   /** El mes de la lista que se armó en esta pasada, o null. */
   listaArmada: string | null;
   /** Anonimizados en esta pasada al amparo de una lista ya firmada (lo que una ejecución dejó a medias). */
@@ -79,7 +82,7 @@ export class ConservacionService {
 
   async pasada(organizationId: string, ahora: Date = new Date()): Promise<PasadaDeConservacion> {
     const repo = new ConservacionRepository(organizationId);
-    const salida: PasadaDeConservacion = { arranco: false, rostrosBorrados: 0, rostrosEnEspera: 0, listaArmada: null, anonimizados: 0, errores: [] };
+    const salida: PasadaDeConservacion = { arranco: false, rostrosBorrados: 0, rostrosEnEspera: 0, rostrosPorBiometriaApagada: 0, listaArmada: null, anonimizados: 0, errores: [] };
     const hoy = (await new BusinessCalendar(organizationId).dias(ahora)).cierre;
 
     if (await repo.fijarArranque(hoy)) {
@@ -95,6 +98,13 @@ export class ConservacionService {
     salida.rostrosBorrados = rostros.borrados;
     salida.rostrosEnEspera = rostros.enEspera;
     salida.errores.push(...rostros.errores);
+
+    // Biometría apagada con aviso hace 30 días (D-32, paréntesis; 3.12).
+    const apagada = await this.borrarRostrosDeBiometriaApagada(organizationId, ahora);
+    salida.rostrosBorrados += apagada.borrados;
+    salida.rostrosPorBiometriaApagada = apagada.borrados;
+    salida.rostrosEnEspera += apagada.enEspera;
+    salida.errores.push(...apagada.errores);
 
     // Lo que una lista firmada dejó a medias se termina ANTES de armar la del mes: así no vuelve a listarse.
     for (const lista of await repo.firmadasConPendientes()) {
@@ -139,6 +149,45 @@ export class ConservacionService {
         // Si otra pasada lo revocó en este instante ya no hay nada que borrar: no es un error.
         if (e instanceof DomainError && e.code === 'CONFLICT') continue;
         salida.errores.push({ entityId: p.enrollmentId, error: texto(e) });
+      }
+    }
+    return salida;
+  }
+
+  /**
+   * BIOMETRÍA APAGADA (D-32: «igual si se apaga Biometría, con aviso»; 3.12).
+   * Borra los rostros de un gimnasio o de una sucursal cuando el módulo lleva
+   * apagado el plazo Y quien lo apagó confirmó el aviso con el número de
+   * rostros: ese día quedó anotada la fecha (`erasureOn`). Sin esa fecha no se
+   * borra nada: un módulo apagado antes de que existiera el aviso, o apagado
+   * por no estar contratado, no entra aquí. Encenderlo otra vez quita la fecha.
+   *
+   * Idempotente: lo ya borrado no vuelve a salir, y cada rostro va en su unidad.
+   */
+  async borrarRostrosDeBiometriaApagada(organizationId: string, ahora: Date = new Date()): Promise<{ borrados: number; enEspera: number; errores: ErrorDePasada[] }> {
+    const salida = { borrados: 0, enEspera: 0, errores: [] as ErrorDePasada[] };
+    const avisados = await new ModuleStateRepository(organizationId).borradosAvisados('biometrics');
+    if (avisados.length === 0) return salida;
+
+    const dias = this.diasDeSede(organizationId, ahora);
+    const enrolamientos = new EnrollmentService();
+    const ctx = systemContext(organizationId);
+    const vistos = new Set<string>();
+    // Primero lo que ya toca: si un rostro cae en dos avisos (su sucursal y todo el gimnasio), manda el que vence antes.
+    for (const a of [...avisados].sort((x, y) => x.erasureOn.getTime() - y.erasureOn.getTime())) {
+      const { hoy } = await dias(a.branchId);
+      const toca = hoy.getTime() >= a.erasureOn.getTime();
+      for (const p of await rostrosQueBorraApagar(organizationId, a.branchId)) {
+        if (vistos.has(p.enrollmentId)) continue;
+        vistos.add(p.enrollmentId);
+        if (!toca) { salida.enEspera += 1; continue; }
+        try {
+          await enUnaTransaccion(() => enrolamientos.revoke(ctx, p.enrollmentId, MOTIVO_ROSTRO_BIOMETRIA_APAGADA));
+          salida.borrados += 1;
+        } catch (e) {
+          if (e instanceof DomainError && e.code === 'CONFLICT') continue;
+          salida.errores.push({ entityId: p.enrollmentId, error: texto(e) });
+        }
       }
     }
     return salida;

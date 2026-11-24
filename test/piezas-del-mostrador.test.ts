@@ -9,6 +9,7 @@ import {
 import { makeApp, loginAs, orgFixtures, nombreUnico, telefonoUnico, CONSENTIMIENTOS } from './helpers.js';
 import { closeDb, getDb } from '../src/platform/db/client.js';
 import { ConsentDocumentRepository } from '../src/modules/members/index.js';
+import { activarSinCobro, altaSinCobro } from './membresia-de-prueba.js';
 
 /**
  * PIEZAS DEL MOSTRADOR (auditoría 8, fase 1.4).
@@ -51,12 +52,9 @@ describe('piezas del mostrador (1.4)', () => {
 
   async function conMembresia(estado: 'ACTIVE' | 'PAST_DUE' | 'SUSPENDED'): Promise<string> {
     const memberId = await nuevoSocio();
-    const mem = await app.inject({
-      method: 'POST', url: `/members/${memberId}/memberships`, headers: { cookie: gerencia },
-      payload: { reason: 'Fixture de prueba', planId, soldAtBranchId: cen },
-    });
+    const mem = await altaSinCobro(app, gerencia, memberId, { reason: 'Fixture de prueba', planId, soldAtBranchId: cen });
     expect(mem.statusCode, mem.body).toBe(201);
-    await app.inject({ method: 'POST', url: `/memberships/${mem.json().id}/activate`, headers: { cookie: gerencia }, payload: { reason: 'Fixture de prueba' } });
+    await activarSinCobro(app, gerencia, mem.json().id);
     if (estado !== 'ACTIVE') await getDb().membership.update({ where: { id: mem.json().id }, data: { status: estado } });
     return memberId;
   }

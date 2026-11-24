@@ -1,4 +1,4 @@
-import { PlatformAuditRepository, platformActorOf, verifyPlatformChain, type PlatformAuditEntry, type PlatformChainVerification } from './platform-audit.repository.js';
+import { PlatformAuditRepository, platformActorOf, verifyPlatformChain, type PlatformAuditEntry, type PlatformChainCursor, type PlatformChainVerification } from './platform-audit.repository.js';
 
 /** Quién de la plataforma actúa: sale de `request.platform` y de la petición. */
 export type PlatformActor = {
@@ -61,7 +61,7 @@ export class PlatformAuditService {
 
   /** Recorre la cadena completa por tramos y la verifica eslabón por eslabón. */
   async verifyChain(pageSize = 1000): Promise<PlatformChainVerification> {
-    let after: { at: Date; id: string } | null = null;
+    let after: PlatformChainCursor | null = null;
     let prev: string | null = null;
     let checked = 0;
     for (;;) {
@@ -72,7 +72,7 @@ export class PlatformAuditService {
       checked += r.checked;
       prev = r.lastHash;
       const ultimo = tramo.at(-1)!;
-      after = { at: ultimo.at, id: ultimo.content.id };
+      after = { at: ultimo.at, id: ultimo.content.id, chainSeq: ultimo.chainSeq };
     }
   }
 

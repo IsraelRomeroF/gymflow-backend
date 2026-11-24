@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import type { Perfil } from '../perfiles.js';
+import { abiertoAInternet, esDireccionProvisional, type Perfil } from '../perfiles.js';
 import { route } from './registry.js';
 
 declare module 'fastify' {
@@ -30,6 +30,14 @@ export function registerHealthRoutes(app: FastifyInstance): void {
     method: 'GET',
     url: '/public/config',
     security: { kind: 'public', why: 'Dirección pública del portal que el panel imprime en sus QR; no es un dato privado' },
-    handler: async () => ({ portalUrl: (process.env.PORTAL_PUBLIC_URL ?? '').replace(/\/$/, '') || null }),
+    // D-01 (fase 3): también la del panel, y si la dirección es FIJA (un dominio propio) o
+    // provisional (el túnel sin cuenta, que cambia en cada arranque): el panel avisa de la segunda.
+    handler: async () => {
+      const portalUrl = (process.env.PORTAL_PUBLIC_URL ?? '').trim().replace(/\/$/, '') || null;
+      const panelUrl = (process.env.PANEL_PUBLIC_URL ?? '').trim().replace(/\/$/, '') || null;
+      const abierto = abiertoAInternet({ PANEL_PUBLIC_URL: panelUrl ?? undefined, PORTAL_PUBLIC_URL: portalUrl ?? undefined });
+      const provisional = esDireccionProvisional(portalUrl ?? undefined) || esDireccionProvisional(panelUrl ?? undefined);
+      return { portalUrl, panelUrl, address: !abierto ? 'local' : provisional ? 'provisional' : 'fixed' };
+    },
   });
 }

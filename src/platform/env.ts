@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { LLAVE_DATOS, LLAVE_DATOS_ANTERIOR, avisarSiNombreAnterior, llaveDeDatos } from './sensitive.js';
-import { CORS_POR_OMISION, datosDeConexion, perfilDe, problemasDeArranque, procesadorPorOmision, tipoDeBase, type Perfil } from './perfiles.js';
+import { CORS_POR_OMISION, abiertoAInternet, datosDeConexion, perfilDe, problemasDeArranque, procesadorPorOmision, tipoDeBase, type Perfil } from './perfiles.js';
 
 /** Valor de desarrollo. En producción se rechaza explícitamente. */
 const DEV_WEBHOOK_SECRET = 'sandbox-dev-secret';
@@ -14,6 +14,15 @@ const schema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production'], { message: 'Falta NODE_ENV (development, test o production)' }),
   API_PORT: z.coerce.number().int().positive().default(3001),
   DATABASE_URL: z.string().min(1, 'Falta DATABASE_URL'),
+  /**
+   * Dominio de las cookies de sesión (D-01). Vacía, cada cookie vale solo en
+   * la dirección exacta que la puso, que es lo más cerrado y lo que basta con
+   * una dirección fija por aplicación. Con valor (`tu-dominio.mx`), la cookie
+   * vale en ese dominio y lo que cuelga de él, y SOLO se le pone a quien
+   * entró por ahí: quien entra por `localhost` o por la red del gimnasio
+   * recibe la suya sin dominio (`platform/http/sesion.ts`). La combinación la
+   * revisa `platform/perfiles.ts`.
+   */
   SESSION_COOKIE_DOMAIN: z.string().default(''),
   SESSION_TTL_STAFF_HOURS: z.coerce.number().int().positive().default(12),
   SESSION_TTL_MEMBER_DAYS: z.coerce.number().int().positive().default(30),
@@ -171,6 +180,11 @@ export type Env = z.infer<typeof schema> & {
   corsOrigins: string[]; trustedProxies: string[]; portalOrigins: string[]; paymentProvider: 'none' | 'sandbox'; platformAllowedIps: string[];
   /** El perfil de arranque por la base: `uso-real`, `pruebas` o ninguno (`platform/perfiles.ts`). */
   perfil: Perfil | null;
+  /** D-01: el panel o el portal se sirven en una dirección que no es de esta computadora ni de su red. */
+  abiertoAInternet: boolean;
+  /** Dirección pública del panel y del portal, sin diagonal final; `null` si no hay. */
+  panelPublicUrl: string | null;
+  portalPublicUrl: string | null;
 };
 
 export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
@@ -222,6 +236,9 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
     ...parsed.data,
     paymentProvider,
     perfil: perfilDe(parsed.data.DATABASE_URL),
+    abiertoAInternet: abiertoAInternet({ PANEL_PUBLIC_URL: source.PANEL_PUBLIC_URL, PORTAL_PUBLIC_URL: source.PORTAL_PUBLIC_URL }),
+    panelPublicUrl: (source.PANEL_PUBLIC_URL ?? '').trim().replace(/\/$/, '') || null,
+    portalPublicUrl: (source.PORTAL_PUBLIC_URL ?? '').trim().replace(/\/$/, '') || null,
     platformAllowedIps: parsed.data.PLATFORM_ALLOWED_IPS.split(',').map((x) => x.trim()).filter(Boolean),
     corsOrigins: parsed.data.CORS_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean),
     trustedProxies: parsed.data.TRUSTED_PROXIES.split(',').map((s) => s.trim()).filter(Boolean),
@@ -233,7 +250,8 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
   const problemas = problemasDeArranque({
     NODE_ENV: env.NODE_ENV, API_PORT: env.API_PORT, DATABASE_URL: env.DATABASE_URL, paymentProvider,
     trustedProxies: env.trustedProxies, CORS_ORIGINS: env.CORS_ORIGINS, portalOrigins: env.portalOrigins,
-    PORTAL_PUBLIC_URL: source.PORTAL_PUBLIC_URL,
+    PORTAL_PUBLIC_URL: source.PORTAL_PUBLIC_URL, PANEL_PUBLIC_URL: source.PANEL_PUBLIC_URL,
+    SESSION_COOKIE_DOMAIN: env.SESSION_COOKIE_DOMAIN,
   });
   if (problemas.length > 0) {
     throw new Error(`La configuración no corresponde a ningún perfil válido (uso real, pruebas o producción):\n${problemas.map((p) => `  · ${p}`).join('\n')}`);

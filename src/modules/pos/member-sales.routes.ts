@@ -1,3 +1,4 @@
+import { PosCorrectionRepository } from './correccion.repository.js';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { notFound, validation } from '@gymflow/core';
@@ -39,9 +40,13 @@ export function registerMemberSalesRoutes(app: FastifyInstance): void {
       const repo = new PosSaleRepository(orgId);
       const { filas, total, spentCents } = await repo.pageForMember(id, q.limit, cursor);
       const pagina = cortarPagina(filas, q.limit, (u) => armarCursor(u.soldAt.toISOString(), u.id));
-      const [lineas, nombres] = await Promise.all([
+      const correcciones = new PosCorrectionRepository(orgId);
+      const [lineas, nombres, marcas, devueltas] = await Promise.all([
         repo.linesWithNames(pagina.items.map((v) => v.id)),
         repo.sellerNames(pagina.items.map((v) => v.soldByUserId)),
+        // D-13 (bloque 3.5): la ficha dice cuál sigue «por corregir» y cuál se devolvió.
+        correcciones.flagsOf(pagina.items.map((v) => v.id)),
+        correcciones.returnsOf(pagina.items.map((v) => v.id)),
       ]);
       return {
         items: pagina.items.map((v) => ({
@@ -55,6 +60,8 @@ export function registerMemberSalesRoutes(app: FastifyInstance): void {
           soldAt: v.soldAt.toISOString(),
           businessDate: v.businessDate.toISOString().slice(0, 10),
           soldByName: nombres.get(v.soldByUserId) ?? null,
+          flagged: !!marcas.get(v.id) && !marcas.get(v.id)!.resolvedAt,
+          returnedOn: devueltas.get(v.id)?.businessDate.toISOString().slice(0, 10) ?? null,
           lines: (lineas.get(v.id) ?? []).map((l) => ({
             productId: l.productId, name: l.name, quantity: l.quantity,
             unitPriceCents: cents(l.unitPriceCents), lineTotalCents: cents(l.lineTotalCents),

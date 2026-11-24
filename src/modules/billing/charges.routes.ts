@@ -8,6 +8,7 @@ import { idParam, cents, iso, serializeCharge, serializeAdjustment, serializeEst
 import { notFound, formatMoney, money, discountPercentOf } from '@gymflow/core';
 import { MemberStatement, PAGINA_MAXIMA, PAGINA_POR_OMISION, StatementChargesPage, StatementPaymentsPage } from '@gymflow/core/contracts';
 import { StatementService, cursorDe } from './statement.service.js';
+import { perdonDisponible } from './perdon.js';
 
 /** `?cursor=&limit=` de una lista por páginas. */
 const paginaQuery = z.object({
@@ -203,6 +204,10 @@ export function registerChargesRoutes(app: FastifyInstance): void {
         ? discountPercentOf(money(amount), money(charge.amountCents))
         : undefined;
 
+      // D-12: condonar pasa sin firma mientras quepa en lo que a ESE socio se le puede perdonar
+      // (una mensualidad suya menos lo ya perdonado sin firma en 30 días); arriba firma la dueña.
+      const tope = body.adjustmentType === 'WAIVER' ? await perdonDisponible(ctx.tenant.organizationId, charge.memberId) : null;
+
       const aprobador = await request.verifyApprover(body.approvalToken, permission, { branchId: charge.branchId, resourceType: 'Charge', resourceId: charge.id, amountCents: amount, ...(percent === undefined ? {} : { percent }) });
       request.authorize(permission, {
         branchId: charge.branchId,
@@ -210,6 +215,7 @@ export function registerChargesRoutes(app: FastifyInstance): void {
         ...(aprobador ? { approvedByUserId: aprobador } : {}),
         amountCents: amount,
         ...(percent === undefined ? {} : { percent }),
+        ...(tope ? { waiverAllowanceCents: tope.disponibleCents } : {}),
       });
 
       const updated = await service.adjustCharge(ctx, {

@@ -25,3 +25,7 @@ export { VisitPackRepository, type VisitPackRecord } from './visitpack.repositor
 // Consumida por: billing, que se registra para anular las cuotas sin pagar de
 // una membresía que se cancela (DM-03). `memberships` no sabe quién escucha.
 export { registerMembershipClosedHook, emitMembershipClosed, type MembershipClosed } from './closed-hooks.js';
+
+// D-14 (fase 3, bloque 3.5): las anualidades vivas que «se renuevan solas». Lo consume
+// `scripts/anualidades-no-se-renuevan.ts` (la lista antes de aplicar, y la aplicación).
+export { prepagosQueSeRenuevan, apagarRenovacionDePrepagos, cambiarRenovacion, type PrepagoQueSeRenueva } from './anualidades.js';

@@ -1,7 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import {
-  conflict, formatMoney, money, notFound, validation, isoDate,
+  conflict, DomainError, formatMoney, money, notFound, validation, isoDate,
   BOOKING_RULE_LIMITS, DEFAULT_BOOKING_SETTINGS, GYM_BOOKING_RULE_KEYS, type BookingSettings,
 } from '@gymflow/core';
 import {
@@ -83,10 +83,47 @@ export function registerClassRoutes(app: FastifyInstance): void {
     if (!clase) throw notFound('Clase no encontrada');
     return clase.branchId;
   }
-  async function sedeDeReserva(request: FastifyRequest, bookingId: string): Promise<string> {
-    const reserva = await new ClassRepository(request.ctx!.tenant.organizationId).findBooking(bookingId);
+  async function sesionDeReserva(request: FastifyRequest, bookingId: string): Promise<{ sede: string; sesion: { coachUserId: string | null } }> {
+    const repo = new ClassRepository(request.ctx!.tenant.organizationId);
+    const reserva = await repo.findBooking(bookingId);
     if (!reserva) throw notFound('Reserva no encontrada');
-    return sedeDeClase(request, reserva.classScheduleId);
+    const clase = await repo.findSchedule(reserva.classScheduleId);
+    if (!clase) throw notFound('Clase no encontrada');
+    return { sede: clase.branchId, sesion: clase };
+  }
+
+  // ── D-28 (fase 3, bloque 3.8): el coach opera SUS clases ──────────────────
+
+  const ajena = () => new DomainError('FORBIDDEN', 'Esa clase la imparte otra persona: solo operas las tuyas', undefined, 'NOT_YOUR_CLASS');
+
+  /**
+   * Inscribir, quitar y pasar lista: quien es SOLO coach lo hace en las
+   * sesiones que imparte o cubre, no en las de otro coach ni en las que no
+   * tienen coach. Recepción y gerencia, en cualquiera de su sede.
+   */
+  function soloEnLaSuya(request: FastifyRequest, sesion: { coachUserId: string | null }): void {
+    const coach = request.ctx!.coachOf;
+    if (coach && sesion.coachUserId !== coach) throw ajena();
+  }
+
+  /** Y solo a SUS socios: a uno ajeno no lo encuentra, igual que en `/members/:id`. */
+  async function soloAlSuyo(request: FastifyRequest, memberId: string): Promise<void> {
+    const coach = request.ctx!.coachOf;
+    if (!coach) return;
+    const suyos = await new MemberRepository(request.ctx!.tenant.organizationId).assignedTo(coach);
+    if (!suyos.includes(memberId.toLowerCase())) throw notFound('Socio no encontrado');
+  }
+
+  /**
+   * Suplente y cupo (`classes:session:operate`): quien arma el horario de la
+   * sede (`classes:manage`) opera cualquier sesión; los demás, la que imparten.
+   * Devuelve si opera como dueño del horario.
+   */
+  function operaLaSesion(request: FastifyRequest, sesion: { branchId: string; coachUserId: string | null }): { armaElHorario: boolean } {
+    if (request.holds('classes:manage', sesion.branchId)) return { armaElHorario: true };
+    const yo = request.ctx!.tenant.actorUserId ?? null;
+    if (yo === null || sesion.coachUserId !== yo) throw ajena();
+    return { armaElHorario: false };
   }
 
   // ── Catálogo y horarios ───────────────────────────────────────────────────
@@ -196,12 +233,13 @@ export function registerClassRoutes(app: FastifyInstance): void {
   route(app, {
     method: 'POST',
     url: '/classes/types/:id/retire',
-    security: { kind: 'permission', permission: 'classes:manage' },
+    // Retirar cancela las sesiones futuras: es de la gerencia (D-28).
+    security: { kind: 'permission', permission: 'classes:session:cancel' },
     handler: async (request) => {
       const { id } = idParam.parse(request.params);
       const { reason } = z.object({ reason: z.string().min(3).max(300) }).parse(request.body);
       // Un tipo de clase es de todo el gimnasio: retirarlo exige alcance organizacional.
-      request.authorize('classes:manage', { reason, branchId: null });
+      request.authorize('classes:session:cancel', { reason, branchId: null });
       const r = await service.retireType(request.ctx!, id, reason);
       await audit.record(request.ctx!, {
         action: 'class.type.retire', resourceType: 'class_type', resourceId: id, reason, afterState: r,
@@ -239,13 +277,14 @@ export function registerClassRoutes(app: FastifyInstance): void {
   route(app, {
     method: 'POST',
     url: '/classes/templates/:id/retire',
-    security: { kind: 'permission', permission: 'classes:manage' },
+    // Quitar un horario cancela sus sesiones futuras: es de la gerencia (D-28).
+    security: { kind: 'permission', permission: 'classes:session:cancel' },
     handler: async (request) => {
       const { id } = idParam.parse(request.params);
       const { reason } = z.object({ reason: z.string().min(3).max(300) }).parse(request.body);
       const sede = await new ClassRepository(request.ctx!.tenant.organizationId).templateBranch(id);
       if (sede === undefined) throw notFound('Horario no encontrado');
-      request.authorize('classes:manage', { reason, branchId: sede });
+      request.authorize('classes:session:cancel', { reason, branchId: sede });
       const r = await service.retireTemplate(request.ctx!, id, reason);
       await audit.record(request.ctx!, {
         action: 'class.template.retire', resourceType: 'class_template', resourceId: id, reason, afterState: r,
@@ -375,11 +414,15 @@ export function registerClassRoutes(app: FastifyInstance): void {
     },
   });
 
-  /** Quién imparte UNA clase: un suplente ese día. */
+  /**
+   * Quién imparte UNA clase: un suplente ese día. El coach lo pone en la
+   * sesión que imparte (D-28) y tiene que nombrar a alguien: dejarla sin coach
+   * es de quien arma el horario.
+   */
   route(app, {
     method: 'PUT',
     url: '/classes/schedules/:id/coach',
-    security: { kind: 'permission', permission: 'classes:manage' },
+    security: { kind: 'permission', permission: 'classes:session:operate' },
     handler: async (request) => {
       const { id } = idParam.parse(request.params);
       const { coachUserId } = z.object({ coachUserId: z.string().uuid().nullable() }).parse(request.body);
@@ -387,11 +430,16 @@ export function registerClassRoutes(app: FastifyInstance): void {
       const repo = new ClassRepository(orgId);
       const clase = await repo.findSchedule(id);
       if (!clase) throw notFound('Clase no encontrada');
-      request.authorize('classes:manage', { branchId: clase.branchId });
+      request.requirePermission('classes:session:operate', clase.branchId);
+      const { armaElHorario } = operaLaSesion(request, clase);
       if (clase.status !== 'SCHEDULED') throw conflict('Esa clase ya no está programada');
+      if (!armaElHorario && coachUserId === null) throw validation('Elige quién te cubre: dejar la clase sin coach lo decide la gerencia');
       await coachValido(orgId, coachUserId);
       await repo.setScheduleCoach(id, coachUserId);
-      await audit.record(request.ctx!, { action: 'class.schedule.coach', resourceType: 'class_schedule', resourceId: id, branchId: clase.branchId, afterState: { coachUserId } });
+      await audit.record(request.ctx!, {
+        action: 'class.schedule.coach', resourceType: 'class_schedule', resourceId: id, branchId: clase.branchId,
+        beforeState: { coachUserId: clase.coachUserId }, afterState: { coachUserId },
+      });
       return { ok: true };
     },
   });
@@ -491,31 +539,38 @@ export function registerClassRoutes(app: FastifyInstance): void {
   route(app, {
     method: 'PATCH',
     url: '/classes/schedules/:id/capacity',
-    security: { kind: 'permission', permission: 'classes:manage' },
+    // El coach cambia el cupo de la sesión que imparte (D-28).
+    security: { kind: 'permission', permission: 'classes:session:operate' },
     handler: async (request) => {
       const { id } = idParam.parse(request.params);
       const { capacity } = z.object({ capacity: z.number().int().min(1).max(500) }).parse(request.body);
-      const sede = await sedeDeClase(request, id);
-      request.requirePermission('classes:manage', sede);
       const antes = await new ClassRepository(request.ctx!.tenant.organizationId).findSchedule(id);
+      if (!antes) throw notFound('Clase no encontrada');
+      const sede = antes.branchId;
+      request.requirePermission('classes:session:operate', sede);
+      operaLaSesion(request, antes);
       await service.setCapacity(request.ctx!.tenant.organizationId, id, capacity);
       // Desde la lista de la sesión ya se usa (antes la ruta no tenía pantalla): queda en la bitácora.
       await audit.record(request.ctx!, {
         action: 'class.schedule.capacity', resourceType: 'class_schedule', resourceId: id, branchId: sede,
-        beforeState: { capacity: antes?.capacity ?? null }, afterState: { capacity },
+        beforeState: { capacity: antes.capacity }, afterState: { capacity },
       });
       return { ok: true, capacity };
     },
   });
 
+  /**
+   * CANCELAR UNA SESIÓN es de la gerencia (D-28, opción c): el coach no
+   * cancela ninguna, ni la suya; si no puede darla, pone suplente o avisa.
+   */
   route(app, {
     method: 'POST',
     url: '/classes/schedules/:id/cancel',
-    security: { kind: 'permission', permission: 'classes:manage' },
+    security: { kind: 'permission', permission: 'classes:session:cancel' },
     handler: async (request) => {
       const { id } = idParam.parse(request.params);
       const { reason } = z.object({ reason: z.string().min(3).max(300) }).parse(request.body);
-      request.authorize('classes:manage', { reason, branchId: await sedeDeClase(request, id) });
+      request.authorize('classes:session:cancel', { reason, branchId: await sedeDeClase(request, id) });
 
       const canceladas = await service.cancelSchedule(request.ctx!, id, reason);
       await audit.record(request.ctx!, {
@@ -571,6 +626,8 @@ export function registerClassRoutes(app: FastifyInstance): void {
           chargeId: visible ? b.chargeId : null,
           pendingCents: pendingCents.toString(),
           pendingLabel: pendingCents > 0n ? formatMoney(money(pendingCents)) : null,
+          // D-16 (bloque 3.5): si sigue sin pagar, hasta cuándo se le guarda el lugar.
+          holdUntil: payment === 'PENDING' && b.holdUntil ? iso(b.holdUntil) : null,
           ...(visible ? {} : { hidden: true }),
         };
       });
@@ -738,7 +795,8 @@ export function registerClassRoutes(app: FastifyInstance): void {
   route(app, {
     method: 'POST',
     url: '/classes/pauses',
-    security: { kind: 'permission', permission: 'classes:manage' },
+    // Una pausa cancela las sesiones de esas fechas: es de la gerencia (D-28).
+    security: { kind: 'permission', permission: 'classes:session:cancel' },
     schema: respuesta(201, ClassPauseCreated),
     handler: async (request, reply) => {
       const body = z.object({
@@ -749,7 +807,7 @@ export function registerClassRoutes(app: FastifyInstance): void {
         reason: z.string().trim().min(3).max(300),
       }).parse(request.body);
       const sede = body.branchId ?? null;
-      request.authorize('classes:manage', { reason: body.reason, branchId: sede });
+      request.authorize('classes:session:cancel', { reason: body.reason, branchId: sede });
       const orgId = request.ctx!.tenant.organizationId;
       if (sede && !(await new BranchRepository(orgId).list()).some((b) => b.id === sede)) throw notFound('Sucursal no encontrada');
       const r = await service.createPause(request.ctx!, { branchId: sede, fromDate: body.fromDate, toDate: body.toDate, reason: body.reason });
@@ -791,15 +849,32 @@ export function registerClassRoutes(app: FastifyInstance): void {
     security: { kind: 'permission', permission: 'classes:book_for_member' },
     handler: async (request, reply) => {
       const { id } = idParam.parse(request.params);
-      const { memberId } = z.object({ memberId: z.string().uuid() }).parse(request.body);
+      // D-16 (bloque 3.5): `payment` cobra la clase suelta en el momento de apartarla. Es obligatorio si el
+      // socio debe su mensualidad o falta menos de una hora; sin él, el lugar se guarda hasta una hora antes.
+      const { memberId, payment } = z.object({
+        memberId: z.string().uuid(),
+        payment: z.object({
+          method: z.enum(['CASH', 'CARD_TERMINAL', 'SPEI_TRANSFER']),
+          cashSessionId: z.string().uuid().optional(),
+          externalRef: z.string().trim().max(120).optional(),
+        }).refine((p) => p.method !== 'SPEI_TRANSFER' || !!p.externalRef, { message: 'Una transferencia necesita su referencia o clave de rastreo', path: ['externalRef'] }).optional(),
+      }).parse(request.body);
       const ctx = request.ctx!;
-      request.requirePermission('classes:book_for_member', await sedeDeClase(request, id));
+      const sesion = await new ClassRepository(ctx.tenant.organizationId).findSchedule(id);
+      if (!sesion) throw notFound('Clase no encontrada');
+      request.requirePermission('classes:book_for_member', sesion.branchId);
+      // Cobrar es otro permiso: el coach inscribe, pero no cobra.
+      if (payment) request.authorize('payments:record', { branchId: sesion.branchId });
+      // D-28: el coach inscribe a SUS socios en SUS clases.
+      soloEnLaSuya(request, sesion);
+      await soloAlSuyo(request, memberId);
 
       const r = await service.book(ctx.tenant.organizationId, {
         scheduleId: id,
         memberId,
         source: 'FRONT_DESK',
         bookedByUserId: ctx.tenant.actorUserId ?? null,
+        cobro: payment ? { ctx, payment: { method: payment.method, cashSessionId: payment.cashSessionId ?? null, externalRef: payment.externalRef ?? null } } : null,
       });
       return reply.status(201).send(serializeBooking(r));
     },
@@ -811,13 +886,19 @@ export function registerClassRoutes(app: FastifyInstance): void {
     security: { kind: 'permission', permission: 'classes:book_for_member' },
     handler: async (request) => {
       const { id } = idParam.parse(request.params);
-      request.requirePermission('classes:book_for_member', await sedeDeClase(request, id));
+      const sesion = await new ClassRepository(request.ctx!.tenant.organizationId).findSchedule(id);
+      if (!sesion) throw notFound('Clase no encontrada');
+      request.requirePermission('classes:book_for_member', sesion.branchId);
       const { memberId } = z.object({ memberId: z.string().uuid() }).parse(request.query);
+      soloEnLaSuya(request, sesion);
+      await soloAlSuyo(request, memberId);
       const q = await service.quote(request.ctx!.tenant.organizationId, id, memberId);
       return {
         ...q,
         priceCents: q.priceCents.toString(),
         priceLabel: q.priceCents > 0n ? formatMoney(money(q.priceCents)) : null,
+        // D-16: hasta cuándo se le guardaría sin pagar, o por qué solo pagando ahora.
+        holdUntil: q.holdUntil ? iso(q.holdUntil) : null,
       };
     },
   });
@@ -833,8 +914,10 @@ export function registerClassRoutes(app: FastifyInstance): void {
         reason: z.string().max(300).optional(),
       }).parse(request.body ?? {});
       const ctx = request.ctx!;
-      const sede = await sedeDeReserva(request, id);
+      const { sede, sesion } = await sesionDeReserva(request, id);
       request.requirePermission('classes:book_for_member', sede);
+      // D-28: el coach quita a alguien solo de la sesión que imparte.
+      soloEnLaSuya(request, sesion);
 
       // Cancelar por el socio fuera de ventana es una excepción: exige su
       // propio permiso y su motivo, y queda en la bitácora.
@@ -867,7 +950,10 @@ export function registerClassRoutes(app: FastifyInstance): void {
     security: { kind: 'permission', permission: 'classes:book_for_member' },
     handler: async (request) => {
       const { id } = idParam.parse(request.params);
-      request.requirePermission('classes:book_for_member', await sedeDeReserva(request, id));
+      const { sede, sesion } = await sesionDeReserva(request, id);
+      request.requirePermission('classes:book_for_member', sede);
+      // D-28: el coach pasa lista en la sesión que imparte, no en la de otro.
+      soloEnLaSuya(request, sesion);
       await service.checkIn(request.ctx!.tenant.organizationId, id);
       return { ok: true };
     },
@@ -1030,12 +1116,16 @@ export function registerClassRoutes(app: FastifyInstance): void {
 function serializeBooking(r: {
   booking: { id: string; classScheduleId: string; status: string };
   chargeId: string | null; priceCents: bigint; warnings: readonly string[];
+  holdUntil?: Date | null; paymentId?: string | null;
 }) {
   return {
     id: r.booking.id,
     classScheduleId: r.booking.classScheduleId,
     status: r.booking.status,
     chargeId: r.chargeId,
+    // D-16 (bloque 3.5): hasta cuándo se guarda el lugar sin pagar, y el cobro si se hizo al apartar.
+    holdUntil: r.holdUntil ? r.holdUntil.toISOString() : null,
+    paymentId: r.paymentId ?? null,
     priceCents: r.priceCents.toString(),
     priceLabel: r.priceCents > 0n ? formatMoney(money(r.priceCents)) : null,
     warnings: r.warnings,

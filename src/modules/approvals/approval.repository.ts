@@ -23,6 +23,8 @@ export class ApprovalGrantRepository extends TenantRepository {
     approverUserId: string; requestedByUserId: string; permission: string; tokenHash: string;
     branchId: string | null; resourceType: string | null; resourceId: string | null;
     amountCents: bigint | null; expiresAt: Date;
+    /** D-02: el nombramiento con el que se firma como apoderado; sin él, firma el dueño. */
+    proxyId?: string | null;
   }): Promise<{ id: string }> {
     const id = uuidv7();
     await this.db.approvalGrant.create({ data: { id, organizationId: this.organizationId, ...input } });
@@ -83,6 +85,8 @@ export type Solicitud = {
   /** D-03: quien firma preguntó en vez de rechazar; la solicitud sigue pendiente. */
   question: string | null; questionAt: Date | null; questionByUserId: string | null;
   answer: string | null; answeredAt: Date | null;
+  /** D-02: el nombramiento con el que se contestó como apoderado; null = contestó el dueño. */
+  proxyId: string | null;
 };
 
 /** El «no» de una operación: quién, cuándo y por qué. */
@@ -93,6 +97,7 @@ const SELECT = {
   status: true, requestedByUserId: true, approverUserId: true, decidedAt: true, rejectReason: true, expiresAt: true, createdAt: true,
   grantId: true, notifiedCount: true, seenAt: true,
   previousRequestId: true, reply: true, question: true, questionAt: true, questionByUserId: true, answer: true, answeredAt: true,
+  proxyId: true,
 } as const;
 
 /** La base solo admite los cinco estados (CHECK); aquí se dice con el tipo cerrado del núcleo. */
@@ -243,6 +248,8 @@ export class ApprovalRequestRepository extends TenantRepository {
   async decide(id: string, data: {
     status: 'APPROVED' | 'REJECTED' | 'CANCELED' | 'EXPIRED';
     approverUserId?: string; rejectReason?: string; deliveryToken?: string | null; grantId?: string;
+    /** D-02: quien contesta lo hace como apoderado, con este nombramiento. */
+    proxyId?: string | null;
   }): Promise<boolean> {
     const { status, ...resto } = data;
     const { count } = await this.db.approvalRequest.updateMany({
@@ -305,6 +312,7 @@ export class ApprovalRequestRepository extends TenantRepository {
     // Sin ids de ese tipo no se consulta: Prisma mandaba igual un `WHERE 1=0`
     // por cada tabla, y la bandeja vacía costaba diez consultas (OPT3-09).
     const si = <T>(lista: string[], consulta: (ids: string[]) => Promise<T[]>): Promise<T[]> => (lista.length === 0 ? Promise.resolve([]) : consulta(lista));
+    const ventasDeTienda = await si(ids('PosSale'), (xs) => this.db.posSale.findMany({ where: this.scope({ id: { in: xs } }), select: { id: true, folio: true, businessDate: true } }));
     const [pagos, cargos, socios, membresias, turnos, paquetes] = await Promise.all([
       si(ids('Payment'), (xs) => this.db.payment.findMany({ where: this.scope({ id: { in: xs } }), select: { id: true, folio: true, method: true, member: socio } })),
       si(ids('Charge'), (xs) => this.db.charge.findMany({ where: this.scope({ id: { in: xs } }), select: { id: true, concept: true, member: socio } })),
@@ -326,6 +334,9 @@ export class ApprovalRequestRepository extends TenantRepository {
       ...membresias.map((m) => [m.id, `Membresía de ${quien(m.member)}`] as const),
       ...turnos.map((t) => [t.id, `Turno de ${t.cashRegister.name}`] as const),
       ...paquetes.map((p) => [p.id, `Paquete de visitas de ${quien(p.member)}`] as const),
+      // Bloque 3.5 (edición puntual): la devolución de una venta de tienda (D-13) y los topes del cajón (D-15).
+      ...ventasDeTienda.map((v) => [v.id, `Venta de tienda${v.folio ? ` · folio ${v.folio}` : ''} del ${v.businessDate.toISOString().slice(0, 10)}`] as const),
+      ...ids('CashLimits').map((id) => [id, 'Topes del cajón del gimnasio'] as const),
       ...cierres,
     ]);
     return new Map(sols.filter((s) => s.resourceId && porRecurso.has(s.resourceId)).map((s) => [s.id, porRecurso.get(s.resourceId!)!]));

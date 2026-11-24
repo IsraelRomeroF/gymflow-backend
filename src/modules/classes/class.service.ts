@@ -2,6 +2,7 @@ import {
   conflict, expandWeekly, evaluateBooking, evaluateCancellation, evaluateNoShowPenalty,
   canSetCapacity, notFound, validation, DomainError,
   bookingSettingsFrom, attendanceWindowState, ATTENDANCE_WINDOW, isValidSlot, isoDate, resolveWallTime,
+  apartadoDeClaseSuelta, apartadoVencido,
   type BookingDecision, type BookingSubject, type BookingSettings, type WeeklySlot,
 } from '@gymflow/core';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
@@ -13,6 +14,9 @@ import { PlanRepository } from '../catalog/index.js';
 import { BranchRepository } from '../organization/index.js';
 import { ClassRepository, type BookingRecord, type ClassPauseRecord, type ScheduleRecord } from './class.repository.js';
 import type { RequestContext } from '../../platform/context.js';
+import { AuditService } from '../../platform/audit/audit.service.js';
+import { systemContext } from '../../platform/jobs/types.js';
+import { enUnidadDeDinero } from '../../platform/db/unit-of-work.js';
 
 /**
  * ¿Qué sedes dan clases hoy? Las abiertas que no dejaron de usar Clases
@@ -67,7 +71,14 @@ export type BookingResult = {
   chargeId: string | null;
   priceCents: bigint;
   warnings: readonly string[];
+  /** D-16: hasta cuándo se le guarda el lugar si no paga; nulo si está incluida o ya se pagó. */
+  holdUntil: Date | null;
+  /** D-16: el cobro hecho en el momento de apartar, si lo hubo. */
+  paymentId: string | null;
 };
+
+/** El cobro en el momento de apartar una clase suelta (D-16): quién cobra y cómo. Solo desde el mostrador. */
+export type CobroAlApartar = { ctx: RequestContext; payment: { method: 'CASH' | 'CARD_TERMINAL' | 'SPEI_TRANSFER'; cashSessionId?: string | null; externalRef?: string | null } };
 
 export class ClassService {
   /**
@@ -210,6 +221,8 @@ export class ClassService {
     input: {
       scheduleId: string; memberId: string;
       source: 'PORTAL' | 'FRONT_DESK'; bookedByUserId?: string | null;
+      /** D-16: cobrar la clase suelta en el momento (obligatorio si debe su mensualidad o falta menos de una hora). */
+      cobro?: CobroAlApartar | null;
     },
     now = new Date(),
   ): Promise<BookingResult> {
@@ -223,6 +236,25 @@ export class ClassService {
 
     const { decision } = await this.evaluate(orgId, input.memberId, schedule, now);
     if (decision.outcome === 'DENY') throw conflict(await this.porQueNo(orgId, input.memberId, schedule, decision.reason, now));
+
+    // D-16 (b): una clase suelta se aparta sin pagar y se guarda hasta una hora antes. Quien debe su
+    // mensualidad, o quien aparta con menos de una hora, solo la aparta PAGÁNDOLA en el momento. Se
+    // decide ANTES de tomar la plaza: no se le quita el lugar a nadie para decir que no después.
+    let holdUntil: Date | null = null;
+    let pago: CobroAlApartar['payment'] | null = null;
+    if (decision.requiresPayment) {
+      const apartado = apartadoDeClaseSuelta({ startsAt: schedule.startsAt, now, debeSuMensualidad: await this.debeSuMensualidad(orgId, input.memberId, schedule.branchId, now) });
+      if (input.cobro) {
+        // Paga ahora: la caja se resuelve antes de tocar nada («no hay caja abierta» sale aquí).
+        pago = await new BillingService().cobroValidado(input.cobro.ctx, schedule.branchId, input.cobro.payment) as CobroAlApartar['payment'];
+      } else if (apartado.outcome === 'PAY_NOW') {
+        throw apartado.porQue === 'OWES_MEMBERSHIP'
+          ? conflict('Debe su mensualidad: una clase suelta solo se aparta pagándola en el momento, en recepción', 'CLASS_PAY_NOW')
+          : conflict('Falta menos de una hora para la clase: ya no se aparta sin pagar. Se paga en recepción al llegar', 'CLASS_HOLD_CLOSED');
+      } else {
+        holdUntil = apartado.holdUntil;
+      }
+    }
 
     const booking = await repo.book({
       scheduleId: schedule.id,
@@ -238,6 +270,7 @@ export class ClassService {
     if (booking === 'DUPLICATE') throw conflict(denialMessage('ALREADY_BOOKED'));
 
     let chargeId: string | null = null;
+    let paymentId: string | null = null;
     if (decision.requiresPayment) {
       try {
         const type = await repo.findType(schedule.classTypeId);
@@ -256,7 +289,20 @@ export class ClassService {
           createdByUserId: input.bookedByUserId ?? null,
         });
         chargeId = charge.id;
-        await repo.attachCharge(booking.id, charge.id);
+        await repo.attachCharge(booking.id, charge.id, holdUntil);
+        // D-16: si se cobra en el momento, el cobro va directo al cargo de la clase, con su llave.
+        if (pago && input.cobro) {
+          try {
+            const p = await new BillingService().cobrarAhora(input.cobro.ctx, {
+              memberId: input.memberId, branchId: schedule.branchId, charges: [charge], key: `class-booking-pay:${booking.id}`,
+            }, pago);
+            paymentId = p?.id ?? null;
+          } catch (error) {
+            // Sin cobro no hay lugar ni deuda: se anula el cargo recién emitido (la plaza la devuelve el `catch` de afuera).
+            await new ChargeRepository(orgId).voidCharge(charge.id, 'No se pudo cobrar al apartar la clase');
+            throw error;
+          }
+        }
       } catch (error) {
         await repo.cancelBooking(booking.id, false);
         throw error;
@@ -268,11 +314,66 @@ export class ClassService {
     }
 
     return {
-      booking,
+      booking: { ...booking, chargeId, holdUntil },
       chargeId,
       priceCents: decision.priceCents,
       warnings: decision.warnings,
+      holdUntil,
+      paymentId,
     };
+  }
+
+  /**
+   * ¿Debe su mensualidad? (D-16): tiene una cuota o una inscripción de su
+   * membresía con saldo y ya exigible (vence hoy o antes, en la fecha de
+   * negocio de esa sede). Una cuota de un periodo que aún no empieza no cuenta.
+   */
+  async debeSuMensualidad(orgId: string, memberId: string, branchId: string, now = new Date()): Promise<boolean> {
+    const hoy = await new BusinessCalendar(orgId).today(branchId, now);
+    return (await new ChargeRepository(orgId).listOutstanding(memberId)).some((c) =>
+      (c.chargeType === 'MEMBERSHIP_PERIOD' || c.chargeType === 'SIGNUP_FEE')
+      && c.amountCents - c.allocatedCents - c.adjustedCents > 0n
+      && c.dueDate.getTime() <= hoy.getTime());
+  }
+
+  /**
+   * D-16 (b): LIBERA los lugares apartados sin pagar cuya hora ya pasó (una
+   * hora antes de la clase). El lugar vuelve al cupo, su cargo se anula (no
+   * debe nada) y NO cuenta como falta. Lo que ya se pagó deja de ser un
+   * apartado y se queda. Corre cada 15 minutos; repetirlo no hace nada.
+   */
+  async releaseUnpaidHolds(orgId: string, now = new Date(), limit = 200): Promise<{ released: number; kept: number; truncated: boolean }> {
+    const repo = new ClassRepository(orgId);
+    const cargos = new ChargeRepository(orgId);
+    const audit = new AuditService();
+    const ctx = systemContext(orgId);
+    const vencidos = (await repo.holdsDue(now, limit)).filter((b) => apartadoVencido(b.holdUntil, now));
+    let released = 0;
+    let kept = 0;
+    for (const b of vencidos) {
+      const cargo = b.chargeId ? await cargos.findById(b.chargeId) : null;
+      const falta = cargo ? cargo.amountCents - cargo.allocatedCents - cargo.adjustedCents : 0n;
+      // Ya pagada (o perdonada, o con un abono): se queda con su lugar; lo que falte se le cobra al pasar lista.
+      if (!cargo || cargo.status === 'VOID' || falta <= 0n || cargo.allocatedCents > 0n || b.checkedInAt) {
+        await repo.clearHold(b.id);
+        kept += 1;
+        continue;
+      }
+      await enUnidadDeDinero(orgId, async () => {
+        const cancelada = await repo.cancelBooking(b.id, false);
+        if (!cancelada) return;
+        await cargos.voidCharge(cargo.id, 'Clase apartada sin pagar: el lugar se liberó una hora antes');
+        await repo.clearHold(b.id);
+        await audit.record(ctx, {
+          action: 'class.booking.release', resourceType: 'class_booking', resourceId: b.id, branchId: b.branchId,
+          afterState: { memberId: b.memberId, chargeId: cargo.id, amountCents: falta.toString(), holdUntil: b.holdUntil?.toISOString() ?? null },
+          reason: 'Apartada sin pagar: se guardó hasta una hora antes de la clase',
+        });
+        await new BillingService().refreshCachedBalance(orgId, b.memberId);
+        released += 1;
+      });
+    }
+    return { released, kept, truncated: vencidos.length === limit };
   }
 
   /**
@@ -284,11 +385,19 @@ export class ClassService {
     if (!schedule) throw notFound('Clase no encontrada');
     const { decision } = await this.evaluate(orgId, memberId, schedule, now);
     const reason = decision.outcome === 'DENY' ? await this.porQueNo(orgId, memberId, schedule, decision.reason, now) : null;
+    // D-16: si la clase se paga aparte, ¿se le puede guardar sin pagar (y hasta cuándo) o solo pagando ahora?
+    const apartado = decision.outcome === 'ALLOW' && decision.requiresPayment
+      ? apartadoDeClaseSuelta({ startsAt: schedule.startsAt, now, debeSuMensualidad: await this.debeSuMensualidad(orgId, memberId, schedule.branchId, now) })
+      : null;
+    const d16 = {
+      payNow: apartado?.outcome === 'PAY_NOW' ? apartado.porQue : null,
+      holdUntil: apartado?.outcome === 'HOLD' ? apartado.holdUntil : null,
+    };
     return decision.outcome === 'ALLOW'
       ? { canBook: true, reason: null, requiresPayment: decision.requiresPayment, priceCents: decision.requiresPayment ? decision.priceCents : 0n,
           // Sin plan que la cubra: clase suelta, entra solo a esa clase (2026-10-09).
-          dropInOnly: decision.warnings.includes('DROP_IN_ONLY') }
-      : { canBook: false, reason, requiresPayment: false, priceCents: 0n, dropInOnly: false };
+          dropInOnly: decision.warnings.includes('DROP_IN_ONLY'), ...d16 }
+      : { canBook: false, reason, requiresPayment: false, priceCents: 0n, dropInOnly: false, ...d16 };
   }
 
   /**
@@ -341,9 +450,12 @@ export class ClassService {
     // reembolso o crédito lo decide recepción, que queda avisada.
     let chargeVoided = false;
     let paidChargeKept = false;
-    if (decision.outcome === 'ALLOW' && decision.voidsCharge && booking.chargeId) {
+    // D-16 (bloque 3.5): un lugar APARTADO sin pagar no deja deuda, se cancele cuando se cancele:
+    // si no venir no le costaba nada (se liberaba solo una hora antes), avisar tampoco.
+    const apartadoSinPagar = booking.holdUntil !== null;
+    if (((decision.outcome === 'ALLOW' && decision.voidsCharge) || apartadoSinPagar) && booking.chargeId) {
       chargeVoided = (await new ChargeRepository(orgId).voidCharge(
-        booking.chargeId, 'Cancelación de clase dentro del plazo',
+        booking.chargeId, apartadoSinPagar && late ? 'Clase apartada sin pagar, cancelada: no deja deuda' : 'Cancelación de clase dentro del plazo',
       )) !== null;
       paidChargeKept = !chargeVoided;
       // Anulado el cargo, el saldo cacheado del socio baja en el momento (D3).

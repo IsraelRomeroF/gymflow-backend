@@ -41,7 +41,8 @@ const createMemberSchema = z.object({
   responsible: responsibleSchema.optional(),
   /** D-10: es menor y su tutor firma aquí, en el mostrador; la aceptación queda a nombre del tutor. */
   guardian: guardianSchema.optional(),
-  // (D-29, bloque 3.8: aquí irá `coachUserId`, el coach que recepción elige al alta.)
+  /** D-29: el coach que recepción elige al alta. Después solo lo cambia la gerencia (`PUT /members/:id/coach`). */
+  coachUserId: z.string().uuid().nullish(),
   // D-11: «celular o correo» lo exige la pantalla («Nuevo socio» no deja dar de alta sin uno). La API no lo
   // rechaza todavía: la importación y varias pruebas de otros módulos crean socios sin contacto (pendientes/3.4.md).
 });
@@ -77,6 +78,7 @@ export async function altaEnMostrador(ctx: RequestContext, body: CuerpoDeAlta, s
     consents: body.consents,
     ...(body.force === undefined ? {} : { force: body.force }),
     responsible: body.responsible, guardian: body.guardian,
+    coachUserId: body.coachUserId ?? null,
   });
 }
 

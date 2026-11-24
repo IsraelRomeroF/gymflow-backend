@@ -4,6 +4,7 @@ import {
   makeApp, loginAs, orgFixtures, nombreUnico, telefonoUnico, sedeDesechable, archivarSede, CONSENTIMIENTOS,
 } from './helpers.js';
 import { closeDb, getDb } from '../src/platform/db/client.js';
+import { activarSinCobro, altaSinCobro } from './membresia-de-prueba.js';
 
 const db = () => getDb();
 const sello = () => Date.now().toString(36).slice(-5) + Math.random().toString(36).slice(2, 4);
@@ -28,13 +29,8 @@ describe('pantalla de excepción y retención', () => {
     expect(alta.statusCode, alta.body).toBe(201);
     const memberId = alta.json().id as string;
 
-    const mem = await app.inject({
-      method: 'POST', url: `/members/${memberId}/memberships`, headers: { cookie: owner },
-      payload: { reason: 'Fixture de prueba', planId, soldAtBranchId: branchId },
-    });
-    await app.inject({
-      method: 'POST', url: `/memberships/${mem.json().id}/activate`, headers: { cookie: owner }, payload: { reason: 'Fixture de prueba' },
-    });
+    const mem = await altaSinCobro(app, owner, memberId, { reason: 'Fixture de prueba', planId, soldAtBranchId: branchId });
+    await activarSinCobro(app, owner, mem.json().id);
     await db().membership.update({ where: { id: mem.json().id }, data: { status: 'PAST_DUE' } });
 
     await app.inject({
@@ -239,14 +235,9 @@ describe('pantalla de excepción y retención', () => {
       });
       expect(alta.statusCode, alta.body).toBe(201);
       const memberId = alta.json().id as string;
-      const mem = await app.inject({
-        method: 'POST', url: `/members/${memberId}/memberships`, headers: { cookie: owner },
-        payload: { reason: 'Fixture de prueba', planId, soldAtBranchId: branchId },
-      });
+      const mem = await altaSinCobro(app, owner, memberId, { reason: 'Fixture de prueba', planId, soldAtBranchId: branchId });
       expect(mem.statusCode, mem.body).toBe(201);
-      const activa = await app.inject({
-        method: 'POST', url: `/memberships/${mem.json().id}/activate`, headers: { cookie: owner }, payload: { reason: 'Fixture de prueba' },
-      });
+      const activa = await activarSinCobro(app, owner, mem.json().id);
       expect(activa.statusCode, activa.body).toBe(200);
       // Se inscribió hace 30 días y no ha venido nunca.
       await db().member.update({

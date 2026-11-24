@@ -231,7 +231,7 @@ const closeArchivedMembers: JobHandler = (organizationId) =>
         payload: { motivo: 'Cierre automático: el socio está archivado' },
         businessDate: day,
       });
-      await emitMembershipClosed({ organizationId, membershipId: membership.id, memberId: (await repo.findById(membership.id))!.memberId, outcome: 'CANCELED', reason: 'El socio fue archivado' });
+      await emitMembershipClosed({ organizationId, membershipId: membership.id, memberId: (await repo.findById(membership.id))!.memberId, outcome: 'CANCELED', reason: 'El socio fue archivado', fromStatus: membership.status, actorUserId: null });
       return true;
     });
 
@@ -255,7 +255,7 @@ export const expirePendingSales: JobHandler = (organizationId) =>
         data: { canceledAt: new Date(), endedAt: new Date(), cancellationReason: motivo },
         reason: motivo, payload: { motivo: 'Cierre automático: nunca se cobró' }, businessDate: day,
       });
-      await emitMembershipClosed({ organizationId, membershipId: membership.id, memberId: (await repo.findById(membership.id))!.memberId, outcome: 'CANCELED', reason: motivo });
+      await emitMembershipClosed({ organizationId, membershipId: membership.id, memberId: (await repo.findById(membership.id))!.memberId, outcome: 'CANCELED', reason: motivo, fromStatus: membership.status, actorUserId: null });
       return true;
     });
 
@@ -272,7 +272,7 @@ export const expireSuspended: JobHandler = (organizationId) =>
         data: { endedAt: new Date() },
         reason: `${DIAS_VENTANA_RECUPERACION} días suspendida sin pagar`, payload: { motivo: 'Ventana de recuperación agotada' }, businessDate: day,
       });
-      await emitMembershipClosed({ organizationId, membershipId: membership.id, memberId: (await repo.findById(membership.id))!.memberId, outcome: 'EXPIRED', reason: 'Ventana de recuperación agotada' });
+      await emitMembershipClosed({ organizationId, membershipId: membership.id, memberId: (await repo.findById(membership.id))!.memberId, outcome: 'EXPIRED', reason: 'Ventana de recuperación agotada', fromStatus: membership.status, actorUserId: null });
       return true;
     });
 

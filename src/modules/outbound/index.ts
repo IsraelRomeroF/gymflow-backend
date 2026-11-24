@@ -24,5 +24,9 @@ export { OUTBOUND_JOBS } from './outbound.jobs.js';
 export { OutboundService } from './outbound.service.js';
 export type { AlcanceDeMensajes } from './outbound.repository.js';
 
+// Consumida por: privacy. Al anonimizar a un exsocio, el texto de los mensajes
+// que ya se le mandaron deja de traer su nombre (fase 3, bloque 3.10).
+export { olvidarTextosDeMensajes } from './outbound.service.js';
+
 // D-19 (bloque 3.6): al cambiar el precio de un plan, arma el aviso al teléfono de cada socio tocado.
 export { registerOutboundHooks } from './hooks.js';

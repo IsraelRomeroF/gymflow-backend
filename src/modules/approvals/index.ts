@@ -3,7 +3,9 @@
  * firma teclea su contraseña) y a distancia (quien opera la pide y quien puede
  * la da desde su teléfono).
  *
- * Tablas propias: `approval_grants`, `approval_requests`, `approval_signer_locks`.
+ * Tablas propias: `approval_grants`, `approval_requests`, `approval_signer_locks`
+ * y `approval_proxies` (el apoderado temporal, D-02; `identity` solo la lee al
+ * resolver la sesión, para saber si la persona ve Autorizaciones).
  *
  * Nació en la auditoría 8 (fase 1, bloque 1.7; A4 «Se mueve») con lo que
  * vivía en `identity`, donde la identidad y la firma compartían archivo.

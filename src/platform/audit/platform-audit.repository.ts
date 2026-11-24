@@ -64,6 +64,9 @@ export type PlatformAuditEntry = {
   organizationAuditId: string | null; hash: string;
 };
 
+/** Dónde va la verificación: el último eslabón revisado. */
+export type PlatformChainCursor = { at: Date; id: string; chainSeq: number | null };
+
 export type PlatformChainVerification =
   | { readonly ok: true; readonly checked: number; readonly lastHash: string | null }
   | { readonly ok: false; readonly checked: number; readonly brokenAtId: string; readonly reason: string };
@@ -105,7 +108,12 @@ export function platformActorOf(afterState: unknown): string | null {
  */
 export async function appendToPlatformChain(tx: Prisma.TransactionClient, entry: PlatformAuditWrite): Promise<{ id: string; hash: string }> {
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended('gymflow-platform-audit', 42))`;
-  const tip = await tx.platformAuditLog.findFirst({ orderBy: [{ at: 'desc' }, { id: 'desc' }], select: { hash: true } });
+  // La punta es el eslabón con el número más alto, no «el más tardío» (3.12):
+  // la cadena no depende de que el reloj del servidor nunca retroceda. Lo
+  // asentado antes de `chainSeq` busca su punta como antes, por (at, id).
+  const tip = (await tx.platformAuditLog.findFirst({ where: { chainSeq: { not: null } }, orderBy: { chainSeq: 'desc' }, select: { hash: true, chainSeq: true } }))
+    ?? (await tx.platformAuditLog.findFirst({ orderBy: [{ at: 'desc' }, { id: 'desc' }], select: { hash: true, chainSeq: true } }));
+  const chainSeq = (tip?.chainSeq ?? 0) + 1;
   const id = uuidv7();
   const at = new Date();
   const occurredAt = entry.occurredAt ?? at;
@@ -145,6 +153,7 @@ export async function appendToPlatformChain(tx: Prisma.TransactionClient, entry:
       requestId: entry.requestId ?? null,
       prevHash,
       hash,
+      chainSeq,
       occurredAt,
       at,
     },
@@ -158,15 +167,26 @@ export class PlatformAuditRepository extends GlobalRepository {
     return this.db.$transaction((tx) => appendToPlatformChain(tx, entry));
   }
 
-  /** Un tramo de la cadena en el orden en que se encadenó, después de `after`. */
-  async chainPage(after: { at: Date; id: string } | null, limit: number): Promise<Array<{ at: Date; prevHash: string | null; hash: string; content: PlatformAuditContent }>> {
-    const rows = await this.db.platformAuditLog.findMany({
-      where: after ? { OR: [{ at: { gt: after.at } }, { at: after.at, id: { gt: after.id } }] } : {},
+  /**
+   * Un tramo de la cadena en el orden en que se encadenó, después de `after`:
+   * primero lo anterior a `chainSeq` (sin número) por (at, id), como siempre
+   * se verificó; después lo numerado, por su número (3.12).
+   */
+  async chainPage(after: PlatformChainCursor | null, limit: number): Promise<Array<{ at: Date; chainSeq: number | null; prevHash: string | null; hash: string; content: PlatformAuditContent }>> {
+    const anteriores = after && after.chainSeq !== null ? [] : await this.db.platformAuditLog.findMany({
+      where: { chainSeq: null, ...(after ? { OR: [{ at: { gt: after.at } }, { at: after.at, id: { gt: after.id } }] } : {}) },
       orderBy: [{ at: 'asc' }, { id: 'asc' }],
       take: limit,
     });
+    const numerados = anteriores.length >= limit ? [] : await this.db.platformAuditLog.findMany({
+      where: { chainSeq: after && after.chainSeq !== null ? { gt: after.chainSeq } : { not: null } },
+      orderBy: { chainSeq: 'asc' },
+      take: limit - anteriores.length,
+    });
+    const rows = [...anteriores, ...numerados];
     return rows.map((row) => ({
       at: row.at,
+      chainSeq: row.chainSeq,
       prevHash: row.prevHash,
       hash: row.hash,
       content: {

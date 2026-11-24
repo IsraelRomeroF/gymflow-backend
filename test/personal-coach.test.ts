@@ -110,18 +110,18 @@ describe('personal a la medida y coach con sus socios', () => {
 
   it('el coach ve solo a sus socios asignados, Rutinas y Clases', async () => {
     const recepcion = await loginAs(app, correo('recepcion'));
-    const socio = async () => (await app.inject({ method: 'POST', url: '/members', headers: { cookie: recepcion },
-      payload: { firstName: nombreUnico('Suyo'), lastName: nombreUnico('Socio'), phoneE164: telefonoUnico(), homeBranchId: sede, consents: CONSENTIMIENTOS } })).json() as { id: string; firstName: string };
-    const suyo = await socio();
-    const ajeno = await socio();
     const coachId = await idDe(correo('coach'));
+    // D-29: recepción elige el coach AL ALTA; después ya no lo cambia.
+    const alta = (coachUserId?: string) => app.inject({ method: 'POST', url: '/members', headers: { cookie: recepcion },
+      payload: { firstName: nombreUnico('Suyo'), lastName: nombreUnico('Socio'), phoneE164: telefonoUnico(), homeBranchId: sede, consents: CONSENTIMIENTOS, ...(coachUserId ? { coachUserId } : {}) } });
+    const suyo = (await alta(coachId)).json() as { id: string; firstName: string };
+    const ajeno = (await alta()).json() as { id: string; firstName: string };
+    expect((await alta(await idDe(correo('recepcion')))).statusCode).toBe(422);
 
     const coaches = (await app.inject({ method: 'GET', url: '/members/coaches', headers: { cookie: recepcion } })).json().coaches;
     expect(coaches.map((c: { id: string }) => c.id)).toContain(coachId);
-    const asignar = await app.inject({ method: 'PUT', url: `/members/${suyo.id}/coach`, headers: { cookie: recepcion }, payload: { coachUserId: coachId } });
-    expect(asignar.statusCode, asignar.body).toBe(200);
-    const noCoach = await app.inject({ method: 'PUT', url: `/members/${ajeno.id}/coach`, headers: { cookie: recepcion }, payload: { coachUserId: await idDe(correo('recepcion')) } });
-    expect(noCoach.statusCode).toBe(422);
+    const asignar = await app.inject({ method: 'PUT', url: `/members/${ajeno.id}/coach`, headers: { cookie: recepcion }, payload: { coachUserId: coachId } });
+    expect(asignar.statusCode, asignar.body).toBe(403);
 
     const coach = await loginAs(app, correo('coach'));
     const permisos = (await yo(coach)).permissions as string[];
@@ -137,8 +137,8 @@ describe('personal a la medida y coach con sus socios', () => {
     expect((await app.inject({ method: 'GET', url: `/members/access-summary?ids=${suyo.id}`, headers: { cookie: coach } })).statusCode).toBe(200);
     expect((await app.inject({ method: 'GET', url: '/routines', headers: { cookie: coach } })).statusCode).toBe(200);
 
-    // Sin coach asignado, deja de verlo.
-    await app.inject({ method: 'PUT', url: `/members/${suyo.id}/coach`, headers: { cookie: recepcion }, payload: { coachUserId: null } });
+    // Sin coach asignado, deja de verlo (este gimnasio no tiene gerente que lo quite: se quita en la base).
+    await getDb().member.update({ where: { id: suyo.id }, data: { coachUserId: null } });
     expect((await app.inject({ method: 'GET', url: `/members/${suyo.id}`, headers: { cookie: coach } })).statusCode).toBe(404);
   });
 
@@ -150,10 +150,12 @@ describe('personal a la medida y coach con sus socios', () => {
       expect(r.statusCode, add).toBe(422);
       expect(r.json().message).toMatch(/A Coach no se le ajusta/);
     }
-    // Lo de su trabajo sí: este coach no arma el horario.
-    const bien = await app.inject({ method: 'PUT', url: `/users/${coachId}/permissions`, headers: { cookie: dueno }, payload: { remove: ['classes:manage'], reason: 'No arma el horario' } });
+    // Lo de su trabajo sí: a este coach se le da armar el horario (D-28: ya no viene con el puesto) y se le quita reservar por el socio.
+    const bien = await app.inject({ method: 'PUT', url: `/users/${coachId}/permissions`, headers: { cookie: dueno }, payload: { add: ['classes:manage'], remove: ['classes:book_for_member'], reason: 'Arma el horario' } });
     expect(bien.statusCode, bien.body).toBe(200);
-    expect(bien.json().permissionOverrides).toEqual({ add: [], remove: ['classes:manage'] });
+    expect(bien.json().permissionOverrides).toEqual({ add: ['classes:manage'], remove: ['classes:book_for_member'] });
+    // Cancelar clases no se le enciende a nadie por persona (D-28).
+    expect((await app.inject({ method: 'PUT', url: `/users/${coachId}/permissions`, headers: { cookie: dueno }, payload: { add: ['classes:session:cancel'], reason: 'Prueba' } })).statusCode).toBe(422);
     // El catálogo dice qué se le ajusta a cada puesto: el panel solo muestra eso.
     const cat = (await app.inject({ method: 'GET', url: '/users/adjustable-permissions', headers: { cookie: dueno } })).json();
     const delCoach = cat.roles.find((r: { key: string }) => r.key === 'COACH').adjustable as string[];
@@ -161,12 +163,13 @@ describe('personal a la medida y coach con sus socios', () => {
     expect(delCoach).not.toContain('cash:session:open');
     expect(cat.roles.find((r: { key: string }) => r.key === 'RECEPTION').adjustable).toContain('cash:withdraw');
     // Un ajuste viejo que quedó guardado (de antes de la regla) ya no le da caja ni venta.
-    await getDb().user.update({ where: { id: coachId }, data: { permissionOverrides: { add: ['cash:session:open', 'pos:sale:create'], remove: ['classes:manage'] } } });
+    await getDb().user.update({ where: { id: coachId }, data: { permissionOverrides: { add: ['cash:session:open', 'pos:sale:create'], remove: ['classes:book_for_member'] } } });
     const permisos = (await yo(await loginAs(app, correo('coach')))).permissions as string[];
     expect(permisos).not.toContain('cash:session:open');
     expect(permisos).not.toContain('pos:sale:create');
+    expect(permisos).not.toContain('classes:book_for_member');
     expect(permisos).not.toContain('classes:manage');
-    expect((await app.inject({ method: 'GET', url: `/users/${coachId}`, headers: { cookie: dueno } })).json().permissionOverrides).toEqual({ add: [], remove: ['classes:manage'] });
+    expect((await app.inject({ method: 'GET', url: `/users/${coachId}`, headers: { cookie: dueno } })).json().permissionOverrides).toEqual({ add: [], remove: ['classes:book_for_member'] });
   });
 
   it('cambiar de puesto borra las excepciones y lo deja en la bitácora (17-03)', async () => {

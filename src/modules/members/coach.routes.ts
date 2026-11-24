@@ -1,6 +1,9 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { notFound, validation } from '@gymflow/core';
+import { notFound } from '@gymflow/core';
+import { CoachOptions, MemberCoachSet } from '@gymflow/core/contracts';
+import { respuesta } from '../../platform/http/respuesta.js';
+import { exigirCoachActivo } from './coach-valido.js';
 import { route } from '../../platform/http/registry.js';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { MemberRepository } from './member.repository.js';
@@ -12,13 +15,14 @@ export function registerCoachRoutes(app: FastifyInstance): void {
 
   /**
    * Los coaches del gimnasio, para elegir el de un socio. Lo ve quien inscribe
-   * (gerencia y recepción).
+   * (gerencia y recepción): recepción lo elige al dar de alta (D-29).
    */
   route(app, {
     method: 'GET',
     url: '/members/coaches',
     security: { kind: 'permission', permission: 'members:create' },
-    handler: async (request) => {
+    schema: respuesta(200, CoachOptions),
+    handler: async (request): Promise<CoachOptions> => {
       const { StaffRepository } = await import('../identity/index.js');
       const gente = await new StaffRepository(request.ctx!.tenant.organizationId).list();
       return {
@@ -29,30 +33,29 @@ export function registerCoachRoutes(app: FastifyInstance): void {
   });
 
   /**
-   * COACH ASIGNADO (2026-10-09): el coach ve solo a sus socios. Lo asigna
-   * quien inscribe (gerencia o recepción) desde la ficha; null lo quita y
-   * entonces cuenta quien le asignó la rutina vigente.
+   * EL COACH DE UN SOCIO (2026-10-09; D-29, fase 3). Recepción lo elige AL
+   * ALTA (`POST /members`, o al aprobar un alta digital). Después lo pone, lo
+   * cambia o lo quita (`null`) solo la gerencia: pasar socios de un coach a
+   * otro es reasignar clientes. El coach se suma a un socio sin coach con el
+   * código que el socio le dicta (`POST /coach/claim`).
    */
   route(app, {
     method: 'PUT',
     url: '/members/:id/coach',
-    security: { kind: 'permission', permission: 'members:create' },
-    handler: async (request) => {
+    security: { kind: 'permission', permission: 'members:coach:assign' },
+    schema: respuesta(200, MemberCoachSet),
+    handler: async (request): Promise<MemberCoachSet> => {
       const ctx = request.ctx!;
       const { id } = idParam.parse(request.params);
       const body = z.object({ coachUserId: z.string().uuid().nullable() }).parse(request.body);
       const repo = new MemberRepository(ctx.tenant.organizationId);
       const member = await repo.findById(id);
       if (!member) throw notFound('Socio no encontrado');
-      request.authorize('members:create', { branchId: member.homeBranchId });
-      if (body.coachUserId) {
-        const { StaffRepository } = await import('../identity/index.js');
-        const coach = await new StaffRepository(ctx.tenant.organizationId).find(body.coachUserId);
-        if (!coach || !coach.isActive || !coach.assignments.some((a) => a.roleKey === 'COACH')) throw validation('Esa persona no es coach activo del gimnasio');
-      }
+      request.authorize('members:coach:assign', { branchId: member.homeBranchId });
+      if (body.coachUserId) await exigirCoachActivo(ctx.tenant.organizationId, body.coachUserId);
       const antes = await repo.coachOf(id);
       await repo.setCoach(id, body.coachUserId);
-      await audit.record(ctx, { action: 'member.coach', resourceType: 'Member', resourceId: id, beforeState: { coachUserId: antes }, afterState: { coachUserId: body.coachUserId } });
+      await audit.record(ctx, { action: 'member.coach', resourceType: 'Member', resourceId: id, branchId: member.homeBranchId, beforeState: { coachUserId: antes }, afterState: { coachUserId: body.coachUserId } });
       return { coachUserId: body.coachUserId };
     },
   });

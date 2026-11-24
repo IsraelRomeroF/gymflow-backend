@@ -5,6 +5,7 @@ import { makeApp, loginAs, orgFixtures, nombreUnico, aprobacion, PASSWORD } from
 import { closeDb, getDb } from '../src/platform/db/client.js';
 import { getPaymentProvider } from '../src/modules/payments/provider/index.js';
 import { SandboxPaymentProvider } from '../src/modules/payments/provider/sandbox.provider.js';
+import { activarSinCobro, altaSinCobro } from './membresia-de-prueba.js';
 
 /**
  * DOMICILIACIÓN.
@@ -302,12 +303,9 @@ describe('domiciliación', () => {
     const memberId = await crearSocio();
     const planes = (await app.inject({ method: 'GET', url: '/plans', headers: { cookie } })).json();
     const plan = planes.find((p: { code: string }) => p.code === 'MEN');
-    const mem = await app.inject({
-      method: 'POST', url: `/members/${memberId}/memberships`, headers: { cookie },
-      payload: { reason: 'Fixture de prueba', planId: plan.id, soldAtBranchId: branchId },
-    });
+    const mem = await altaSinCobro(app, cookie, memberId, { reason: 'Fixture de prueba', planId: plan.id, soldAtBranchId: branchId });
     expect(mem.statusCode, mem.body).toBe(201);
-    await app.inject({ method: 'POST', url: `/memberships/${mem.json().id}/activate`, headers: { cookie }, payload: { reason: 'Fixture de prueba' } });
+    await activarSinCobro(app, cookie, mem.json().id);
     const cargo = await app.inject({ method: 'POST', url: `/memberships/${mem.json().id}/period-charge`, headers: { cookie } });
     expect(cargo.statusCode, cargo.body).toBe(201);
     // Como la deja el job: suspendida con la gracia que se le venció.
