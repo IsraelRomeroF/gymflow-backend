@@ -97,7 +97,7 @@ export class HomeRepository extends TenantRepository {
              JOIN "roles" r ON r."id" = ra."roleId" AND r."key" = 'COACH'
              JOIN "users" u ON u."id" = ra."userId" AND u."isActive" AND u."deletedAt" IS NULL
             WHERE ra."organizationId" = ${this.organizationId}::uuid AND ra."revokedAt" IS NULL)
-       ORDER BY m."createdAt" DESC
+       ORDER BY m."createdAt" DESC, m."id" DESC
        LIMIT 4`;
     return { total: filas[0]?.total ?? 0, nombres: filas.map((f) => f.nombre) };
   }

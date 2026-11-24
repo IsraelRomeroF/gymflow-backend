@@ -52,6 +52,8 @@ describe('inicio · socios nuevos sin coach (D-29, 3.16)', () => {
     const db = getDb();
     const coachId = (await db.user.findFirstOrThrow({ where: { email: await cuentaDePrueba(g.organizationId, 'COACH', [sede]) } })).id;
     const nuevos = [await socioPropio(g), await socioPropio(g), await socioPropio(g), await socioPropio(g), await socioPropio(g)];
+    // Cada uno un segundo más nuevo que el anterior: en CI cinco altas seguidas caen en el mismo milisegundo.
+    for (const [i, id] of nuevos.entries()) await db.member.update({ where: { id }, data: { createdAt: new Date(Date.now() - (nuevos.length - i) * 1000) } });
     // Uno de hace ocho días y una baja: ninguno cuenta.
     const viejo = await socioPropio(g);
     await db.member.update({ where: { id: viejo }, data: { createdAt: new Date(Date.now() - 8 * 86_400_000) } });
