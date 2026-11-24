@@ -336,6 +336,12 @@ describe('alta de marcas desde la plataforma', () => {
     expect(sinSede.statusCode).toBe(422);
     const duenaAcotada = await app.inject({ method: 'POST', url: `/platform/organizations/${orgId}/users`, headers: { cookie: plataforma }, payload: { fullName: 'Dora Duena Dos', email: correo('duenados'), roleKey: 'OWNER', branchIds: [sede], reason: 'x' } });
     expect(duenaAcotada.statusCode).toBe(422);
+    // Un solo dueño por gimnasio (D-02, 22-10): la marca nació con el suyo.
+    const correoSegundo = correo('duenatres');
+    const segundoDueno = await app.inject({ method: 'POST', url: `/platform/organizations/${orgId}/users`, headers: { cookie: plataforma }, payload: { fullName: 'Dora Duena Tres', email: correoSegundo, roleKey: 'OWNER', branchIds: null, reason: 'Otro socio del negocio' } });
+    expect(segundoDueno.statusCode, segundoDueno.body).toBe(409);
+    expect(segundoDueno.json().message).toMatch(/ya tiene dueño \(.+\) y solo puede haber uno/);
+    expect(await getDb().user.count({ where: { email: correoSegundo } })).toBe(0);
     const plataformaNo = await app.inject({ method: 'POST', url: `/platform/organizations/${orgId}/users`, headers: { cookie: plataforma }, payload: { fullName: 'Sam Soporte', email: correo('soporte'), roleKey: 'SUPERADMIN', branchIds: null, reason: 'x' } });
     expect(plataformaNo.statusCode).toBe(422);
 

@@ -4,7 +4,7 @@ import { ApprovalApprovers, ApprovalHistory, ApprovalInbox, ApprovalProxyAppoint
 import {
   APPROVAL_PROXY_MAX_DAYS, approvalProxyActive, approvalProxyLastDay, auditCategoryOf, auditNeedsReview, auditPhrase, isoDate, businessDateIn, monthlyCloseResourceId,
 } from '@gymflow/core';
-import { makeApp, PASSWORD, loginAs } from './helpers.js';
+import { makeApp, PASSWORD, loginAs, aprobacion } from './helpers.js';
 import { closeDb, getDb } from '../src/platform/db/client.js';
 import { APPROVAL_JOBS } from '../src/modules/approvals/index.js';
 import { finDelDia } from '../src/modules/approvals/approval-proxy.service.js';
@@ -237,6 +237,17 @@ describe('firmas · D-02: apoderado temporal (bloque 3.1)', () => {
     const token = (await estado(pedida)).approvalToken!;
     const retiro = await post(`/cash-sessions/${turno}/movements`, { movementType: 'WITHDRAWAL', amountCents: '20000', reason: 'Corte de la tarde', approvalToken: token }, s.gerente);
     expect(retiro.statusCode, retiro.body).toBeLessThan(300);
+    // El asiento de la OPERACIÓN también lo dice (3.16): «· se autorizó como apoderado de …».
+    const delRetiro = (await db().auditLog.findMany({ where: { organizationId: g.organizationId, approvedByUserId: ids.gerente2, NOT: { action: { startsWith: 'approval.' } } }, orderBy: { id: 'asc' } })).at(-1)!;
+    expect(delRetiro.action).toMatch(/^cash\./);
+    expect(delRetiro.afterState).toMatchObject({ approvedAsProxy: true, approvedProxyId: nombramiento, approvedProxyOfUserId: g.ownerId, approvedProxyOfName: duena });
+    expect(auditPhrase({ action: delRetiro.action, afterState: delRetiro.afterState })).toMatch(new RegExp(` · se autorizó como apoderado de ${duena}$`));
+    // Lo que firma la dueña por su puesto no lleva la nota.
+    const firmaDeLaDuena = await aprobacion(app, s.gerente, 'cash:withdraw', g.correos.owner, sede().id, { resourceId: turno, amountCents: '10000' });
+    expect((await post(`/cash-sessions/${turno}/movements`, { movementType: 'WITHDRAWAL', amountCents: '10000', reason: 'Otro retiro', approvalToken: firmaDeLaDuena }, s.gerente)).statusCode).toBeLessThan(300);
+    const delSegundo = (await db().auditLog.findMany({ where: { organizationId: g.organizationId, approvedByUserId: g.ownerId, action: delRetiro.action }, orderBy: { id: 'asc' } })).at(-1)!;
+    expect((delSegundo.afterState as Record<string, unknown>).approvedAsProxy).toBeUndefined();
+    expect(auditPhrase({ action: delSegundo.action, afterState: delSegundo.afterState })).not.toMatch(/apoderado/);
 
     // En el mostrador: recepción pide y el apoderado teclea SU contraseña.
     const op = otroMes();

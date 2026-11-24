@@ -9,6 +9,8 @@ export type ApprovalGrantRecord = {
   resourceType: string | null;
   resourceId: string | null;
   amountCents: bigint | null;
+  /** D-02: el nombramiento con el que se firmó; null = firmó por su puesto. */
+  proxyId?: string | null;
 };
 
 /**
@@ -44,7 +46,7 @@ export class ApprovalGrantRepository extends TenantRepository {
     if (count === 0) return null;
     return this.db.approvalGrant.findFirstOrThrow({
       where: this.scope({ tokenHash }),
-      select: { id: true, approverUserId: true, branchId: true, resourceType: true, resourceId: true, amountCents: true },
+      select: { id: true, approverUserId: true, branchId: true, resourceType: true, resourceId: true, amountCents: true, proxyId: true },
     });
   }
 

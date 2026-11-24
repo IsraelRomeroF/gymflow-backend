@@ -91,17 +91,35 @@ export class AnalyticsRepository extends TenantRepository {
    * su línea al cobrarse (`unitCostCents`, bloque 3.6), por sucursal. Con las
    * mismas ventas que cuentan como ganadas (`accruedImmediate`). `sinCosto`:
    * piezas de productos sin costo registrado, cuyo costo no se puede restar.
+   *
+   * UNA VENTA DEVUELTA DEJA DE CONTAR SU COSTO (3.16): el producto volvió al
+   * estante. Igual que el importe devuelto en `accruedImmediate`, el costo se
+   * descuenta el día en que se DEVUELVE y en la sede de la devolución, no el
+   * día de la venta: así un mes ya cerrado no cambia (D-22). La devolución es
+   * de la venta entera (`pos_sale_returns.posSaleId` es único).
    */
   async costOfGoodsSold(from: Date, to: Date): Promise<Array<{ branchId: string | null; costCents: bigint; sinCosto: number }>> {
     return this.db.$queryRaw`
-      SELECT s."branchId",
-             COALESCE(SUM(l."unitCostCents" * l."quantity"), 0)::bigint AS "costCents",
-             COALESCE(SUM(l."quantity") FILTER (WHERE l."unitCostCents" IS NULL), 0)::int AS "sinCosto"
-      FROM "pos_sales" s JOIN "pos_sale_lines" l ON l."posSaleId" = s."id"
-      WHERE s."organizationId" = ${this.organizationId}::uuid
-        AND s."status" = 'COMPLETED'
-        AND s."businessDate" >= ${from}::date AND s."businessDate" < ${to}::date
-      GROUP BY s."branchId"`;
+      SELECT t."branchId",
+             COALESCE(SUM(t."costCents"), 0)::bigint AS "costCents",
+             GREATEST(COALESCE(SUM(t."sinCosto"), 0), 0)::int AS "sinCosto"
+      FROM (
+        SELECT s."branchId",
+               l."unitCostCents" * l."quantity" AS "costCents",
+               CASE WHEN l."unitCostCents" IS NULL THEN l."quantity" ELSE 0 END AS "sinCosto"
+        FROM "pos_sales" s JOIN "pos_sale_lines" l ON l."posSaleId" = s."id"
+        WHERE s."organizationId" = ${this.organizationId}::uuid
+          AND s."status" = 'COMPLETED'
+          AND s."businessDate" >= ${from}::date AND s."businessDate" < ${to}::date
+        UNION ALL
+        SELECT r."branchId",
+               -(l."unitCostCents" * l."quantity"),
+               CASE WHEN l."unitCostCents" IS NULL THEN -l."quantity" ELSE 0 END
+        FROM "pos_sale_returns" r JOIN "pos_sale_lines" l ON l."posSaleId" = r."posSaleId"
+        WHERE r."organizationId" = ${this.organizationId}::uuid
+          AND r."businessDate" >= ${from}::date AND r."businessDate" < ${to}::date
+      ) t
+      GROUP BY t."branchId"`;
   }
 
   /** Cuotas de periodo que SOLAPAN la ventana. El prorrateo lo hace el dominio. */

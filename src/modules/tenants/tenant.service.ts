@@ -7,7 +7,7 @@ import { AuditService } from '../../platform/audit/audit.service.js';
 import { systemContext } from '../../platform/jobs/types.js';
 import { forgetModules } from '../../platform/modules/module-state.js';
 import { ModuleStateRepository } from '../../platform/modules/module-state.repository.js';
-import { TenantRepository, type Cuenta } from './tenant.repository.js';
+import { TenantRepository, yaTieneDueno, type Cuenta } from './tenant.repository.js';
 import { validarPuesto } from '../../platform/roles/puestos.js';
 import { PlatformPlanRepository, type PlanDePlataforma } from './platform-plan.repository.js';
 import { hoyDeCobro } from './cobro-reglas.js';
@@ -227,10 +227,12 @@ export class TenantService {
     });
   }
 
-  /** Una cuenta más para la marca con cualquier puesto del catálogo (gerente, encargado, caja, coach, profesor, dueña), con contraseña temporal. */
+  /** Una cuenta más para la marca con cualquier puesto del catálogo (gerente, encargado, caja, coach, profesor), con contraseña temporal. Dueño, solo si la marca no tiene uno activo (D-02). */
   async agregarCuenta(organizationId: string, p: Persona & { roleKey: RoleKey; branchIds: string[] | null }, byUserId: string, reason: string): Promise<Credencial & { userId: string; sectionsUnlocked: boolean }> {
     validarPuesto(p.roleKey, p.branchIds);
     if (await this.repo.emailEnUso(p.email.toLowerCase())) throw conflict(`El correo ${p.email.toLowerCase()} ya tiene una cuenta`);
+    // Un solo dueño por gimnasio (D-02, 22-10); `addUser` lo vuelve a mirar con la marca bloqueada.
+    if (p.roleKey === 'OWNER') { const ya = await this.repo.duenoActivo(organizationId); if (ya) throw yaTieneDueno(ya.fullName); }
     if (p.branchIds) {
       const sedes = await this.repo.branchesOf(organizationId);
       for (const b of p.branchIds) if (!sedes.has(b)) throw validation('Una de las sucursales no es de esta marca');

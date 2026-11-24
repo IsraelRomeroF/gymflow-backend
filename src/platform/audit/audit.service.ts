@@ -3,6 +3,7 @@ import { AuditRepository, type AuditEntry, type AuditListOptions, type ChainCurs
 import type { RequestContext } from '../context.js';
 import { BusinessCalendar } from '../time/business-calendar.js';
 import { olvidarTableros } from '../cache.js';
+import { conFirmaDeApoderado, firmaDeApoderado } from './firma-de-apoderado.js';
 
 export type AuditInput = {
   action: string;
@@ -40,6 +41,9 @@ export class AuditService {
     olvidarTableros(ctx.tenant.organizationId);
     setTimeout(() => olvidarTableros(ctx.tenant.organizationId), 1_500).unref();
 
+    // D-02 (3.16): si la firma que autorizó esta operación fue de un apoderado, el asiento lo dice.
+    const apoderado = input.approvedByUserId ? firmaDeApoderado(ctx, input.approvedByUserId) : null;
+
     return this.repo.append({
       organizationId: ctx.tenant.organizationId,
       branchId,
@@ -49,7 +53,7 @@ export class AuditService {
       resourceType: input.resourceType,
       resourceId: input.resourceId ?? null,
       beforeState: input.beforeState,
-      afterState: input.afterState,
+      afterState: apoderado ? conFirmaDeApoderado(input.afterState, apoderado) : input.afterState,
       reason: input.reason ?? null,
       approvedByUserId: input.approvedByUserId ?? null,
       ip: ctx.ip ?? null,

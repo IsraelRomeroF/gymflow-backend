@@ -28,7 +28,8 @@ export function registerMembershipRoutes(app: FastifyInstance): void {
    * EL CAMINO SIN COBRO SE QUITÓ (D-12, auditoría 8, bloque 3.5). Aquí vivían
    * cinco rutas que movían una membresía sin cobrarla (`POST
    * /members/:id/memberships`, `/memberships/:id/activate`, `/renew`,
-   * `/change-plan` y `/reactivate`), con el permiso `memberships:override` y
+   * `/change-plan` y `/reactivate`), con el permiso `memberships:override`
+   * (retirado del catálogo en el bloque 3.16) y
    * un motivo: regalaban días sin decir cuánto se dejaba de cobrar. Una
    * cortesía o una corrección es ahora una venta, una renovación o un cambio
    * de plan por `billing` (que emite el cargo) más un descuento o una

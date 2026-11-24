@@ -31,12 +31,13 @@ const TEMA: Readonly<Partial<Record<NoticeKind, PortalNotificationTopic>>> = {
   PAYMENT_DUE_SOON: 'payments',
   PAYMENT_OVERDUE: 'payments',
   CLASS_TOMORROW: 'classes',
+  CLASS_HOLD_RELEASED: 'classes',
 };
 
 /** A dónde lleva tocar la notificación. */
 function destino(kind: NoticeKind): string {
   if (kind === 'PAYMENT_DUE_SOON' || kind === 'PAYMENT_OVERDUE' || kind === 'MEMBERSHIP_SUSPENDED') return '/pagos';
-  if (kind === 'CLASS_TOMORROW') return '/clases';
+  if (kind === 'CLASS_TOMORROW' || kind === 'CLASS_HOLD_RELEASED') return '/clases';
   if (kind === 'NEW_DEVICE' || kind.startsWith('PRIVACY_')) return '/cuenta';
   return '/';
 }

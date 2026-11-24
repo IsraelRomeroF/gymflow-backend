@@ -3,7 +3,9 @@ import { TenantRepository } from '../../platform/db/tenant-repository.js';
 
 export type NoticeKind = 'PAYMENT_DUE_SOON' | 'PAYMENT_OVERDUE' | 'CLASS_TOMORROW' | 'INTAKE_APPROVED' | 'PRIVACY_NOTICE_UPDATED' | 'NEW_DEVICE' | 'MEMBERSHIP_SUSPENDED'
   // Solicitudes de privacidad (1.10, 21-02): la constancia de entrada, la respuesta y que ya quedó hecho.
-  | 'PRIVACY_REQUEST_RECEIVED' | 'PRIVACY_REQUEST_RESOLVED' | 'PRIVACY_REQUEST_DONE';
+  | 'PRIVACY_REQUEST_RECEIVED' | 'PRIVACY_REQUEST_RESOLVED' | 'PRIVACY_REQUEST_DONE'
+  // Su lugar apartado sin pagar se liberó una hora antes de la clase (D-16; 3.16).
+  | 'CLASS_HOLD_RELEASED';
 
 export type NoticeRecord = { id: string; kind: NoticeKind; title: string; body: string; createdAt: Date; readAt: Date | null };
 

@@ -1003,12 +1003,17 @@ export function registerClassRoutes(app: FastifyInstance): void {
       // Quién imparte cada clase (2026-10-09).
       const coaches = await new UserRepository(organizationId).namesById(schedules.map((s) => s.coachUserId).filter((x): x is string => !!x));
 
+      // D-16 (3.16): el mismo dato que la cotización, para toda la lista con una sola lectura de lo que debe.
+      const apartados = await service.apartadoEnLote(organizationId, memberId, now);
+
       const out = [];
       for (const s of schedules) {
         if (s.status !== 'SCHEDULED' || !daClases(s.branchId)) continue;
         const bookingId = ctx.bookingByScheduleId.get(s.id) ?? null;
         const { decision } = await service.evaluate(organizationId, memberId, s, now, ctx);
         const tipo = tipos.get(s.classTypeId);
+        // Solo si se pagaría aparte: ¿se le guarda sin pagar (y hasta cuándo) o solo pagándola en recepción?
+        const apartado = bookingId === null && decision.outcome === 'ALLOW' && decision.requiresPayment ? await apartados.de(s) : null;
 
         out.push({
           id: s.id,
@@ -1031,6 +1036,9 @@ export function registerClassRoutes(app: FastifyInstance): void {
           priceLabel: decision.outcome === 'ALLOW' && decision.requiresPayment
             ? formatMoney(money(decision.priceCents)) : null,
           warnings: decision.outcome === 'ALLOW' ? decision.warnings : [],
+          // D-16: `payNow` = desde el teléfono no se aparta (aquí no se paga); `holdUntil` = hasta cuándo se le guardaría sin pagar.
+          payNow: apartado?.outcome === 'PAY_NOW' ? apartado.porQue : null,
+          holdUntil: apartado?.outcome === 'HOLD' ? iso(apartado.holdUntil) : null,
         });
       }
       // Si está bloqueado por faltas, hasta cuándo (11-08): el portal puede decirlo.
@@ -1107,6 +1115,8 @@ export function registerClassRoutes(app: FastifyInstance): void {
             lateCancel: b.lateCancel,
             // Incluida en su plan, pagada o por pagar en recepción.
             payment: !b.chargeId ? 'INCLUDED' : b.chargeStatus === 'PAID' ? 'PAID' : 'PENDING',
+            // D-16 (3.16): hasta cuándo se le guarda el lugar si sigue sin pagar; null si ya pagó, va incluida o ya no hay apartado.
+            holdUntil: b.status === 'BOOKED' && b.chargeId && b.chargeStatus !== 'PAID' && b.holdUntil ? iso(b.holdUntil) : null,
           })),
       };
     },

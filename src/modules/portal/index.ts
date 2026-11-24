@@ -24,3 +24,6 @@ export { PortalAuthRepository } from './portal.repository.js';
 // Consumida por: privacy. Al anonimizar a un exsocio se borran las suscripciones de
 // notificaciones de sus teléfonos (fase 3, bloque 3.10).
 export { MemberPushRepository } from './notificaciones.js';
+// Consumida por: classes. Al liberar un lugar apartado sin pagar (D-16) el socio
+// recibe su aviso en la campana (fase 3, bloque 3.16).
+export { PortalNotificationsService } from './notificaciones.js';

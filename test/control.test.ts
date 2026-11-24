@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { uuidv7 } from '@gymflow/core';
-import { makeApp, loginAs, orgFixtures, nombreUnico, CONSENTIMIENTOS, PASSWORD, aprobacion, correoUnico, loginPlataforma, asignarAlCoach } from './helpers.js';
+import { makeApp, loginAs, orgFixtures, nombreUnico, CONSENTIMIENTOS, PASSWORD, aprobacion, loginPlataforma, asignarAlCoach } from './helpers.js';
 import { closeDb, getDb } from '../src/platform/db/client.js';
+import { gimnasioPropio } from './gimnasio-propio.js';
 
 /**
  * BLOQUE 9 · control para la dueña: cada autorización con su sucursal, el
@@ -169,30 +170,29 @@ describe('control: alcance por sucursal y datos de dinero', () => {
 
   it('a quien le restablecieron la contraseña no firma: la cambia y espera 24 h (SEC2-08)', async () => {
     const db = getDb();
-    // Una corrida cortada a medias dejaba al firmante de la vez anterior activo
-    // (se desactivaba solo al final): se apaga antes de crear el de hoy, y el de
-    // hoy se apaga en `finally`, pase lo que pase.
-    await db.user.updateMany({ where: { organizationId: orgId, fullName: 'Firmante Nuevo', isActive: true }, data: { isActive: false } });
-    // Un segundo dueño (socio del gimnasio): es quien firma. A un dueño lo da
-    // de alta la plataforma, no la gerencia.
-    const plataforma = await loginPlataforma(app);
-    const correo = correoUnico('firma');
-    const crear = await app.inject({
-      method: 'POST', url: `/platform/organizations/${orgId}/users`, headers: { cookie: plataforma },
-      payload: { fullName: 'Firmante Nuevo', email: correo, roleKey: 'OWNER', branchIds: null, reason: 'Alta de socio del gimnasio' },
-    });
-    expect(crear.statusCode, crear.body).toBe(201);
-    const user = { id: crear.json().userId as string, email: correo };
+    // El dueño de un gimnasio propio (un gimnasio tiene UN dueño, D-02: ya no
+    // se crea un segundo para esta prueba): la plataforma le restablece la
+    // contraseña y con la temporal no firma.
+    const g = await gimnasioPropio();
     try {
-      const temporaryPassword = crear.json().password as string;
+      const plataforma = await loginPlataforma(app);
+      const sede = g.sedes[0]!.id;
+      const mostrador = await loginAs(app, g.correos.recepcion);
+      const restablecer = await app.inject({
+        method: 'POST', url: `/platform/organizations/${g.organizationId}/users/${g.ownerId}/password-reset`, headers: { cookie: plataforma },
+        payload: { reason: 'El dueño olvidó su contraseña' },
+      });
+      expect(restablecer.statusCode, restablecer.body).toBe(200);
+      const user = { id: g.ownerId, email: g.correos.owner };
+      const temporaryPassword = restablecer.json().password as string;
       const cookie = await (async () => {
         const l = await app.inject({ method: 'POST', url: '/auth/login', payload: { email: user.email, password: temporaryPassword } });
         return `gf_session=${l.cookies.find((c) => c.name === 'gf_session')!.value}`;
       })();
       expect((await app.inject({ method: 'GET', url: '/auth/me', headers: { cookie } })).json().mustChangePassword).toBe(true);
       const firmar = (password: string) => app.inject({
-        method: 'POST', url: '/approvals', headers: { cookie: recepcion },
-        payload: { email: user.email, password, permission: 'cash:withdraw', branchId: centro, resourceId: uuidv7(), amountCents: '100' },
+        method: 'POST', url: '/approvals', headers: { cookie: mostrador },
+        payload: { email: user.email, password, permission: 'cash:withdraw', branchId: sede, resourceId: uuidv7(), amountCents: '100' },
       });
       expect((await firmar(temporaryPassword)).json().detail).toMatch(/temporal/);
       expect((await app.inject({ method: 'POST', url: '/auth/password', headers: { cookie }, payload: { current: temporaryPassword, next: 'Otra-Clave-Segura-2026' } })).statusCode).toBe(200);
@@ -200,7 +200,7 @@ describe('control: alcance por sucursal y datos de dinero', () => {
       await db.user.update({ where: { id: user.id }, data: { passwordResetAt: new Date(Date.now() - 25 * 3_600_000) } });
       expect((await firmar('Otra-Clave-Segura-2026')).statusCode).toBe(200);
     } finally {
-      await db.user.update({ where: { id: user.id }, data: { isActive: false } });
+      await g.cerrar();
     }
   });
 });

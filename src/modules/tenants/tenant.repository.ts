@@ -1,4 +1,4 @@
-import { ROLES, uuidv7, type RoleKey } from '@gymflow/core';
+import { ROLES, conflict, uuidv7, type RoleKey } from '@gymflow/core';
 import { Prisma } from '@gymflow/db';
 import { GlobalRepository } from '../../platform/db/tenant-repository.js';
 import { versionDePlan } from './platform-price-change.repository.js';
@@ -34,6 +34,15 @@ export type Cuenta = {
   /** Las secciones de Dirección y Cumplimiento con que nace (la llave del dueño). Sin esto, ninguna. */
   unlockedSections?: readonly string[];
 };
+
+/**
+ * UN SOLO DUEÑO POR GIMNASIO (D-02, 22-10). Quien firma cuando el dueño no
+ * puede es su apoderado temporal, no un segundo dueño. Cambiar de dueño es
+ * suspender la cuenta del anterior y dar de alta (o reactivar) la del nuevo.
+ */
+export const yaTieneDueno = (nombre: string) => conflict(
+  `Este gimnasio ya tiene dueño (${nombre}) y solo puede haber uno. Si cambió de dueño, suspende primero esa cuenta; si alguien más va a firmar por un tiempo, el dueño lo nombra apoderado desde su panel.`,
+);
 
 /** El último cierre diario de una marca, como lo dejó `system.daily_run` en su bitácora. */
 export type UltimoCierre = { at: Date; jobs: number; failed: string[]; chain: string };
@@ -323,11 +332,34 @@ export class TenantRepository extends GlobalRepository {
     })) > 0;
   }
 
+  /**
+   * El dueño ACTIVO de la marca, si lo hay (D-02: un solo dueño por gimnasio).
+   * `salvo` deja fuera a una cuenta (la que se quiere reactivar).
+   */
+  async duenoActivo(organizationId: string, salvo?: string, db: Pick<Prisma.TransactionClient, 'roleAssignment'> = this.db): Promise<{ id: string; fullName: string } | null> {
+    const a = await db.roleAssignment.findFirst({
+      where: { organizationId, revokedAt: null, role: { key: 'OWNER' }, user: { isActive: true, deletedAt: null, ...(salvo ? { id: { not: salvo } } : {}) } },
+      select: { user: { select: { id: true, fullName: true } } },
+    });
+    return a?.user ?? null;
+  }
+
+  async esDueno(organizationId: string, userId: string): Promise<boolean> {
+    return (await this.db.roleAssignment.count({ where: { organizationId, userId, revokedAt: null, role: { key: 'OWNER' } } })) > 0;
+  }
+
   /** Una cuenta más para la marca, con su rol y su alcance. */
   async addUser(organizationId: string, c: Cuenta, branchIds: readonly string[] | null): Promise<string> {
     return this.db.$transaction(async (tx) => {
       const role = await tx.role.findFirst({ where: { organizationId: null, key: c.roleKey }, select: { id: true } });
       if (!role) throw new Error(`Rol de sistema ${c.roleKey} no sembrado`);
+      if (c.roleKey === 'OWNER') {
+        // Un solo dueño (D-02): dos altas a la vez hacen fila en la marca y la
+        // segunda ya ve a la primera.
+        await tx.$queryRaw`SELECT 1 FROM organizations WHERE id = ${organizationId}::uuid FOR UPDATE`;
+        const ya = await this.duenoActivo(organizationId, undefined, tx);
+        if (ya) throw yaTieneDueno(ya.fullName);
+      }
       const id = uuidv7();
       await tx.user.create({
         data: {
@@ -343,7 +375,15 @@ export class TenantRepository extends GlobalRepository {
   }
 
   async setUserActive(organizationId: string, userId: string, isActive: boolean): Promise<boolean> {
-    const { count } = await this.db.user.updateMany({ where: { id: userId, organizationId, deletedAt: null }, data: { isActive } });
+    const { count } = await this.db.$transaction(async (tx) => {
+      if (isActive && await this.esDueno(organizationId, userId)) {
+        // Reactivar a un dueño no deja dos (D-02): misma fila que el alta.
+        await tx.$queryRaw`SELECT 1 FROM organizations WHERE id = ${organizationId}::uuid FOR UPDATE`;
+        const ya = await this.duenoActivo(organizationId, userId, tx);
+        if (ya) throw yaTieneDueno(ya.fullName);
+      }
+      return tx.user.updateMany({ where: { id: userId, organizationId, deletedAt: null }, data: { isActive } });
+    });
     if (count > 0 && !isActive) {
       // Una cuenta suspendida no sigue con sus sesiones abiertas.
       await this.db.session.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date(), revokedReason: 'platform_suspend' } });

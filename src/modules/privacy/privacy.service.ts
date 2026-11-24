@@ -12,7 +12,6 @@ import { PaymentMethodRepository } from '../payments/index.js';
 import { TrainingRepository } from '../training/index.js';
 import { olvidarTextosDeMensajes } from '../outbound/index.js';
 import { MemberPushRepository } from '../portal/index.js';
-import { OrganizationRepository } from '../organization/index.js';
 import { PrivacyRequestsService } from './privacy-requests.service.js';
 
 /**
@@ -231,16 +230,5 @@ export class PrivacyService {
     });
     // Si pidió la cancelación de sus datos y procedía, con esto quedó hecha (1.10, 21-03).
     await new PrivacyRequestsService().alHacerse(ctx, memberId, 'CANCELLATION', 'Se le dio de baja y sus datos se anonimizaron; lo contable se conserva');
-  }
-
-  // ── Plazo de supresión (PS-08) ────────────────────────────────────────────
-
-  /** Exsocios que ya cumplieron el plazo del gimnasio: se PROPONEN; anonimizar sigue exigiendo dos firmas. */
-  async candidatos(organizationId: string): Promise<{ monthsAfterArchive: number | null; members: Array<{ id: string; firstName: string; lastName: string; memberCode: string; archivedAt: Date; homeBranchId: string | null }> }> {
-    const { monthsAfterArchive } = await new OrganizationRepository(organizationId).privacySettings();
-    if (!monthsAfterArchive) return { monthsAfterArchive: null, members: [] };
-    const limite = new Date(); limite.setUTCMonth(limite.getUTCMonth() - monthsAfterArchive);
-    const filas = await new MemberRepository(organizationId).archivedBefore(limite, 100);
-    return { monthsAfterArchive, members: filas.map((f) => ({ id: f.id, firstName: f.firstName, lastName: f.lastName, memberCode: f.memberCode, archivedAt: f.deletedAt, homeBranchId: f.homeBranchId })) };
   }
 }

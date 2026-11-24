@@ -52,7 +52,8 @@ export function registerOnboardingRoutes(app: FastifyInstance): void {
 
       const [creada, membresia, debe, portal, rostros, biometria, portalEncendido] = await Promise.all([
         new FichaCreada(orgId).cuando(id),
-        new MembershipRepository(orgId).findLiveForMember(id),
+        // La vigente o, si no hay, la SUSPENDIDA: quien debe sí tiene plan, y decirle «todavía no tiene plan» mandaba a venderle otro.
+        new MembershipRepository(orgId).findCurrentForMember(id),
         veDinero ? new ChargeRepository(orgId).outstandingTotalCents(id) : Promise.resolve(0n),
         new PortalAuthRepository().activeForMember(orgId, id),
         new EnrollmentRepository(orgId).listForMember(id),

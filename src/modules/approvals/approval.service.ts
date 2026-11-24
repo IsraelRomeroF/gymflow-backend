@@ -6,6 +6,7 @@ import {
   type ApprovalFailureStep, type ApprovalReach, type ApprovalResourceType, type Grant, type PermissionKey, type RoleLimits, type TenantContext,
 } from '@gymflow/core';
 import { AuditService } from '../../platform/audit/audit.service.js';
+import { anotarFirmaDeApoderado } from '../../platform/audit/firma-de-apoderado.js';
 import { systemContext } from '../../platform/jobs/types.js';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 import { AuthUserRepository, GrantRepository, PushService, UserRepository, type AuthService } from '../identity/index.js';
@@ -367,6 +368,11 @@ export class ApprovalService {
       branchId: scope.branchId, amountCents: scope.amountCents, percent: scope.percent,
     });
     alConsumir?.(grant.id);
+    // D-02 (3.16): firmó con un nombramiento → el asiento de la operación dirá «como apoderado de …».
+    if (grant.proxyId) {
+      const duenoId = (await new ApprovalProxyRepository(ctx.tenant.organizationId).duenosDe([grant.proxyId])).get(grant.proxyId);
+      if (duenoId) anotarFirmaDeApoderado(ctx, grant.approverUserId, { proxyId: grant.proxyId, proxyOfUserId: duenoId, proxyOfName: (await this.users.findById(duenoId))?.fullName ?? null });
+    }
     return grant.approverUserId;
   }
 

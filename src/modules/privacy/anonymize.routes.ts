@@ -76,20 +76,6 @@ export function registerAnonymizeRoutes(app: FastifyInstance): void {
     },
   });
 
-  /**
-   * Exsocios que ya cumplieron el plazo que el gimnasio FIJÓ (PS-08): se
-   * proponen para anonimizarlos uno por uno desde su ficha. Desde D-32 la
-   * pantalla usa `GET /privacy/conservation` (la lista mensual, con el plazo
-   * por omisión); esta ruta se conserva tal cual para quien todavía la lea.
-   */
-  route(app, {
-    method: 'GET',
-    url: '/privacy/candidates',
-    security: { kind: 'permission', permission: 'members:anonymize' },
-    handler: async (request) => {
-      request.requirePermission('members:anonymize', null);
-      const r = await service.candidatos(request.ctx!.tenant.organizationId);
-      return { monthsAfterArchive: r.monthsAfterArchive, members: r.members.map((m) => ({ ...m, archivedAt: m.archivedAt.toISOString() })) };
-    },
-  });
+  // `GET /privacy/candidates` (PS-08) se retiró en el bloque 3.16: desde D-32 la pantalla usa
+  // `GET /privacy/conservation` (la lista mensual que firma la dueña) y nadie más la leía.
 }

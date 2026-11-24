@@ -2,7 +2,7 @@ import {
   conflict, expandWeekly, evaluateBooking, evaluateCancellation, evaluateNoShowPenalty,
   canSetCapacity, notFound, validation, DomainError,
   bookingSettingsFrom, attendanceWindowState, ATTENDANCE_WINDOW, isValidSlot, isoDate, resolveWallTime,
-  apartadoDeClaseSuelta, apartadoVencido,
+  apartadoDeClaseSuelta, apartadoVencido, MINUTOS_DE_APARTADO, type ApartadoDeClase,
   type BookingDecision, type BookingSubject, type BookingSettings, type WeeklySlot,
 } from '@gymflow/core';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
@@ -12,6 +12,7 @@ import { MemberRepository } from '../members/index.js';
 import { MembershipRepository } from '../memberships/index.js';
 import { PlanRepository } from '../catalog/index.js';
 import { BranchRepository } from '../organization/index.js';
+import { PortalNotificationsService } from '../portal/index.js';
 import { ClassRepository, type BookingRecord, type ClassPauseRecord, type ScheduleRecord } from './class.repository.js';
 import type { RequestContext } from '../../platform/context.js';
 import { AuditService } from '../../platform/audit/audit.service.js';
@@ -248,9 +249,15 @@ export class ClassService {
         // Paga ahora: la caja se resuelve antes de tocar nada («no hay caja abierta» sale aquí).
         pago = await new BillingService().cobroValidado(input.cobro.ctx, schedule.branchId, input.cobro.payment) as CobroAlApartar['payment'];
       } else if (apartado.outcome === 'PAY_NOW') {
+        // En el portal quien lee es el socio: se le habla de tú (3.16). El panel conserva lo suyo.
+        const alSocio = input.source === 'PORTAL';
         throw apartado.porQue === 'OWES_MEMBERSHIP'
-          ? conflict('Debe su mensualidad: una clase suelta solo se aparta pagándola en el momento, en recepción', 'CLASS_PAY_NOW')
-          : conflict('Falta menos de una hora para la clase: ya no se aparta sin pagar. Se paga en recepción al llegar', 'CLASS_HOLD_CLOSED');
+          ? conflict(alSocio
+            ? 'Debes tu mensualidad: una clase suelta solo la apartas pagándola en el momento, en recepción'
+            : 'Debe su mensualidad: una clase suelta solo se aparta pagándola en el momento, en recepción', 'CLASS_PAY_NOW')
+          : conflict(alSocio
+            ? 'Falta menos de una hora para la clase: ya no la puedes apartar sin pagar. Págala en recepción al llegar'
+            : 'Falta menos de una hora para la clase: ya no se aparta sin pagar. Se paga en recepción al llegar', 'CLASS_HOLD_CLOSED');
       } else {
         holdUntil = apartado.holdUntil;
       }
@@ -329,11 +336,34 @@ export class ClassService {
    * negocio de esa sede). Una cuota de un periodo que aún no empieza no cuenta.
    */
   async debeSuMensualidad(orgId: string, memberId: string, branchId: string, now = new Date()): Promise<boolean> {
-    const hoy = await new BusinessCalendar(orgId).today(branchId, now);
-    return (await new ChargeRepository(orgId).listOutstanding(memberId)).some((c) =>
-      (c.chargeType === 'MEMBERSHIP_PERIOD' || c.chargeType === 'SIGNUP_FEE')
-      && c.amountCents - c.allocatedCents - c.adjustedCents > 0n
-      && c.dueDate.getTime() <= hoy.getTime());
+    return (await this.apartadoEnLote(orgId, memberId, now)).debe(branchId);
+  }
+
+  /**
+   * D-16 para MUCHAS clases del mismo socio (la lista del portal, 3.16): lo
+   * que debe se lee UNA vez, y solo si alguna clase lo pregunta; el «hoy» de
+   * cada sede sale de su zona, que el calendario guarda en memoria. Es la
+   * misma cuenta que hacen `book` y `quote`, sin una consulta por clase.
+   */
+  async apartadoEnLote(orgId: string, memberId: string, now = new Date()): Promise<{
+    debe(branchId: string): Promise<boolean>;
+    de(clase: { branchId: string; startsAt: Date }): Promise<ApartadoDeClase>;
+  }> {
+    const calendario = new BusinessCalendar(orgId);
+    let vencimientos: Promise<number[]> | null = null;
+    const leer = () => (vencimientos ??= new ChargeRepository(orgId).listOutstanding(memberId).then((cargos) => cargos
+      .filter((c) => (c.chargeType === 'MEMBERSHIP_PERIOD' || c.chargeType === 'SIGNUP_FEE') && c.amountCents - c.allocatedCents - c.adjustedCents > 0n)
+      .map((c) => c.dueDate.getTime())));
+    const debe = async (branchId: string) => {
+      const exigibles = await leer();
+      if (exigibles.length === 0) return false;
+      const hoy = (await calendario.today(branchId, now)).getTime();
+      return exigibles.some((vence) => vence <= hoy);
+    };
+    return {
+      debe,
+      de: async (clase) => apartadoDeClaseSuelta({ startsAt: clase.startsAt, now, debeSuMensualidad: await debe(clase.branchId) }),
+    };
   }
 
   /**
@@ -359,9 +389,11 @@ export class ClassService {
         kept += 1;
         continue;
       }
+      let liberada = false;
       await enUnidadDeDinero(orgId, async () => {
         const cancelada = await repo.cancelBooking(b.id, false);
         if (!cancelada) return;
+        liberada = true;
         await cargos.voidCharge(cargo.id, 'Clase apartada sin pagar: el lugar se liberó una hora antes');
         await repo.clearHold(b.id);
         await audit.record(ctx, {
@@ -372,8 +404,29 @@ export class ClassService {
         await new BillingService().refreshCachedBalance(orgId, b.memberId);
         released += 1;
       });
+      // El socio se entera (3.16): aviso en la campana de su portal, ya con el lugar liberado.
+      if (liberada) await this.avisarLugarLiberado(orgId, b).catch(() => undefined);
     }
     return { released, kept, truncated: vencidos.length === limit };
+  }
+
+  /**
+   * «Se liberó tu lugar» (D-16, 3.16): un aviso en la campana del portal (y a
+   * su teléfono si tiene encendidas las notificaciones de clases, que son
+   * gratis). Uno por reserva (`dedupeKey`). Nunca tira al job que libera.
+   */
+  private async avisarLugarLiberado(orgId: string, b: BookingRecord): Promise<void> {
+    const repo = new ClassRepository(orgId);
+    const sesion = await repo.findSchedule(b.classScheduleId);
+    if (!sesion) return;
+    const [tipo, zona] = await Promise.all([repo.findType(sesion.classTypeId), new BusinessCalendar(orgId).timezoneFor(sesion.branchId)]);
+    const hora = (d: Date) => d.toLocaleTimeString('es-MX', { timeZone: zona, hour: '2-digit', minute: '2-digit', hour12: false });
+    const dia = (d: Date) => d.toLocaleDateString('es-MX', { timeZone: zona, weekday: 'long', day: 'numeric', month: 'long' }).replace(',', '');
+    await new PortalNotificationsService().avisar(orgId, {
+      memberId: b.memberId, kind: 'CLASS_HOLD_RELEASED', dedupeKey: `CLASS_HOLD_RELEASED:${b.id}`,
+      title: `Se liberó tu lugar en ${tipo?.name ?? 'tu clase'}`,
+      body: `Te lo guardamos hasta las ${hora(b.holdUntil ?? new Date(sesion.startsAt.getTime() - MINUTOS_DE_APARTADO * 60_000))} y no se pagó, así que quedó libre. No debes nada y no cuenta como falta. La clase es el ${dia(sesion.startsAt)} a las ${hora(sesion.startsAt)}: si todavía quieres ir, pregunta en recepción si queda lugar y la pagas al llegar.`,
+    });
   }
 
   /**

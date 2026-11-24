@@ -22,6 +22,8 @@ const DE_QUE_ES: Readonly<Record<string, 'MONEY' | 'ACCESS' | 'CLASS'>> = {
   PAYMENT_OVERDUE: 'MONEY',
   MEMBERSHIP_SUSPENDED: 'ACCESS',
   CLASS_TOMORROW: 'CLASS',
+  // Se liberó su lugar apartado sin pagar (3.16): de clase mientras sea reciente.
+  CLASS_HOLD_RELEASED: 'CLASS',
 };
 
 /** Una clase «de mañana» avisada hace más de dos días ya pasó. */

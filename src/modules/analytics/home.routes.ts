@@ -17,6 +17,8 @@ import { HomeRepository } from './home.repository.js';
 const TEXTOS_OBLIGATORIOS = ['PRIVACY_NOTICE', 'HOUSE_RULES'] as const;
 /** La cifra de Retención cambia despacio: el Inicio se abre veinte veces al día. */
 const VIGENCIA_RIESGO_MS = 60_000;
+/** «Socio nuevo» para el aviso de sin coach (D-29): dado de alta en los últimos 7 días. */
+const DIAS_DE_SOCIO_NUEVO = 7;
 
 type Parte = Omit<RenglonDelInicio, 'key'> | null;
 const renglon = (count: number, tone: RenglonDelInicio['tone'], extra: Partial<Pick<RenglonDelInicio, 'amountCents' | 'detail' | 'until' | 'waiting'>> = {}): Parte =>
@@ -99,6 +101,11 @@ export function registerHomeRoutes(app: FastifyInstance): void {
           return renglon(await repo.clasesSinCoach(sedesCon('classes:manage', 'classes'), ahora, new Date(hoy.getTime() + 86_400_000)), 'warn');
         },
         intakes: async () => renglon(await repo.altasPorRevisar(sedesCon('members:intake:review', 'intake')), 'info'),
+        // D-29 (3.16): los socios de esta semana que nadie tiene de coach, para quien se lo puede poner.
+        coachless: async () => {
+          const r = await repo.nuevosSinCoach(sedesCon('members:coach:assign'), new Date(ahora.getTime() - DIAS_DE_SOCIO_NUEVO * 86_400_000));
+          return renglon(r.total, 'info', { detail: r.nombres });
+        },
         // La misma cuenta que la bandeja de interesados (2.4): los que tocan hoy más los que nadie ha contactado.
         prospects: async () => {
           const sedes = sedesCon('members:create', 'prospects');

@@ -77,4 +77,28 @@ export class HomeRepository extends TenantRepository {
     if (sedes.length === 0) return 0;
     return this.db.memberIntake.count({ where: { organizationId: this.organizationId, status: 'SUBMITTED', branchId: { in: [...sedes] } } });
   }
+
+  /**
+   * Socios dados de alta desde `desde` que siguen sin coach (D-29; bloque 3.16),
+   * en esas sedes: cuántos y los primeros nombres. Una sola consulta, y no
+   * cuenta nada si el gimnasio no tiene ningún coach activo (no habría a quién
+   * ponerles). No cuenta bajas ni anonimizados.
+   */
+  async nuevosSinCoach(sedes: readonly string[], desde: Date): Promise<{ total: number; nombres: string[] }> {
+    if (sedes.length === 0) return { total: 0, nombres: [] };
+    const filas = await this.db.$queryRaw<Array<{ total: number; nombre: string }>>`
+      SELECT COUNT(*) OVER ()::int AS "total", m."firstName" || ' ' || m."lastName" AS "nombre"
+        FROM "members" m
+       WHERE m."organizationId" = ${this.organizationId}::uuid
+         AND m."coachUserId" IS NULL AND m."deletedAt" IS NULL AND m."anonymizedAt" IS NULL AND m."status" <> 'ARCHIVED'
+         AND m."createdAt" >= ${desde} AND m."homeBranchId" = ANY(${sedes as string[]}::uuid[])
+         AND EXISTS (
+           SELECT 1 FROM "role_assignments" ra
+             JOIN "roles" r ON r."id" = ra."roleId" AND r."key" = 'COACH'
+             JOIN "users" u ON u."id" = ra."userId" AND u."isActive" AND u."deletedAt" IS NULL
+            WHERE ra."organizationId" = ${this.organizationId}::uuid AND ra."revokedAt" IS NULL)
+       ORDER BY m."createdAt" DESC
+       LIMIT 4`;
+    return { total: filas[0]?.total ?? 0, nombres: filas.map((f) => f.nombre) };
+  }
 }

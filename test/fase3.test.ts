@@ -192,19 +192,17 @@ describe('fase 3 · plataforma', () => {
     expect((await app.inject({ method: 'POST', url: `/members/${otro}/consents/${mk.id}/revoke`, headers: { cookie: gerencia }, payload: { reason: 'Otra vez' } })).statusCode).toBe(409);
   });
 
-  it('PS-08 · el plazo de supresión propone exsocios y anonimizar deja el prospecto y las notas sin persona', async () => {
+  // La propuesta de exsocios por plazo es ahora la lista mensual de D-32 (`conservacion.test.ts`); `GET /privacy/candidates` se retiró en 3.16.
+  it('PS-08 · anonimizar a un exsocio con el plazo cumplido deja el prospecto y las notas sin persona', async () => {
     const gerencia = await loginAs(app, 'gerencia@demo.mx');
     const cen = (await orgFixtures()).demoBranches.find((b) => b.code === 'CEN')!.id;
-    await app.inject({ method: 'PUT', url: '/privacy/settings', headers: { cookie: gerencia }, payload: { monthsAfterArchive: null } });
-    expect((await app.inject({ method: 'GET', url: '/privacy/candidates', headers: { cookie: gerencia } })).json().members).toEqual([]);
     expect((await app.inject({ method: 'PUT', url: '/privacy/settings', headers: { cookie: gerencia }, payload: { monthsAfterArchive: 24 } })).statusCode).toBe(200);
+    // La ruta vieja de candidatos ya no existe.
+    expect((await app.inject({ method: 'GET', url: '/privacy/candidates', headers: { cookie: gerencia } })).statusCode).toBe(404);
 
     const id = await socioConMarketing(gerencia, cen);
     await app.inject({ method: 'POST', url: `/members/${id}/archive`, headers: { cookie: gerencia }, payload: { reason: 'Se fue' } });
     await getDb().$executeRaw`UPDATE "members" SET "deletedAt" = now() - interval '25 months' WHERE "id" = ${id}::uuid`;
-    const cand = (await app.inject({ method: 'GET', url: '/privacy/candidates', headers: { cookie: gerencia } })).json() as { monthsAfterArchive: number; members: Array<{ id: string }> };
-    expect(cand.monthsAfterArchive).toBe(24);
-    expect(cand.members.map((m) => m.id)).toContain(id);
 
     // Un prospecto convertido en este socio y una nota de rutina: ambos quedan sin persona al anonimizar.
     const { uuidv7 } = await import('@gymflow/core');
@@ -216,7 +214,7 @@ describe('fase 3 · plataforma', () => {
     expect(ok.statusCode, ok.body).toBe(204);
     const pros = await getDb().prospect.findFirst({ where: { convertedMemberId: id } });
     expect(pros?.firstName).toBe('Prospecto');
-    expect((await app.inject({ method: 'GET', url: '/privacy/candidates', headers: { cookie: gerencia } })).json().members.map((m: { id: string }) => m.id)).not.toContain(id);
+    expect((await getDb().member.findUniqueOrThrow({ where: { id } })).anonymizedAt).not.toBeNull();
     await app.inject({ method: 'PUT', url: '/privacy/settings', headers: { cookie: gerencia }, payload: { monthsAfterArchive: null } });
   });
 

@@ -506,16 +506,6 @@ export class MemberRepository extends TenantRepository {
     });
   }
 
-  /** Exsocios dados de baja antes de una fecha y aún con nombre: candidatos a anonimizar (PS-08). */
-  async archivedBefore(before: Date, limit = 100): Promise<Array<{ id: string; firstName: string; lastName: string; memberCode: string; deletedAt: Date; homeBranchId: string | null }>> {
-    const rows = await this.db.member.findMany({
-      where: this.scope({ deletedAt: { lt: before }, anonymizedAt: null }),
-      select: { id: true, firstName: true, lastName: true, memberCode: true, deletedAt: true, homeBranchId: true },
-      orderBy: { deletedAt: 'asc' }, take: limit,
-    });
-    return rows.map((r) => ({ ...r, deletedAt: r.deletedAt! }));
-  }
-
   /**
    * Volver a dar de alta a un exsocio (PS-04): recupera su código, su historia
    * y sus consentimientos; queda INACTIVE hasta que se le venda algo. Solo
