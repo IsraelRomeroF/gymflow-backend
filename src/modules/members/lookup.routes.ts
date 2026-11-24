@@ -1,9 +1,21 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { forbidden, notFound, validation } from '@gymflow/core';
 import { route } from '../../platform/http/registry.js';
 import { MemberRepository } from './member.repository.js';
 import { idParam, serializeMember, vista } from './members.serializers.js';
+
+/**
+ * ¿Quien pregunta no ve el teléfono de NINGÚN socio? (el coach: D-30, «no,
+ * como hoy»). Es lo mismo que decide `vista()` por socio, preguntado para
+ * todas las sedes: entonces el buscador tampoco busca por teléfono. Buscar
+ * «5512» y ver si su socio aparece es un modo de ir leyendo el número que la
+ * ficha le oculta (bloque 4.7).
+ */
+function buscaSinContacto(request: FastifyRequest): boolean {
+  const enAlguna = (p: 'members:update' | 'members:create') => { const sedes = request.branchScope(p); return sedes === null || sedes.length > 0; };
+  return !enAlguna('members:update') && !enAlguna('members:create');
+}
 
 /** Búsqueda de recepción, padrón por cursor y ficha del socio. */
 export function registerLookupRoutes(app: FastifyInstance): void {
@@ -23,7 +35,7 @@ export function registerLookupRoutes(app: FastifyInstance): void {
       const repo = new MemberRepository(ctx.tenant.organizationId);
       // El coach solo encuentra a sus socios asignados (2026-10-09).
       const suyos = ctx.coachOf ? new Set(await repo.assignedTo(ctx.coachOf)) : null;
-      const results = (await repo.search(q, suyos ? 50 : limit)).filter((m) => !suyos || suyos.has(m.id)).slice(0, limit);
+      const results = (await repo.search(q, suyos ? 50 : limit, { sinContacto: buscaSinContacto(request) })).filter((m) => !suyos || suyos.has(m.id)).slice(0, limit);
       const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
 
       return {
@@ -60,6 +72,7 @@ export function registerLookupRoutes(app: FastifyInstance): void {
         // El coach solo ve a sus socios asignados (2026-10-09).
         ids: ctx.coachOf ? await repo.assignedTo(ctx.coachOf) : undefined,
         q: query.q, limit: query.limit, after: query.cursor ? leerCursor(query.cursor) : undefined,
+        sinContacto: buscaSinContacto(request),
       });
       const ultimo = members.length === query.limit ? members.at(-1) : undefined;
       return {

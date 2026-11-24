@@ -456,14 +456,15 @@ describe('estado de cuenta y listas por páginas (1.6)', () => {
     expect((await app.inject({ method: 'POST', url: `/members/${socio}/portal-sessions/revoke`, headers: { cookie: gerencia } })).statusCode).toBe(200);
     expect(await motivo(dos)).toBe('SESSION_CLOSED_EVERYWHERE');
 
-    // Llegó a su fecha tope.
+    // Llegó a su fecha. Desde D-04 (fase 4, bloque 4.1) no hay fecha tope: el vencimiento se corre con
+    // cada uso, así que llegar a él es haber pasado 30 días sin abrirlo.
     const tres = await portalDe(socio);
     await db().memberSession.update({ where: { id: await idDe(tres) }, data: { createdAt: new Date(Date.now() - 31 * 86_400_000), expiresAt: new Date(Date.now() - 60_000) } });
-    expect(await motivo(tres)).toBe('SESSION_EXPIRED');
+    expect(await motivo(tres)).toBe('SESSION_IDLE');
 
-    // Pasó una semana sin abrirlo.
+    // Pasaron más de 30 días sin abrirlo (antes de D-04 bastaba una semana).
     const cuatro = await portalDe(socio);
-    await db().memberSession.update({ where: { id: await idDe(cuatro) }, data: { lastSeenAt: new Date(Date.now() - 8 * 86_400_000) } });
+    await db().memberSession.update({ where: { id: await idDe(cuatro) }, data: { lastSeenAt: new Date(Date.now() - 31 * 86_400_000) } });
     expect(await motivo(cuatro)).toBe('SESSION_IDLE');
 
     // El socio se dio de baja.

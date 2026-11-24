@@ -11,8 +11,21 @@ import { TenantRepository, GlobalRepository } from '../../platform/db/tenant-rep
  */
 
 
-/** Días sin usar el portal tras los que la sesión del socio deja de valer. */
-export const MEMBER_IDLE_DAYS = 7;
+/**
+ * Días sin abrir el portal tras los que la sesión del socio se cierra (D-04,
+ * opción a; fase 4, bloque 4.1). Mientras lo use queda abierta: cada uso
+ * corre su vencimiento a `MEMBER_IDLE_DAYS` días de ese momento. Antes eran 7
+ * días sin uso y, además, 30 desde que se activó aunque se usara a diario.
+ */
+export const MEMBER_IDLE_DAYS = 30;
+/** Cada cuánto, como mucho, se corre el vencimiento con el uso (y se vuelve a poner la cookie del teléfono). */
+export const RENOVAR_PORTAL_CADA_MS = 3_600_000;
+/**
+ * La causa que dejó la migración de D-04 en las sesiones que ya llevaban más
+ * de 7 días sin uso (muertas con la regla anterior): al socio se le dice que
+ * se cerró por falta de uso, no que alguien la cerró.
+ */
+export const CIERRE_POR_REGLA_ANTERIOR = 'Sin uso por más de 7 días (regla anterior a D-04)';
 /** Cada cuánto, como mucho, se anota que el socio usó el portal (la inactividad se mide en días). */
 const VISTO_CADA_MS = 60_000;
 /** La causa que queda escrita cuando el socio sale en UN teléfono (`POST /portal/logout`). */
@@ -31,6 +44,8 @@ export type MemberSessionRecord = {
   memberId: string;
   expiresAt: Date;
   revokedAt: Date | null;
+  /** El vencimiento se corrió en ESTA lectura (D-04): quien responde vuelve a poner la cookie con `expiresAt`. */
+  renovada?: boolean;
 };
 
 function hashCode(value: string): string {
@@ -158,28 +173,45 @@ export class PortalAuthRepository extends GlobalRepository {
   }
 
   /**
-   * Sesión del socio vigente: sin revocar, sin caducar, sin 7 días de
-   * inactividad y de un socio que no está dado de baja (SEC-11). Un teléfono
-   * perdido deja de servir en una semana, no en un mes.
+   * Sesión del socio vigente: sin revocar, sin caducar, sin `MEMBER_IDLE_DAYS`
+   * días de inactividad y de un socio que no está dado de baja (SEC-11).
+   *
+   * D-04 (bloque 4.1): queda ABIERTA mientras se use. Cada uso corre el
+   * vencimiento a `MEMBER_IDLE_DAYS` días (como mucho una vez por hora), así
+   * que se cierra sola a los 30 días sin abrirlo. Solo se corre una sesión
+   * sin cerrar y sin vencer: la que recepción o el socio cerraron, o la de un
+   * socio dado de baja, no revive aunque alguien siga presentando su cookie.
    */
   async findSession(tokenHash: string): Promise<MemberSessionRecord | null> {
+    const ahora = Date.now();
     const row = await this.db.memberSession.findFirst({
       where: {
-        tokenHash, revokedAt: null, expiresAt: { gt: new Date() },
-        lastSeenAt: { gt: new Date(Date.now() - MEMBER_IDLE_DAYS * 86_400_000) },
+        tokenHash, revokedAt: null, expiresAt: { gt: new Date(ahora) },
+        lastSeenAt: { gt: new Date(ahora - MEMBER_IDLE_DAYS * 86_400_000) },
         member: { deletedAt: null },
       },
       select: { id: true, organizationId: true, memberId: true, expiresAt: true, revokedAt: true },
     });
-    if (row) {
-      // «Visto por última vez» con precisión de un minuto (fase 2, bloque 2.8): una pantalla del
-      // portal hace varias peticiones a la vez y todas escribían el mismo renglón de la sesión.
-      // Ahora escribe la primera; las demás no encuentran nada que cambiar y no esperan turno.
-      await this.db.memberSession.updateMany({
-        where: { id: row.id, lastSeenAt: { lt: new Date(Date.now() - VISTO_CADA_MS) } }, data: { lastSeenAt: new Date() },
+    if (!row) return null;
+    const hasta = new Date(ahora + MEMBER_IDLE_DAYS * 86_400_000);
+    if (hasta.getTime() - row.expiresAt.getTime() > RENOVAR_PORTAL_CADA_MS) {
+      const { count } = await this.db.memberSession.updateMany({
+        where: { id: row.id, revokedAt: null, expiresAt: { gt: new Date(ahora), lt: hasta } },
+        data: { expiresAt: hasta, lastSeenAt: new Date(ahora) },
       });
+      if (count > 0) return { ...row, expiresAt: hasta, renovada: true } as MemberSessionRecord;
+      // Otra petición de la misma pantalla la corrió primero (o se cerró en este instante): se lee como quedó.
+      const actual = await this.db.memberSession.findFirst({ where: { id: row.id, revokedAt: null }, select: { expiresAt: true } });
+      if (!actual) return null;
+      return { ...row, expiresAt: actual.expiresAt, renovada: true } as MemberSessionRecord;
     }
-    return row as MemberSessionRecord | null;
+    // «Visto por última vez» con precisión de un minuto (fase 2, bloque 2.8): una pantalla del
+    // portal hace varias peticiones a la vez y todas escribían el mismo renglón de la sesión.
+    // Ahora escribe la primera; las demás no encuentran nada que cambiar y no esperan turno.
+    await this.db.memberSession.updateMany({
+      where: { id: row.id, lastSeenAt: { lt: new Date(ahora - VISTO_CADA_MS) } }, data: { lastSeenAt: new Date(ahora) },
+    });
+    return row as MemberSessionRecord;
   }
 
   /**
@@ -195,9 +227,12 @@ export class PortalAuthRepository extends GlobalRepository {
     if (!s) return null;
     if (s.member.deletedAt) return 'ACCOUNT_DEACTIVATED';
     // Salir en este teléfono lo anota `revokeSession`; todo lo demás cierra todos (`revokeAllForMember`).
-    if (s.revokedAt) return s.revokedReason === CIERRE_DEL_SOCIO ? 'SESSION_LOGGED_OUT' : 'SESSION_CLOSED_EVERYWHERE';
-    if (s.expiresAt.getTime() <= Date.now()) return 'SESSION_EXPIRED';
-    if (s.lastSeenAt.getTime() <= Date.now() - MEMBER_IDLE_DAYS * 86_400_000) return 'SESSION_IDLE';
+    if (s.revokedAt) {
+      if (s.revokedReason === CIERRE_POR_REGLA_ANTERIOR) return 'SESSION_IDLE';
+      return s.revokedReason === CIERRE_DEL_SOCIO ? 'SESSION_LOGGED_OUT' : 'SESSION_CLOSED_EVERYWHERE';
+    }
+    // D-04: el vencimiento se corre con el uso, así que llegar a él ES haber dejado de abrirlo.
+    if (s.expiresAt.getTime() <= Date.now() || s.lastSeenAt.getTime() <= Date.now() - MEMBER_IDLE_DAYS * 86_400_000) return 'SESSION_IDLE';
     return null;
   }
 

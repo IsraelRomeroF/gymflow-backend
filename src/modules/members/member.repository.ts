@@ -77,13 +77,20 @@ export class MemberRepository extends TenantRepository {
    * La similitud por trigramas es lo que hace que "Martinz" encuentre a
    * "Martínez": el índice GIN la resuelve sin recorrer la tabla.
    */
-  async search(query: string, limit = 20): Promise<Array<MemberRecord & { similarity: number }>> {
+  async search(query: string, limit = 20, opts: {
+    /**
+     * Quien pregunta no ve teléfonos (el coach, D-30): tampoco se busca por
+     * ellos. Si no, teclear dígitos y ver si su socio aparece le iría
+     * diciendo el número, cifra por cifra (bloque 4.7).
+     */
+    sinContacto?: boolean;
+  } = {}): Promise<Array<MemberRecord & { similarity: number }>> {
     const raw = query.trim();
     if (raw.length < 2) return [];
 
     const nameKey = normalizedNameKey(raw);
-    const phone = normalizePhoneMx(raw);
-    const digits = raw.replace(/\D/g, '');
+    const phone = opts.sinContacto ? null : normalizePhoneMx(raw);
+    const digits = opts.sinContacto ? '' : raw.replace(/\D/g, '');
 
     return this.db.$queryRaw<Array<MemberRecord & { similarity: number }>>`
       SELECT id, "memberCode", "firstName", "lastName", "phoneE164", email,
@@ -199,6 +206,8 @@ export class MemberRepository extends TenantRepository {
     ids?: readonly string[] | undefined;
     q?: string | undefined; limit?: number | undefined;
     after?: { lastName: string; firstName: string; id: string } | undefined;
+    /** Quien pregunta no ve teléfonos (el coach, D-30): el buscador no busca por ellos (bloque 4.7). */
+    sinContacto?: boolean | undefined;
   } = {}): Promise<{ members: MemberRecord[]; total: number }> {
     const texto = opts.q?.trim() ?? '';
     const tokens = nameTokens(texto);
@@ -213,7 +222,7 @@ export class MemberRepository extends TenantRepository {
         OR: [
           ...(tokens.length ? [{ AND: tokens.map((t) => ({ nameKey: { contains: t } })) }] : []),
           { memberCode: { contains: texto, mode: 'insensitive' as const } },
-          ...(digitos.length >= 4 ? [{ phoneE164: { contains: digitos } }] : []),
+          ...(digitos.length >= 4 && !opts.sinContacto ? [{ phoneE164: { contains: digitos } }] : []),
         ],
       } : {}),
     });
@@ -545,6 +554,13 @@ export class MemberRepository extends TenantRepository {
         anonymizedAt: new Date(), updatedAt: new Date(),
       },
     });
+    // Los celulares y correos que él mismo cambió desde el portal (fase 4, bloque 4.8) también son su dato:
+    // se vacían en el mismo acto y queda solo que hubo un cambio.
+    if (count > 0) {
+      await this.db.memberContactChange.updateMany({
+        where: this.scope({ memberId: id, forgottenAt: null }), data: { oldValue: null, newValue: null, forgottenAt: new Date() },
+      });
+    }
     return count > 0;
   }
 

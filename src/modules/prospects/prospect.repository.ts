@@ -26,6 +26,9 @@ export type ProspectRecord = {
   lostReasonCode: string | null;
   lostReason: string | null;
   closedAt: Date | null;
+  /** D-31 (4.7): el plan que preguntó y cuándo lo reabrieron por última vez. */
+  interestPlanId: string | null;
+  reopenedAt: Date | null;
 };
 
 const SELECT = {
@@ -33,7 +36,7 @@ const SELECT = {
   source: true, status: true, branchId: true, assignedToUserId: true,
   convertedMemberId: true, createdAt: true, notes: true, updatedAt: true,
   lastContactAt: true, nextStepOn: true, dueOn: true, referredByMemberId: true, referredByName: true,
-  lostReasonCode: true, lostReason: true, closedAt: true,
+  lostReasonCode: true, lostReason: true, closedAt: true, interestPlanId: true, reopenedAt: true,
 } as const;
 
 /** Ya no están en seguimiento: se inscribió o se perdió. */
@@ -164,6 +167,8 @@ export class ProspectRepository extends TenantRepository {
     /** «¿Qué sigue?» al registrarlo: con fecha cae en «Esperando» (o en «Te toca hoy»); sin ella, en «Sin contactar». */
     nextStepOn?: Date | null | undefined;
     referredByMemberId?: string | null | undefined; referredByName?: string | null | undefined;
+    /** El plan que preguntó (D-31). */
+    interestPlanId?: string | null | undefined;
   }): Promise<ProspectSummary> {
     return this.db.prospect.create({
       data: {
@@ -182,6 +187,7 @@ export class ProspectRepository extends TenantRepository {
         dueOn: input.nextStepOn ?? null,
         referredByMemberId: input.referredByMemberId ?? null,
         referredByName: input.referredByName?.trim() || null,
+        interestPlanId: input.interestPlanId ?? null,
       },
       select: { id: true, firstName: true, lastName: true, status: true, branchId: true, createdAt: true },
     });
@@ -241,6 +247,7 @@ export class ProspectRepository extends TenantRepository {
   async update(id: string, patch: {
     firstName?: string; lastName?: string; phoneE164?: string | null; email?: string | null;
     source?: string | null; notes?: string | null; referredByMemberId?: string | null; referredByName?: string | null;
+    interestPlanId?: string | null;
   }): Promise<boolean> {
     const actual = patch.firstName !== undefined || patch.lastName !== undefined
       ? await this.db.prospect.findFirst({ where: this.scope({ id }), select: { firstName: true, lastName: true } }) : null;
@@ -280,7 +287,63 @@ export class ProspectRepository extends TenantRepository {
   async reopen(id: string, d: { status: 'NEW' | 'CONTACTED' | 'VISITED' | 'TRIAL'; dueOn: Date | null }): Promise<boolean> {
     const { count } = await this.db.prospect.updateMany({
       where: this.scope({ id, status: 'LOST' as const }),
-      data: { status: d.status, lostReasonCode: null, lostReason: null, closedAt: null, closedByUserId: null, nextStepOn: null, dueOn: d.dueOn },
+      // `reopenedAt`: el plazo del cierre solo vuelve a contar desde hoy (D-31).
+      data: { status: d.status, lostReasonCode: null, lostReason: null, closedAt: null, closedByUserId: null, nextStepOn: null, dueOn: d.dueOn, reopenedAt: new Date() },
+    });
+    return count > 0;
+  }
+
+  // ── Cierre solo (D-31, bloque 4.7) ───────────────────────────────────────
+
+  /** Desde qué día cierra solo este gimnasio; `null` = el job aún no ha corrido aquí. */
+  async autoCloseStart(): Promise<Date | null> {
+    const fila = await this.db.prospectAutoCloseStart.findUnique({ where: { organizationId: this.organizationId }, select: { startsOn: true } });
+    return fila?.startsOn ?? null;
+  }
+
+  /** Fija el día de arranque una sola vez: si ya existe, no lo mueve. */
+  async startAutoClose(startsOn: Date): Promise<boolean> {
+    const { count } = await this.db.prospectAutoCloseStart.createMany({ data: [{ organizationId: this.organizationId, startsOn }], skipDuplicates: true });
+    return count > 0;
+  }
+
+  /**
+   * Los abiertos cuyo último contacto (o su registro, si nadie los ha
+   * contactado), su próximo paso y su reapertura son anteriores a `antes`:
+   * los CANDIDATOS a cerrarse solos. La regla exacta (con el día de su sede)
+   * la aplica `prospectAutoCloseOn` del núcleo sobre lo que sale de aquí;
+   * esto solo evita leer a los que no pueden estar. Del más viejo al más nuevo.
+   */
+  async autoCloseCandidates(opts: { antes: Date; branchIds?: readonly string[] | null | undefined; limit: number }): Promise<Array<Pick<ProspectRecord,
+    'id' | 'branchId' | 'status' | 'createdAt' | 'updatedAt' | 'lastContactAt' | 'nextStepOn' | 'reopenedAt'>>> {
+    return this.db.prospect.findMany({
+      where: this.scope({
+        ...ABIERTO,
+        ...(opts.branchIds ? { branchId: { in: [...opts.branchIds] } } : {}),
+        AND: [
+          { OR: [{ lastContactAt: { lt: opts.antes } }, { lastContactAt: null, createdAt: { lt: opts.antes } }] },
+          // Lo que lo protege también se filtra aquí: si no, muchos interesados con fecha pendiente
+          // llenarían el lote y los que sí toca cerrar no llegarían a leerse.
+          { OR: [{ nextStepOn: null }, { nextStepOn: { lt: opts.antes } }] },
+          { OR: [{ reopenedAt: null }, { reopenedAt: { lt: opts.antes } }] },
+        ],
+      }),
+      select: { id: true, branchId: true, status: true, createdAt: true, updatedAt: true, lastContactAt: true, nextStepOn: true, reopenedAt: true },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      take: opts.limit,
+    });
+  }
+
+  /**
+   * Cerrarlo sin que nadie lo cierre: queda como perdido, con el código del
+   * cierre solo y sin persona. Solo si sigue abierto Y nadie lo tocó desde
+   * que se leyó (`updatedAt`): un contacto registrado mientras corre el
+   * cierre de la noche gana.
+   */
+  async closeByItself(id: string, d: { reasonCode: string; reason: string; updatedAt: Date }): Promise<boolean> {
+    const { count } = await this.db.prospect.updateMany({
+      where: this.scope({ id, ...ABIERTO, updatedAt: d.updatedAt }),
+      data: { status: 'LOST', lostReasonCode: d.reasonCode, lostReason: d.reason, closedAt: new Date(), closedByUserId: null, nextStepOn: null, dueOn: null },
     });
     return count > 0;
   }

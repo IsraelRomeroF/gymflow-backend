@@ -14,6 +14,7 @@ import { MembershipRepository } from './membership.repository.js';
 import { VisitPackRepository } from './visitpack.repository.js';
 import { MembershipService } from './membership.service.js';
 import { cambiarRenovacion } from './anualidades.js';
+import { registerPlazosRoutes } from './plazos.routes.js';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 
@@ -23,6 +24,9 @@ const reasonBody = z.object({ reason: z.string().min(3).max(300) });
 export function registerMembershipRoutes(app: FastifyInstance): void {
   const service = new MembershipService();
   const audit = new AuditService();
+
+  // Los plazos del socio (D-18, bloque 4.4): verlos, ajustarlos y «está de baja desde».
+  registerPlazosRoutes(app);
 
   /**
    * EL CAMINO SIN COBRO SE QUITÓ (D-12, auditoría 8, bloque 3.5). Aquí vivían

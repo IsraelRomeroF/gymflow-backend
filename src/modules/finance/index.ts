@@ -1,7 +1,9 @@
 /**
  * Módulo FINANZAS — gastos del gimnasio y cierre de mes.
  *
- * Tablas propias: `operating_expenses`, `monthly_closes`.
+ * Tablas propias: `operating_expenses`, `monthly_closes`, `recurring_expenses`,
+ * `recurring_expense_skips` (D-26, bloque 4.5: lo que se repite se propone
+ * «por confirmar» y no cuenta hasta que alguien lo confirma).
  *
  * Nació en la auditoría 8 (fase 1, bloque 1.7) con lo que escribía
  * `analytics`, que vuelve a ser de solo lectura (A3-T12). Aquí vive la

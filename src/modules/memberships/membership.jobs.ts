@@ -8,6 +8,7 @@ import { AuditService } from '../../platform/audit/audit.service.js';
 import type { RequestContext } from '../../platform/context.js';
 import { systemContext, type JobHandler, type JobResult } from '../../platform/jobs/types.js';
 import { BusinessCalendar, type DiaDeSedes, type SedesDelDia } from '../../platform/time/business-calendar.js';
+import { plazosDe } from '../../platform/plazos/plazos-del-socio.repository.js';
 
 /**
  * Jobs del motor de membresías (§29).
@@ -235,21 +236,27 @@ const closeArchivedMembers: JobHandler = (organizationId) =>
       return true;
     });
 
-/** Cuántos días puede quedarse una venta sin cobrar antes de cancelarse sola. */
-export const DIAS_VENTA_SIN_COBRO = 14;
-/** Cuántos días lleva una suspendida sin pagar antes de darse por terminada. */
-export const DIAS_VENTANA_RECUPERACION = 90;
+/**
+ * LOS DOS PLAZOS DE ESTOS JOBS SON DEL GIMNASIO (D-18, bloque 4.4): cuántos
+ * días puede quedarse una venta sin cobrar antes de cancelarse sola (de
+ * fábrica 7; antes eran 14, escritos aquí) y cuántos lleva una suspendida sin
+ * pagar antes de terminar (de fábrica 90). Su única definición es
+ * `PLAZOS_DEL_SOCIO` del núcleo; lo ajustado por el gimnasio (con la firma de
+ * la dueña) se lee en cada corrida.
+ */
 
 /**
- * Una venta sin cobro no es un contrato: a los 14 días se cancela y sus
- * cuotas dejan de ser deuda (DM-07). Antes quedaba PENDING para siempre,
- * inflaba la cartera y bloqueaba una venta nueva.
+ * Una venta sin cobro no es un contrato: al plazo del gimnasio se cancela y
+ * sus cuotas dejan de ser deuda (DM-07; es la regla escrita `cuotaAlCerrar`,
+ * no un perdón: nunca se cobró ni dio acceso). Antes quedaba PENDING para
+ * siempre, inflaba la cartera y bloqueaba una venta nueva.
  */
-export const expirePendingSales: JobHandler = (organizationId) =>
-  run('membership.expire-pending-sales', organizationId,
-    (repo, day, sedes) => repo.pendingOlderThan(day, DIAS_VENTA_SIN_COBRO, 500, sedes),
+export const expirePendingSales: JobHandler = async (organizationId) => {
+  const { unpaidSaleDays } = await plazosDe(organizationId);
+  return run('membership.expire-pending-sales', organizationId,
+    (repo, day, sedes) => repo.pendingOlderThan(day, unpaidSaleDays, 500, sedes),
     async ({ repo, day, membership }) => {
-      const motivo = `Venta sin cobro en ${DIAS_VENTA_SIN_COBRO} días`;
+      const motivo = `Venta sin cobro en ${unpaidSaleDays} días`;
       await repo.transition({
         membershipId: membership.id, fromStatus: 'PENDING', toStatus: 'CANCELED', eventType: 'CANCELED',
         data: { canceledAt: new Date(), endedAt: new Date(), cancellationReason: motivo },
@@ -258,23 +265,28 @@ export const expirePendingSales: JobHandler = (organizationId) =>
       await emitMembershipClosed({ organizationId, membershipId: membership.id, memberId: (await repo.findById(membership.id))!.memberId, outcome: 'CANCELED', reason: motivo, fromStatus: membership.status, actorUserId: null });
       return true;
     });
+};
 
 /**
- * Una suspendida que lleva 90 días sin pagar termina (DM-07). La deuda que
- * dejó se queda como está: cobrarla o condonarla es decisión de la gerencia.
+ * Una suspendida que lleva el plazo del gimnasio sin pagar termina (DM-07).
+ * La deuda que dejó NO se borra ni se condona (D-12): desde esa noche se da
+ * por perdida (`billing.mark-lost-debt`, el job que sigue): sale de «Por
+ * cobrar», se queda en el estado de cuenta del socio y se puede cobrar.
  */
-export const expireSuspended: JobHandler = (organizationId) =>
-  run('membership.expire-suspended', organizationId,
-    (repo, day, sedes) => repo.suspendedOlderThan(day, DIAS_VENTANA_RECUPERACION, 500, sedes),
+export const expireSuspended: JobHandler = async (organizationId) => {
+  const { lostDebtDays } = await plazosDe(organizationId);
+  return run('membership.expire-suspended', organizationId,
+    (repo, day, sedes) => repo.suspendedOlderThan(day, lostDebtDays, 500, sedes),
     async ({ repo, day, membership }) => {
       await repo.transition({
         membershipId: membership.id, fromStatus: 'SUSPENDED', toStatus: 'EXPIRED', eventType: 'EXPIRED',
         data: { endedAt: new Date() },
-        reason: `${DIAS_VENTANA_RECUPERACION} días suspendida sin pagar`, payload: { motivo: 'Ventana de recuperación agotada' }, businessDate: day,
+        reason: `${lostDebtDays} días suspendida sin pagar`, payload: { motivo: 'Ventana de recuperación agotada' }, businessDate: day,
       });
       await emitMembershipClosed({ organizationId, membershipId: membership.id, memberId: (await repo.findById(membership.id))!.memberId, outcome: 'EXPIRED', reason: 'Ventana de recuperación agotada', fromStatus: membership.status, actorUserId: null });
       return true;
     });
+};
 
 /** Orden deliberado: expirar antes de que billing avance periodos o marque mora. */
 export const MEMBERSHIP_JOBS: ReadonlyArray<{ name: string; handler: JobHandler }> = [

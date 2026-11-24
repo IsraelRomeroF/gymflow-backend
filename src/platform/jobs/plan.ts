@@ -49,6 +49,8 @@ export const ORDEN_DIARIO: readonly string[] = [
   'billing.roll-periods', 'billing.generate-cycle-charges',
   'billing.mark-overdue', 'billing.mark-memberships-past-due',
   'membership.suspend-expired-grace', 'membership.expire-suspended',
+  // D-18 (bloque 4.4): la deuda de la suspendida que acaba de terminar se da por perdida (sale de «Por cobrar», no se borra).
+  'billing.mark-lost-debt',
   // Avisos al socio DESPUÉS de marcar mora y suspender: el "vencido" es de hoy (PS-03).
   'portal.notices',
   // La lista de mensajes por mandar (2.9), con la misma mora y suspensión de hoy.
@@ -57,6 +59,9 @@ export const ORDEN_DIARIO: readonly string[] = [
   'class.materialize-horizon',
   'payments.expire-cards',
   'billing.reconcile-balances',
+  // Interesados (D-31, bloque 4.7): los que llevan 60 días sin contacto se cierran solos. No toca
+  // dinero ni socios; va antes de verificar la bitácora porque asienta cada cierre en ella.
+  'prospects.auto-close',
   'privacy.retention',
   // Conservación (D-32, bloque 3.9): después de cerrar las membresías de quien
   // se dio de baja, y antes de verificar la bitácora (escribe en ella).

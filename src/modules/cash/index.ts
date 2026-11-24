@@ -15,3 +15,7 @@ export { CashService } from './cash.service.js';
 export { registerShiftContributor, type ShiftContribution } from './shift-contributors.js';
 // Consumida por: pos (no se anula una venta de un turno ya cerrado).
 export { CashSessionRepository } from './cash.repository.js';
+// Consumida por: analytics (el Inicio de la gerencia) y, en la oleada B, por los avisos al
+// teléfono de la dueña (bloque 4.2). Cajas que amanecieron sin cortar y descuadres por revisar (D-17).
+export { CashAlertsService, type CajaSinCortar } from './cash-alerts.service.js';
+export type { DescuadresPorRevisar } from './cash.repository.js';

@@ -107,12 +107,13 @@ describe('3.7 · dirección', () => {
 
     it('lo tardío se anota en el mes en curso como «ajuste de ‹mes›», etiquetado', async () => {
       // Directo al mes cerrado: 409 con la causa, para que la pantalla ofrezca el ajuste.
-      const directo = await gasto(owner, { month: MES, description: 'Nómina que faltó', category: 'PAYROLL', amountCents: '250000' });
+      // Bloque 4.5 (D-26): la nómina se anota por pago, con fecha y a quién; el mes sale de la fecha.
+      const directo = await gasto(owner, { paidOn: `${MES}-27`, payeeName: 'Persona de prueba', description: 'Nómina que faltó', category: 'PAYROLL', amountCents: '250000' });
       expect(directo.statusCode, directo.body).toBe(409);
       expect(directo.json()).toMatchObject({ reason: 'MONTH_CLOSED' });
       expect(directo.json().message).toContain('ajuste de marzo de 2024');
 
-      const ajuste = await gasto(owner, { month: MES, description: 'Nómina que faltó', category: 'PAYROLL', amountCents: '250000', asAdjustment: true });
+      const ajuste = await gasto(owner, { paidOn: `${MES}-27`, payeeName: 'Persona de prueba', description: 'Nómina que faltó', category: 'PAYROLL', amountCents: '250000', asAdjustment: true });
       expect(ajuste.statusCode, ajuste.body).toBe(201);
       const lista = (await get(owner, `/expenses?month=${MES}`)).json() as ExpenseList;
       expect(diferenciasConElContrato(ExpenseList, lista)).toEqual([]);
@@ -151,7 +152,8 @@ describe('3.7 · dirección', () => {
   describe('D-23 · la dueña con el dinero', () => {
     it('anota gastos, nómina y «Retiro del dueño» aunque haya gerente; el retiro no resta de la ganancia', async () => {
       const MES = '2024-06';
-      const nomina = await gasto(owner, { month: MES, category: 'PAYROLL', description: 'Nómina de junio', amountCents: '4000000' });
+      // Bloque 4.5 (D-26): por pago.
+      const nomina = await gasto(owner, { paidOn: `${MES}-28`, payeeName: 'Persona de prueba', category: 'PAYROLL', description: 'Nómina de junio', amountCents: '4000000' });
       expect(nomina.statusCode, nomina.body).toBe(201);
       const antes = (await get(owner, `/reports/daily?from=${MES}-01&to=${MES}-30`)).json();
       expect(antes.totals.profitCents).toBe('-4000000');

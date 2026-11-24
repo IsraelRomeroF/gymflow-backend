@@ -79,6 +79,24 @@ export class ResponsibleRepository extends TenantRepository {
     });
   }
 
+  /**
+   * Ese socio cambió de celular (fase 4, bloque 4.8; D-36): quienes lo tenían
+   * anotado como responsable de un número que ya no es el suyo se quedan sin
+   * responsable (su ficha vuelve a decir «Falta anotar quién responde por el
+   * número» si lo siguen compartiendo). Devuelve a cuántos.
+   */
+  async soltarA(responsableId: string): Promise<number> {
+    const yo = await this.db.member.findFirst({ where: this.scope({ id: responsableId }), select: { phoneE164: true } });
+    const { count } = await this.db.member.updateMany({
+      where: this.scope({
+        responsibleKind: 'MEMBER', responsibleMemberId: responsableId,
+        ...(yo?.phoneE164 ? { OR: [{ phoneE164: null }, { phoneE164: { not: yo.phoneE164 } }] } : {}),
+      }),
+      data: { responsibleKind: null, responsibleMemberId: null },
+    });
+    return count;
+  }
+
   async nombres(ids: readonly string[]): Promise<Map<string, { fullName: string; memberCode: string; anonymized: boolean }>> {
     if (ids.length === 0) return new Map();
     const rows = await this.db.member.findMany({

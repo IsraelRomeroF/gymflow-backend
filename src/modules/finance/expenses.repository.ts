@@ -19,12 +19,27 @@ export type Gasto = {
   adjustsMonth: Date | null;
   /** El gasto del mes cerrado que este ajuste corrige (en negativo). */
   adjustsExpenseId: string | null;
+  /** D-26 (4.5): un PAGO de nómina lleva su fecha y a quién. La nómina anotada antes como un total no los trae. */
+  paidOn: Date | null;
+  payeeUserId: string | null;
+  payeeName: string | null;
+  /** La propuesta (gasto que se repite y su fecha) de la que salió, si alguien la confirmó. */
+  recurringId: string | null;
+  recurringDue: Date | null;
 };
 
 const SELECT = {
   id: true, branchId: true, category: true, description: true, amountCents: true, periodMonth: true,
   createdByUserId: true, createdAt: true, voidedAt: true, voidReason: true, adjustsMonth: true, adjustsExpenseId: true,
+  paidOn: true, payeeUserId: true, payeeName: true, recurringId: true, recurringDue: true,
 } as const;
+
+export const NOMINA = 'PAYROLL';
+/**
+ * ¿Es un pago de nómina A UNA PERSONA? Eso solo lo ve quien tiene Movimientos
+ * (`expenses:payroll:read`, D-26). La nómina de antes, un total sin nombre, no.
+ */
+export const esPagoAPersona = (g: Pick<Gasto, 'payeeName'>): boolean => g.payeeName !== null;
 
 /** ¿Resta de la ganancia? Todo menos el retiro del dueño. */
 export const restaDeLaGanancia = (g: Pick<Gasto, 'category'>): boolean => g.category !== RETIRO_DEL_DUENO;
@@ -34,6 +49,8 @@ export class ExpensesRepository extends TenantRepository {
   async create(input: {
     branchId: string | null; category: string; description: string; amountCents: bigint; periodMonth: Date; createdByUserId: string;
     adjustsMonth?: Date | null; adjustsExpenseId?: string | null;
+    paidOn?: Date | null; payeeUserId?: string | null; payeeName?: string | null;
+    recurringId?: string | null; recurringDue?: Date | null;
   }): Promise<Gasto> {
     return this.db.operatingExpense.create({
       data: { id: uuidv7(), organizationId: this.organizationId, ...input },

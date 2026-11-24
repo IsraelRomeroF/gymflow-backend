@@ -34,3 +34,20 @@ export function equipoDe(userAgent: string | null | undefined): string | null {
   if (!aparato && !navegador) return null;
   return [aparato, navegador].filter(Boolean).join(' · ');
 }
+
+/**
+ * ¿Ese navegador dice ser un TELÉFONO? (D-04, bloque 4.1.) iPhone o Android
+ * de bolsillo; ni tableta ni computadora: una tableta puede estar en el
+ * mostrador. Ante la duda, no: lo que no es claramente un teléfono se trata
+ * como mostrador, que es la sesión corta.
+ *
+ * No prueba nada (el navegador dice lo que quiere): por eso NO basta para la
+ * sesión larga. Solo cuenta junto con el puesto de dueña y la contraseña
+ * correcta, y lo único que consigue quien finge un teléfono con esa cuenta y
+ * esa contraseña es lo que la dueña ya tiene en el suyo.
+ */
+export function esTelefono(userAgent: string | null | undefined): boolean {
+  const ua = userAgent ?? '';
+  if (/iPad|Tablet/i.test(ua)) return false;
+  return /iPhone/.test(ua) || (/Android/.test(ua) && /Mobile/.test(ua));
+}

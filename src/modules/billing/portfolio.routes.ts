@@ -43,6 +43,9 @@ export function registerPortfolioRoutes(app: FastifyInstance): void {
         totalOutstandingLabel: formatMoney(money(snapshot.totalOutstandingCents)),
         overdueCents: cents(snapshot.overdueCents),
         membersWithDebt: snapshot.membersWithDebt,
+        // D-18 (4.4): dada por perdida; no está en ninguna de las cifras de arriba.
+        lostCents: cents(snapshot.lostCents),
+        lostMembers: snapshot.lostMembers,
         creditBalanceCents: cents(snapshot.creditBalanceCents),
         byAging: snapshot.byAging.map((r) => ({
           bucket: r.bucket,

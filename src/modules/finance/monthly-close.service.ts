@@ -7,6 +7,7 @@ import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 import { ExpensesRepository } from './expenses.repository.js';
 import { monthFigures, type CifrasDeCaja, type CifrasDelMes, type MonthFigures } from './month-figures.js';
 import { MonthlyCloseRepository, type MonthlyCloseRecord } from './monthly-close.repository.js';
+import { porConfirmarEnElMes } from './propuestas.js';
 
 /** Hoy en el gimnasio y en cada sede, según el servidor (A3 T9). */
 export type FechasDeNegocio = MonthlyClosePreview['businessDates'];
@@ -118,12 +119,13 @@ export class MonthlyCloseService {
     const orgId = ctx.tenant.organizationId;
     const { from, to } = this.rangoDelMes(month);
     const repo = new MonthlyCloseRepository(orgId);
-    const [fechas, cerrado, cajas, gastos, cifras] = await Promise.all([
+    const [fechas, cerrado, cajas, gastos, cifras, porConfirmar] = await Promise.all([
       this.fechasDeNegocio(ctx),
       repo.find(from),
       repo.cajasAbiertasDelMes(from, to),
       new ExpensesRepository(orgId).vigentes(from, to),
       monthFigures(ctx, { from, to }),
+      porConfirmarEnElMes(orgId, month),
     ]);
     const fijos = gastos.filter((g) => g.periodMonth.getTime() === from.getTime());
 
@@ -136,6 +138,15 @@ export class MonthlyCloseService {
     // todavía en curso no se dice: tener cajas abiertas es lo normal y el bloqueo que cuenta es el otro.
     if (fin.ok && cajas.length > 0) blockers.push({ code: 'OPEN_CASH_SESSIONS', message: cajasAbiertas(cajas.length) });
     if (fijos.length === 0) warnings.push({ code: 'NO_FIXED_EXPENSES', message: 'No hay gastos fijos registrados en ese mes (renta, nómina): la utilidad sale sin ellos.' });
+    // D-26 (4.5): lo propuesto y sin confirmar no es un gasto y no entra en la foto. Avisa, no impide.
+    if (!cerrado && porConfirmar > 0) {
+      warnings.push({
+        code: 'EXPENSES_TO_CONFIRM',
+        message: porConfirmar === 1
+          ? 'Hay un gasto que se repite por confirmar en ese mes: no cuenta en la foto. Confírmalo o descártalo en Movimientos antes de cerrar.'
+          : `Hay ${porConfirmar} gastos que se repiten por confirmar en ese mes: no cuentan en la foto. Confírmalos o descártalos en Movimientos antes de cerrar.`,
+      });
+    }
 
     const { nombres: _n, ...businessDates } = fechas;
     return {

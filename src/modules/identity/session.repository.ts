@@ -1,4 +1,5 @@
 import { uuidv7, type Grant, lockedPermissions, applyOverrides, normalizeOverrides, ADJUSTABLE_ROLES } from '@gymflow/core';
+import type { SessionKind } from '@gymflow/core/contracts';
 import { GlobalRepository } from '../../platform/db/tenant-repository.js';
 import type { LimitRow } from './role.repository.js';
 import type { UserRecord } from './user.repository.js';
@@ -8,32 +9,74 @@ import type { UserRecord } from './user.repository.js';
 export const STAFF_MAX_SESSION_HOURS = 16;
 
 /**
+ * SESIONES POR LUGAR (D-04, opción a; fase 4, bloque 4.1). `sessions.kind`:
+ *
+ * - `COUNTER`, el MOSTRADOR y, ante la duda, cualquier otro equipo: se cierra
+ *   a las 12 horas de haber entrado, pase lo que pase. Es el valor por omisión.
+ * - `OWNER_PHONE`, el TELÉFONO DE LA DUEÑA: dura 30 días que se renuevan con
+ *   el uso (`OWNER_PHONE_IDLE_DAYS`) y nunca pasa de `OWNER_PHONE_MAX_DAYS`
+ *   desde que entró, por mucho que se use.
+ *
+ * El lugar se decide UNA vez, al entrar con la contraseña correcta
+ * (`AuthService.lugarDe`), y queda escrito en la sesión: nada lo sube después.
+ * Revocar, «Mis sesiones», el cambio de contraseña y la baja cortan igual a
+ * las dos, y una sesión cerrada o vencida no se renueva (`renovar`).
+ */
+export type LugarDeSesion = SessionKind;
+
+/** Días sin usarlo que aguanta la sesión del teléfono de la dueña. */
+export const OWNER_PHONE_IDLE_DAYS = 30;
+/**
+ * Días que dura como mucho la sesión del teléfono de la dueña aunque la use a
+ * diario: una cookie copiada no vive para siempre (SEC-11); la dueña vuelve a
+ * escribir su contraseña una vez por trimestre.
+ */
+export const OWNER_PHONE_MAX_DAYS = 90;
+/** Cada cuánto, como mucho, se corre el vencimiento de una sesión que se renueva (y se vuelve a poner su cookie). */
+export const RENOVAR_CADA_MS = 3_600_000;
+
+/**
  * TOPE ABSOLUTO de cada tipo de sesión, desde que se entra (24-04): la del
  * personal y la de la plataforma. Es lo que dura la cookie en el navegador, y
  * el servidor no acepta la sesión ni un minuto más: lo que se le dice a la
  * persona («se cierra a las 19:05») es lo que pasa.
+ *
+ * El teléfono de la dueña (D-04) tiene dos: `telefonoMs`, lo que aguanta sin
+ * uso (y lo que dura su cookie cada vez que se renueva), y `telefonoMaxMs`,
+ * su tope desde que entró.
  */
-export type TopesDeSesion = { personalMs: number; plataformaMs: number };
+export type TopesDeSesion = { personalMs: number; plataformaMs: number; telefonoMs: number; telefonoMaxMs: number };
 
-/** La sesión del personal tiene gimnasio; la de la plataforma, no. */
-export function topeDe(topes: TopesDeSesion, organizationId: string | null): number {
-  return organizationId ? topes.personalMs : topes.plataformaMs;
+/** El tope desde que se entró. La sesión de la plataforma no tiene gimnasio y nunca es de teléfono. */
+export function topeDe(topes: TopesDeSesion, organizationId: string | null, kind: string = 'COUNTER'): number {
+  if (!organizationId) return topes.plataformaMs;
+  return kind === 'OWNER_PHONE' ? topes.telefonoMaxMs : topes.personalMs;
+}
+
+/** Lo que dura al nacer: su tope, o en el teléfono de la dueña lo que aguanta sin uso. */
+export function duracionInicial(topes: TopesDeSesion, organizationId: string | null, kind: string): number {
+  return organizationId && kind === 'OWNER_PHONE' ? Math.min(topes.telefonoMs, topes.telefonoMaxMs) : topeDe(topes, organizationId, kind);
+}
+
+/** ¿Se renueva con el uso? Solo el teléfono de la dueña, en un gimnasio. */
+export function seRenueva(s: { organizationId: string | null; kind: string }): boolean {
+  return !!s.organizationId && s.kind === 'OWNER_PHONE';
 }
 
 /** Hasta cuándo vale una sesión: su vencimiento, nunca después del tope desde que se entró. */
-export function finDe(s: { createdAt: Date; expiresAt: Date; organizationId: string | null }, topes: TopesDeSesion): Date {
-  return new Date(Math.min(s.expiresAt.getTime(), s.createdAt.getTime() + topeDe(topes, s.organizationId)));
+export function finDe(s: { createdAt: Date; expiresAt: Date; organizationId: string | null; kind?: string }, topes: TopesDeSesion): Date {
+  return new Date(Math.min(s.expiresAt.getTime(), s.createdAt.getTime() + topeDe(topes, s.organizationId, s.kind)));
 }
 
 /** Una sesión viva en la lista de «Mis sesiones» y en Seguridad de la plataforma. */
 export type SesionViva = {
   id: string; organizationId: string | null; deviceLabel: string | null; userAgent: string | null; ip: string | null;
-  createdAt: Date; lastSeenAt: Date; expiresAt: Date;
+  createdAt: Date; lastSeenAt: Date; expiresAt: Date; kind: string;
 };
 
 /** Lo que queda de una sesión que ya no sirve: con esto se dice por qué (24-06). */
 export type SesionTerminada = {
-  organizationId: string | null; createdAt: Date; expiresAt: Date; revokedAt: Date | null; revokedReason: string | null;
+  organizationId: string | null; createdAt: Date; expiresAt: Date; revokedAt: Date | null; revokedReason: string | null; kind: string;
   user: { isActive: boolean; deletedAt: Date | null };
 };
 
@@ -44,6 +87,8 @@ export type SessionRecord = {
   activeBranchId: string | null;
   expiresAt: Date;
   lastSeenAt?: Date | null;
+  /** De qué lugar es (D-04): `COUNTER` u `OWNER_PHONE`. */
+  kind?: string;
   /** Hasta cuándo vale la reconfirmación con la contraseña (plataforma). */
   stepUpUntil?: Date | null;
 };
@@ -58,6 +103,8 @@ export class SessionRepository extends GlobalRepository {
     ip?: string | undefined;
     userAgent?: string | undefined;
     deviceLabel?: string | undefined;
+    /** El lugar (D-04). Sin decirlo, mostrador: la corta. */
+    kind?: LugarDeSesion | undefined;
   }): Promise<SessionRecord> {
     const session = await this.db.session.create({
       data: {
@@ -70,8 +117,9 @@ export class SessionRepository extends GlobalRepository {
         ip: input.ip ?? null,
         userAgent: input.userAgent ?? null,
         deviceLabel: input.deviceLabel ?? null,
+        kind: input.kind ?? 'COUNTER',
       },
-      select: { id: true, userId: true, organizationId: true, activeBranchId: true, expiresAt: true, lastSeenAt: true },
+      select: { id: true, userId: true, organizationId: true, activeBranchId: true, expiresAt: true, lastSeenAt: true, kind: true },
     });
     return session;
   }
@@ -98,20 +146,25 @@ export class SessionRepository extends GlobalRepository {
    * cualquier ruta. Además del vencimiento, el tope de su tipo desde que se
    * entró (24-04): una sesión de antes, con el vencimiento corrido, tampoco
    * pasa de ahí.
+   *
+   * D-04 (bloque 4.1): el tope es el de su LUGAR. La hora sale del reloj de
+   * la API (`Date`), no del de la base: una sola hora para decidir si vive,
+   * para renovarla y para decir cuándo se cierra.
    */
-  async resolveByTokenHash(tokenHash: string, topes: TopesDeSesion): Promise<{ session: SessionRecord & { lastSeenAt: Date; createdAt: Date }; user: UserRecord; grants: Grant[]; limitRows: LimitRow[]; unlockedSections: string[]; platformSections: string[] | null; roleKeys: string[] } | null> {
-    const desde = new Date(Date.now() - STAFF_MAX_SESSION_HOURS * 3_600_000);
-    const desdePersonal = new Date(Date.now() - topes.personalMs);
-    const desdePlataforma = new Date(Date.now() - topes.plataformaMs);
+  async resolveByTokenHash(tokenHash: string, topes: TopesDeSesion): Promise<{ session: SessionRecord & { lastSeenAt: Date; createdAt: Date; kind: string }; user: UserRecord; grants: Grant[]; limitRows: LimitRow[]; unlockedSections: string[]; platformSections: string[] | null; roleKeys: string[] } | null> {
+    const ahora = new Date();
+    const desdePersonal = new Date(ahora.getTime() - topes.personalMs);
+    const desdePlataforma = new Date(ahora.getTime() - topes.plataformaMs);
+    const desdeTelefono = new Date(ahora.getTime() - topes.telefonoMaxMs);
     const rows = await this.db.$queryRaw<Array<{
-      id: string; userId: string; organizationId: string | null; activeBranchId: string | null; expiresAt: Date; lastSeenAt: Date; stepUpUntil: Date | null; createdAt: Date;
+      id: string; userId: string; organizationId: string | null; activeBranchId: string | null; expiresAt: Date; lastSeenAt: Date; stepUpUntil: Date | null; createdAt: Date; kind: string;
       userOrganizationId: string | null; email: string; passwordHash: string; fullName: string; isActive: boolean;
       failedLogins: number; lockedUntil: Date | null; mustChangePassword: boolean; passwordResetAt: Date | null; passwordResetByUserId: string | null;
       unlockedSections: string[]; platformSections: string[] | null; roleKeys: string[];
       grants: Grant[]; limits: LimitRow[]; permissionOverrides: unknown; assignmentBranches: Array<string | null>; orgHasManager: boolean;
       isProxy: boolean;
     }>>`
-      SELECT s.id, s."userId", s."organizationId", s."activeBranchId", s."expiresAt", s."lastSeenAt", s."stepUpUntil", s."createdAt",
+      SELECT s.id, s."userId", s."organizationId", s."activeBranchId", s."expiresAt", s."lastSeenAt", s."stepUpUntil", s."createdAt", s."kind",
              u."organizationId" AS "userOrganizationId", u.email, u."passwordHash", u."fullName", u."isActive",
              u."failedLogins", u."lockedUntil", u."mustChangePassword", u."passwordResetAt", u."passwordResetByUserId",
              u."unlockedSections", u."platformSections", u."permissionOverrides",
@@ -153,13 +206,15 @@ export class SessionRepository extends GlobalRepository {
              ), '[]'::json) AS limits
       FROM sessions s
       JOIN users u ON u.id = s."userId" AND u."deletedAt" IS NULL
-      WHERE s."tokenHash" = ${tokenHash} AND s."revokedAt" IS NULL AND s."expiresAt" > now() AND s."createdAt" > ${desde}
-        AND s."createdAt" > (CASE WHEN s."organizationId" IS NULL THEN ${desdePlataforma}::timestamptz ELSE ${desdePersonal}::timestamptz END)
+      WHERE s."tokenHash" = ${tokenHash} AND s."revokedAt" IS NULL AND s."expiresAt" > ${ahora}
+        AND s."createdAt" > (CASE WHEN s."organizationId" IS NULL THEN ${desdePlataforma}::timestamptz
+                                  WHEN s."kind" = 'OWNER_PHONE' THEN ${desdeTelefono}::timestamptz
+                                  ELSE ${desdePersonal}::timestamptz END)
       LIMIT 1`;
     const r = rows[0];
     if (!r) return null;
     return {
-      session: { id: r.id, userId: r.userId, organizationId: r.organizationId, activeBranchId: r.activeBranchId, expiresAt: r.expiresAt, lastSeenAt: r.lastSeenAt, stepUpUntil: r.stepUpUntil, createdAt: r.createdAt },
+      session: { id: r.id, userId: r.userId, organizationId: r.organizationId, activeBranchId: r.activeBranchId, expiresAt: r.expiresAt, lastSeenAt: r.lastSeenAt, stepUpUntil: r.stepUpUntil, createdAt: r.createdAt, kind: r.kind },
       user: {
         id: r.userId, organizationId: r.userOrganizationId, email: r.email, passwordHash: r.passwordHash, fullName: r.fullName,
         isActive: r.isActive, failedLogins: r.failedLogins, lockedUntil: r.lockedUntil, mustChangePassword: r.mustChangePassword,
@@ -213,20 +268,36 @@ export class SessionRepository extends GlobalRepository {
     });
   }
 
+  /**
+   * RENOVAR con el uso (D-04): corre el vencimiento de la sesión del teléfono
+   * de la dueña hasta `hasta`. Solo a una sesión de ese lugar, SIN cerrar y
+   * SIN vencer, y solo hacia adelante: una sesión revocada («Mis sesiones»,
+   * cambio de contraseña, baja) o ya vencida no revive por más que alguien
+   * siga presentando su cookie. `true` si se corrió.
+   */
+  async renovar(id: string, hasta: Date): Promise<boolean> {
+    const ahora = new Date();
+    const { count } = await this.db.session.updateMany({
+      where: { id, kind: 'OWNER_PHONE', organizationId: { not: null }, revokedAt: null, expiresAt: { gt: ahora, lt: hasta } },
+      data: { expiresAt: hasta, lastSeenAt: ahora },
+    });
+    return count > 0;
+  }
+
   /** Por qué ya no sirve una cookie: la sesión que dejó, si queda (se borran a los 7 días). */
   async terminadaPorToken(tokenHash: string): Promise<SesionTerminada | null> {
     return this.db.session.findUnique({
       where: { tokenHash },
       select: {
-        organizationId: true, createdAt: true, expiresAt: true, revokedAt: true, revokedReason: true,
+        organizationId: true, createdAt: true, expiresAt: true, revokedAt: true, revokedReason: true, kind: true,
         user: { select: { isActive: true, deletedAt: true } },
       },
     });
   }
 
   /** Desde cuándo y hasta cuándo, para que el panel diga a qué hora se cierra esta sesión. */
-  async porId(id: string): Promise<{ id: string; organizationId: string | null; createdAt: Date; expiresAt: Date } | null> {
-    return this.db.session.findUnique({ where: { id }, select: { id: true, organizationId: true, createdAt: true, expiresAt: true } });
+  async porId(id: string): Promise<{ id: string; organizationId: string | null; createdAt: Date; expiresAt: Date; kind: string } | null> {
+    return this.db.session.findUnique({ where: { id }, select: { id: true, organizationId: true, createdAt: true, expiresAt: true, kind: true } });
   }
 
   /**
@@ -274,11 +345,12 @@ export class SessionRepository extends GlobalRepository {
       where: {
         userId, revokedAt: null, expiresAt: { gt: new Date(ahora) },
         OR: [
-          { organizationId: { not: null }, createdAt: { gt: new Date(ahora - vivas.topes.personalMs) } },
+          { organizationId: { not: null }, kind: { not: 'OWNER_PHONE' }, createdAt: { gt: new Date(ahora - vivas.topes.personalMs) } },
+          { organizationId: { not: null }, kind: 'OWNER_PHONE', createdAt: { gt: new Date(ahora - vivas.topes.telefonoMaxMs) } },
           { organizationId: null, createdAt: { gt: new Date(ahora - vivas.topes.plataformaMs) }, lastSeenAt: { gt: new Date(ahora - vivas.inactividadPlataformaMs) } },
         ],
       },
-      select: { id: true, organizationId: true, deviceLabel: true, userAgent: true, ip: true, createdAt: true, lastSeenAt: true, expiresAt: true },
+      select: { id: true, organizationId: true, deviceLabel: true, userAgent: true, ip: true, createdAt: true, lastSeenAt: true, expiresAt: true, kind: true },
       orderBy: { lastSeenAt: 'desc' },
     });
   }

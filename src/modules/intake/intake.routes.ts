@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { nombrePersona } from '../../platform/http/person-name.js';
 import { telefonoMx } from '../../platform/http/phone.js';
 import { z } from 'zod';
-import { INTAKE_CORRECTABLE_FIELDS, intakeFolio, notFound, validation } from '@gymflow/core';
+import { INTAKE_CORRECTABLE_FIELDS, forbidden, intakeFolio, notFound, validation } from '@gymflow/core';
 import {
   ConsentDocumentList, IntakeCorrectionsSaved, IntakeDetail, IntakeList, IntakeResolved, PAGINA_MAXIMA, PAGINA_POR_OMISION, leerCursor,
 } from '@gymflow/core/contracts';
@@ -13,6 +13,7 @@ import { contar, registerModuleUsage } from '../../platform/modules/usage.js';
 import { isModuleOnAt } from '../../platform/modules/module-state.js';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { ConsentDocumentRepository, esAvisoPorFirmar, guardianSchema, listarTextos, pedirFirmaDelAviso, publicarTexto, responsibleSchema, retirarTexto } from '../members/index.js';
+import { planesPublicos } from '../prospects/index.js';
 import { IntakeRepository, datosBorrados } from './intake.repository.js';
 import { IntakeService, correccionesVigentes } from './intake.service.js';
 import { registerOnboardingRoutes } from './onboarding.routes.js';
@@ -114,7 +115,9 @@ export function registerIntakeRoutes(app: FastifyInstance, env: Env): void {
       // organizationId del cliente sería el fallo clásico de multi-tenancy.
       const { id: orgId, branchId } = await sedePublica(request.params);
       await exigirAltasEncendidas(orgId, branchId);
-      return { ...(await service.form(orgId, branchId)), branchId };
+      // D-31 (bloque 4.7, edición puntual): quien escanea el cartel ve los planes que vende ESA
+      // sucursal con su precio de lista, sin promociones. Es público a propósito: es la lista de precios.
+      return { ...(await service.form(orgId, branchId)), branchId, plans: await planesPublicos(orgId, branchId) };
     },
   });
 
@@ -163,11 +166,23 @@ export function registerIntakeRoutes(app: FastifyInstance, env: Env): void {
 
   // ── Bandeja de revisión ───────────────────────────────────────────────────
 
-  /** El alta pertenece a una sede: solo la aprueba o rechaza quien opera ahí. */
-  async function autorizarSede(request: FastifyRequest, intakeId: string): Promise<void> {
+  /**
+   * El alta pertenece a una sede: solo la aprueba o rechaza quien opera ahí.
+   *
+   * `notaDeSalud` (D-33 y choque 6 del consolidado; bloque 4.7, edición
+   * puntual): la nota de salud de un menor la dicta su tutor al firmar, y la
+   * ESCRIBE solo quien puede leerla (`members:health:read` en esa sede: la
+   * gerencia, o la persona a quien se lo encendieron con motivo). Recepción,
+   * con su puesto, registra el permiso del tutor pero no teclea la nota: un
+   * dato sensible no lo escribe quien después no puede ni verlo.
+   */
+  async function autorizarSede(request: FastifyRequest, intakeId: string, notaDeSalud?: string | null): Promise<void> {
     const intake = await new IntakeRepository(request.ctx!.tenant.organizationId).findById(intakeId);
     if (!intake) throw notFound('Alta no encontrada');
     request.requirePermission('members:intake:review', intake.branchId);
+    if (notaDeSalud?.trim() && !request.holds('members:health:read', intake.branchId)) {
+      throw forbidden('La nota de salud la escribe quien puede verla: la gerencia. Aprueba el alta sin la nota (el permiso del tutor sí queda) o pide a la gerencia que la apruebe');
+    }
   }
 
   /** Solo el número de la bandeja: el menú del panel lo muestra en cada pantalla (OPT-07). */
@@ -339,7 +354,7 @@ export function registerIntakeRoutes(app: FastifyInstance, env: Env): void {
         // D-29 (bloque 3.8): quien aprueba elige el coach, igual que en el alta del mostrador.
         coachUserId: z.string().uuid().nullish(),
       }).parse(request.body ?? {});
-      await autorizarSede(request, id);
+      await autorizarSede(request, id, guardian?.healthConsent ? guardian.healthNotes : null);
       const c = limpias(corrections);
       const r = await service.approve(request.ctx!, id, { force, responsible, guardian, coachUserId, ...(c ? { corrections: c } : {}) });
       return reply.status(201).send(r);
@@ -356,7 +371,7 @@ export function registerIntakeRoutes(app: FastifyInstance, env: Env): void {
       const { id } = idParam.parse(request.params);
       // Con lo corregido, igual que aprobar (9-03): antes la corrección se descartaba sin aviso.
       const { memberId, corrections, responsible, guardian } = z.object({ memberId: z.string().uuid(), ...decisionBody }).parse(request.body);
-      await autorizarSede(request, id);
+      await autorizarSede(request, id, guardian?.healthConsent ? guardian.healthNotes : null);
       const c = limpias(corrections);
       return reply.status(201).send(await service.link(request.ctx!, id, memberId, { responsible, guardian, ...(c ? { corrections: c } : {}) }));
     },

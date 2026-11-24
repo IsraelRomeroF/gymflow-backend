@@ -21,6 +21,7 @@ import { diaDeCobroDe, esMes } from './cobro-reglas.js';
 import { PlatformCollectionsService } from './cobranza.service.js';
 import { PlatformPricingService } from './platform-pricing.service.js';
 import { registerGymAccountRoutes } from './cuenta-con-gymflow.routes.js';
+import { registerGymBrandRoutes } from './ficha-de-marca.routes.js';
 import { PlatformPlanRepository } from './platform-plan.repository.js';
 import type { Env } from '../../platform/env.js';
 
@@ -99,6 +100,8 @@ export function registerTenantRoutes(app: FastifyInstance, env: Env): void {
   /** Día 1 de un mes, `AAAA-MM-01`: desde qué factura aplica un cambio anunciado. */
   const desdeFactura = z.string().regex(/^\d{4}-(0[1-9]|1[0-2])-01$/, 'Escribe el día 1 del mes desde el que aplica, como AAAA-MM-01');
   registerGymAccountRoutes(app);
+  // Datos y marca del gimnasio (D-27, bloque 4.6): la ficha de marca y las solicitudes de cambio.
+  registerGymBrandRoutes(app);
   const planes = new PlatformPlanRepository();
   /** La cadena de plataforma: lo que solo pasa en la consola se asienta aquí (24-19, 23-09). */
   const cadena = new PlatformAuditService();

@@ -1,7 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { validation, type PermissionKey } from '@gymflow/core';
-import { RetentionAlerts, RetentionSummary } from '@gymflow/core/contracts';
+import { RetentionAlerts, RetentionSummary, WinbackList } from '@gymflow/core/contracts';
 import { route } from '../../platform/http/registry.js';
 import { respuesta } from '../../platform/http/respuesta.js';
 import { sedeDeConsulta } from '../../platform/http/branch-scope.js';
@@ -75,6 +75,7 @@ export function registerRetentionRoutes(app: FastifyInstance): void {
       return {
         asOf: r.asOf,
         counts: r.counts,
+        terms: { ...r.terms },
         // Cuántos hay que llamar ANTES del recorte: antes era `outreach.length`
         // y la pantalla no podía saber que faltaban.
         total: r.total,
@@ -123,6 +124,33 @@ export function registerRetentionRoutes(app: FastifyInstance): void {
         ? await calcular()
         : await recordar(`retention:${ctx.tenant.organizationId}:${sede ?? '*'}`, VIGENCIA_CIFRAS_MS, calcular);
       return { asOf: r.asOf, branchId: sede, counts: r.counts, atRisk: r.atRisk };
+    },
+  });
+
+  /**
+   * «Recuperar» (D-18, 15-10): a quién se le sigue buscando después de que se
+   * perdió o se dio de baja, durante los meses del gimnasio (de fábrica 6).
+   * Trae nombres y teléfonos: la abre quien ve la lista de Retención, en sus
+   * sedes. La dueña no (cifras sí, nombres no: ADR-039).
+   *
+   * Contrato: `WinbackList` (`@gymflow/core/contracts`).
+   */
+  route(app, {
+    method: 'GET',
+    url: '/retention/winback',
+    module: 'retention',
+    security: { kind: 'permission', permission: VER_LISTA },
+    schema: respuesta(200, WinbackList),
+    handler: async (request): Promise<WinbackList> => {
+      const q = z.object({
+        branchId: z.string().uuid().optional(),
+        limit: z.coerce.number().int().min(1).max(500).optional(),
+      }).parse(request.query);
+      const r = await retention.winback(request.ctx!, {
+        branchId: sedeDeConsulta(request, VER_LISTA, q.branchId),
+        ...(q.limit ? { limit: q.limit } : {}),
+      });
+      return { asOf: r.asOf, terms: { ...r.terms }, total: r.total, counts: r.counts, members: r.members };
     },
   });
 }

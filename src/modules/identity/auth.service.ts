@@ -4,10 +4,13 @@ import { DomainError } from '@gymflow/core';
 import { generateOpaqueToken, hashToken } from '../../platform/crypto.js';
 import { ErrorConMotivo } from '../../platform/http/sesion.js';
 import { AuthUserRepository } from './user.repository.js';
-import { mergeLimits } from './role.repository.js';
-import { STAFF_MAX_SESSION_HOURS, SessionRepository, finDe, topeDe, type SesionViva, type TopesDeSesion } from './session.repository.js';
+import { GrantRepository, mergeLimits } from './role.repository.js';
+import {
+  OWNER_PHONE_IDLE_DAYS, OWNER_PHONE_MAX_DAYS, RENOVAR_CADA_MS, STAFF_MAX_SESSION_HOURS, SessionRepository,
+  duracionInicial, finDe, seRenueva, topeDe, type LugarDeSesion, type SesionViva, type TopesDeSesion,
+} from './session.repository.js';
 import { finDeSesion, motivoDeRevocacion, textoDeFin, type FinDeSesion } from './fin-de-sesion.js';
-import { equipoDe } from './equipo.js';
+import { equipoDe, esTelefono } from './equipo.js';
 import { KnownDeviceRepository } from './known-device.repository.js';
 import { moduleViewOf } from '../../platform/modules/module-state.js';
 import type { Env } from '../../platform/env.js';
@@ -70,7 +73,11 @@ type Resuelta = NonNullable<Awaited<ReturnType<SessionRepository['resolveByToken
 
 /** Resultado de resolver una cookie: la sesión, o por qué ya no sirve (24-06). */
 export type Resolucion =
-  | { ok: true; session: Resuelta['session']; user: Resuelta['user']; grants: Resuelta['grants']; roleKeys: string[]; limits: ReturnType<typeof mergeLimits> | null }
+  | {
+    ok: true; session: Resuelta['session']; user: Resuelta['user']; grants: Resuelta['grants']; roleKeys: string[]; limits: ReturnType<typeof mergeLimits> | null;
+    /** La sesión se renovó en ESTA petición (D-04): hasta cuándo vale ahora; quien responde vuelve a poner la cookie con esa fecha. */
+    renovadaHasta?: Date;
+  }
   | { ok: false; fin: FinDeSesion };
 
 /** Una sesión viva, como la ven «Mis sesiones» y Seguridad de la plataforma (24-05, 24-14). */
@@ -78,8 +85,10 @@ export type SesionDeLaLista = {
   id: string; ip: string | null; createdAt: Date; lastSeenAt: Date; expiresAt: Date;
   /** El equipo en palabras de la persona («iPhone · Safari»), o null si el navegador no lo dice. */
   deviceLabel: string | null; device: string | null;
-  /** A qué hora se cierra aunque se siga usando (el tope desde que se entró). */
+  /** A qué hora se cierra aunque se siga usando (el tope desde que se entró); si se renueva, cuándo se cerraría sin más uso. */
   endsAt: Date;
+  /** De qué lugar es (D-04) y si se renueva con el uso (solo el teléfono de la dueña). */
+  kind: LugarDeSesion; renews: boolean;
   /** Plataforma: a qué hora se cierra si nadie la usa antes. */
   idleEndsAt: Date | null;
 };
@@ -115,7 +124,33 @@ export class AuthService {
     return {
       personalMs: Math.min(this.env.SESSION_TTL_STAFF_HOURS * 3600_000, techo),
       plataformaMs: Math.min(this.env.PLATFORM_SESSION_HOURS * 3600_000, techo),
+      // D-04: el teléfono de la dueña. No pasa por el techo de 16 h: es el único lugar con sesión larga.
+      telefonoMs: OWNER_PHONE_IDLE_DAYS * 86_400_000,
+      telefonoMaxMs: OWNER_PHONE_MAX_DAYS * 86_400_000,
     };
+  }
+
+  /**
+   * DE QUÉ LUGAR ES LA SESIÓN QUE SE ABRE (D-04, opción a). Se decide aquí,
+   * una vez, con la contraseña correcta recién tecleada.
+   *
+   * Es el TELÉFONO DE LA DUEÑA solo si se cumplen las tres cosas:
+   *  1. la cuenta es de un gimnasio y su puesto es dueña (OWNER);
+   *  2. el navegador es un teléfono (iPhone o Android de bolsillo; una
+   *     tableta o una computadora, no);
+   *  3. no entró con una contraseña temporal (esa sesión solo sirve para
+   *     elegir la propia).
+   * Todo lo demás es MOSTRADOR, la sesión corta: recepción, gerencia y coach
+   * en cualquier equipo (también en su teléfono), la dueña en la computadora
+   * del gimnasio, y cualquier caso dudoso (sin navegador, navegador raro).
+   *
+   * El navegador puede mentir sobre lo que es, pero no abre ningún hueco: sin
+   * la cuenta de la dueña y su contraseña no hay sesión larga, y con ellas ya
+   * se tiene lo mismo que en su teléfono.
+   */
+  lugarDe(user: { organizationId: string | null; mustChangePassword: boolean }, roleKeys: readonly string[], userAgent: string | undefined): LugarDeSesion {
+    if (!user.organizationId || user.mustChangePassword) return 'COUNTER';
+    return roleKeys.includes('OWNER') && esTelefono(userAgent) ? 'OWNER_PHONE' : 'COUNTER';
   }
 
   /** Inactividad de la consola de plataforma: sin uso, se cierra. */
@@ -199,12 +234,16 @@ export class AuthService {
     // `mfaSatisfied` se sigue escribiendo porque la columna nace en falso y la
     // resolución de la sesión todavía la mira.
     const token = generateOpaqueToken();
+    // D-04: mostrador (12 h fijas) o teléfono de la dueña (30 días que se renuevan con el uso).
+    const kind = this.lugarDe(user, user.organizationId ? await new GrantRepository().roleKeysForUser(user.id) : [], meta.userAgent);
     const session = await this.sessions.create({
       userId: user.id,
       organizationId: user.organizationId,
       tokenHash: hashToken(token),
+      kind,
       // El vencimiento ES el tope: la cookie dura eso y no se vuelve a poner (24-04).
-      ttlMs: topeDe(this.topes(), user.organizationId),
+      // En el teléfono de la dueña es lo que aguanta sin uso, y se corre al usarla (`resolveSession`).
+      ttlMs: duracionInicial(this.topes(), user.organizationId, kind),
       mfaSatisfied: true,
       ip: meta.ip,
       userAgent: meta.userAgent,
@@ -259,7 +298,7 @@ export class AuthService {
    * quién), vencida, sin uso, la cuenta dada de baja… El motivo viaja en el
    * 401 y el panel lo convierte en el aviso del login.
    */
-  async resolveSession(token: string): Promise<Resolucion> {
+  async resolveSession(token: string, meta: { userAgent?: string | undefined } = {}): Promise<Resolucion> {
     // UNA consulta por petición: sesión, usuario, permisos y topes (OPT3-03).
     // El último uso se anota como mucho una vez por minuto.
     const tokenHash = hashToken(token);
@@ -277,8 +316,32 @@ export class AuthService {
       await this.sessions.revoke(r.session.id, 'idle');
       return { ok: false, fin: finDeSesion('SESSION_IDLE') };
     }
-    if (Date.now() - r.session.lastSeenAt.getTime() > 60_000) await this.sessions.touch(r.session.id);
-    return { ok: true, session: r.session, user: r.user, grants: r.grants, roleKeys: r.roleKeys, limits: r.session.organizationId ? mergeLimits(r.limitRows) : null };
+    let renovadaHasta: Date | undefined;
+    if (seRenueva(r.session)) {
+      const topes = this.topes();
+      const ahora = Date.now();
+      if (!r.roleKeys.includes('OWNER')) {
+        // Ya no es la dueña (lo normal es que el cambio de puesto le haya cerrado las sesiones; esto es
+        // por si no): su sesión larga vale lo que una de mostrador, y pasado ese tiempo se cierra.
+        if (r.session.createdAt.getTime() + topes.personalMs <= ahora) {
+          await this.sessions.revoke(r.session.id, 'role_changed');
+          return { ok: false, fin: finDeSesion('ACCESS_CHANGED') };
+        }
+      } else if (esTelefono(meta.userAgent)) {
+        // Se renueva con el uso, como mucho una vez por hora y nunca más allá de su tope desde que entró.
+        // Solo desde un teléfono: una cookie copiada a una computadora no la alarga.
+        const hasta = new Date(Math.min(ahora + topes.telefonoMs, r.session.createdAt.getTime() + topes.telefonoMaxMs));
+        if (hasta.getTime() - r.session.expiresAt.getTime() > RENOVAR_CADA_MS && await this.sessions.renovar(r.session.id, hasta)) {
+          r.session.expiresAt = hasta;
+          renovadaHasta = hasta;
+        }
+      }
+    }
+    if (!renovadaHasta && Date.now() - r.session.lastSeenAt.getTime() > 60_000) await this.sessions.touch(r.session.id);
+    return {
+      ok: true, session: r.session, user: r.user, grants: r.grants, roleKeys: r.roleKeys, limits: r.session.organizationId ? mergeLimits(r.limitRows) : null,
+      ...(renovadaHasta ? { renovadaHasta } : {}),
+    };
   }
 
   /** La cookie no abrió nada: lo que quedó de su sesión dice por qué. */
@@ -291,14 +354,34 @@ export class AuthService {
       const motivo = motivoDeRevocacion(s.revokedReason);
       return motivo === 'TEMPORARY_PASSWORD_EXPIRED' ? finDeSesion(motivo, TEMPORAL_VENCIDA) : finDeSesion(motivo);
     }
-    if (finDe(s, this.topes()).getTime() <= Date.now()) return finDeSesion('SESSION_EXPIRED');
+    const topes = this.topes();
+    if (finDe(s, topes).getTime() <= Date.now()) {
+      // El teléfono de la dueña (D-04): si no llegó a su tope desde que entró, se cerró por falta de uso.
+      const sinUso = seRenueva(s) && s.createdAt.getTime() + topeDe(topes, s.organizationId, s.kind) > Date.now();
+      return sinUso
+        ? finDeSesion('SESSION_IDLE', `Pasaron ${OWNER_PHONE_IDLE_DAYS} días sin usar GymFlow en este teléfono y tu sesión se cerró. Vuelve a entrar.`)
+        : finDeSesion('SESSION_EXPIRED');
+    }
     return finDeSesion('SESSION_REVOKED');
   }
 
   /** Desde cuándo y hasta cuándo vale ESTA sesión, por mucho que se use (24-04). */
-  async sesionActual(sessionId: string): Promise<{ startedAt: Date; endsAt: Date } | null> {
+  async sesionActual(sessionId: string): Promise<{
+    startedAt: Date; endsAt: Date;
+    /** D-04: el lugar; si se renueva con el uso, cuántos días aguanta sin él; y el día en que se cierra aunque se use. */
+    kind: LugarDeSesion; renews: boolean; idleDays: number | null; maxEndsAt: Date;
+  } | null> {
     const s = await this.sessions.porId(sessionId);
-    return s ? { startedAt: s.createdAt, endsAt: finDe(s, this.topes()) } : null;
+    if (!s) return null;
+    const topes = this.topes();
+    const renews = seRenueva(s);
+    const endsAt = finDe(s, topes);
+    return {
+      startedAt: s.createdAt, endsAt,
+      kind: renews ? 'OWNER_PHONE' : 'COUNTER', renews, idleDays: renews ? OWNER_PHONE_IDLE_DAYS : null,
+      // Sin renovación no hay dos fechas: se cierra cuando se cierra.
+      maxEndsAt: renews ? new Date(s.createdAt.getTime() + topeDe(topes, s.organizationId, s.kind)) : endsAt,
+    };
   }
 
   /**
@@ -386,6 +469,7 @@ export class AuthService {
         id: s.id, ip: s.ip, createdAt: s.createdAt, lastSeenAt: s.lastSeenAt, expiresAt: s.expiresAt,
         deviceLabel: device, device,
         endsAt: finDe(s, topes),
+        kind: seRenueva(s) ? 'OWNER_PHONE' : 'COUNTER', renews: seRenueva(s),
         idleEndsAt: s.organizationId ? null : new Date(s.lastSeenAt.getTime() + this.inactividadPlataformaMs()),
       };
     });

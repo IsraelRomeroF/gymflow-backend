@@ -8,12 +8,15 @@ import { respuesta } from '../../platform/http/respuesta.js';
 import { contar, registerModuleUsage } from '../../platform/modules/usage.js';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { enUnaTransaccion } from '../../platform/db/unit-of-work.js';
+import { BusinessCalendar } from '../../platform/time/business-calendar.js';
+import { PlanRepository } from '../catalog/index.js';
 import { MemberRepository, altaEnMostrador, leerAlta, responderAlta } from '../members/index.js';
 import { FollowUpRepository, contactoDeInteresadoBody, contactoJson } from '../follow-ups/index.js';
 import { ProspectRepository } from './prospect.repository.js';
 import { ProspectService } from './prospects.service.js';
+import { ProspectAutoCloseService } from './auto-close.service.js';
 import {
-  PAGINA_MAXIMA, PAGINA_POR_OMISION, PROSPECT_STATUSES, ProspectContactResult, ProspectList, ProspectPending, ProspectSources, leerCursor,
+  PAGINA_MAXIMA, PAGINA_POR_OMISION, PROSPECT_STATUSES, ProspectAutoClose, ProspectContactResult, ProspectList, ProspectPending, ProspectSources, leerCursor,
 } from '@gymflow/core/contracts';
 
 const idParam = z.object({ id: z.string().uuid() });
@@ -30,6 +33,8 @@ const datos = {
   /** «¿Quién lo recomendó?»: un socio, o solo su nombre. */
   referredByMemberId: z.string().uuid().optional(),
   referredByName: z.string().trim().max(120).optional(),
+  /** El plan que preguntó (D-31): uno de los que vende su sucursal. La venta abre con él. */
+  interestPlanId: z.string().uuid().optional(),
 };
 
 /** Interesados: quien preguntó y todavía no se inscribe, con su seguimiento y su conversión. */
@@ -40,6 +45,17 @@ export function registerProspectRoutes(app: FastifyInstance): void {
   }));
   const audit = new AuditService();
   const service = new ProspectService();
+  const cierreSolo = new ProspectAutoCloseService();
+
+  /**
+   * El plan que preguntó (D-31) tiene que ser uno que ESA sucursal vende hoy:
+   * anotar un plan archivado o de otra sede haría que la venta abriera con
+   * algo que no se le puede vender.
+   */
+  async function exigirPlanDeLaSede(orgId: string, planId: string, branchId: string): Promise<void> {
+    const planes = await new PlanRepository(orgId).list({ activeOnly: true, branchId });
+    if (!planes.some((p) => p.id === planId)) throw validation('Ese plan no se vende en esta sucursal. Elige uno de su lista');
+  }
 
   /** El interesado de la ruta, ya con el permiso comprobado sobre SU sede (`requirePermission(permiso, sede)`). */
   async function sedeDelInteresado(request: FastifyRequest, permiso: 'members:create' | 'members:read') {
@@ -83,9 +99,29 @@ export function registerProspectRoutes(app: FastifyInstance): void {
       });
       // Con su último contacto (UX7): la lista refleja el trabajo de recepción.
       const ultimos = await new FollowUpRepository(ctx.tenant.organizationId).latest('prospect', pagina.items.map((p) => p.id));
+      // D-31: el nombre del plan que preguntó (también si ya se archivó) y la zona de su sede, para decir cuándo se cierra solo.
+      const planes = await new PlanRepository(ctx.tenant.organizationId).findByIds(pagina.items.flatMap((p) => (p.interestPlanId ? [p.interestPlanId] : [])));
+      const calendario = new BusinessCalendar(ctx.tenant.organizationId);
+      const zonas = new Map<string, string>();
+      for (const id of new Set(pagina.items.map((p) => p.branchId))) zonas.set(id, await calendario.timezoneFor(id));
       // Contrato: `ProspectList` (`@gymflow/core/contracts`). Ya no se corta en 50 sin avisar (10-01).
-      return { ...pagina, items: pagina.items.map((p) => service.serialize(p, ultimos.get(p.id), hoy)) };
+      return { ...pagina, items: pagina.items.map((p) => service.serialize(p, ultimos.get(p.id), hoy, { zona: zonas.get(p.branchId)!, planes })) };
     },
+  });
+
+  /**
+   * El cierre solo, visto antes de que pase (D-31, bloque 4.7): desde qué día
+   * cierra este gimnasio, cuántos ya cumplieron los 60 días sin contacto y
+   * cuántos los cumplen esta semana, de las sedes de quien pregunta. Solo lee.
+   */
+  route(app, {
+    method: 'GET',
+    url: '/prospects/auto-close',
+    module: 'prospects',
+    security: { kind: 'permission', permission: 'members:read' },
+    schema: respuesta(200, ProspectAutoClose),
+    handler: async (request): Promise<ProspectAutoClose> =>
+      cierreSolo.vistaPrevia(request.ctx!.tenant.organizationId, request.branchScope('members:create')),
   });
 
   /**
@@ -179,6 +215,7 @@ export function registerProspectRoutes(app: FastifyInstance): void {
         }
       }
       if (body.referredByMemberId && !await new MemberRepository(orgId).findByIdIncludingArchived(body.referredByMemberId)) throw notFound('Socio no encontrado');
+      if (body.interestPlanId) await exigirPlanDeLaSede(orgId, body.interestPlanId, body.branchId);
 
       const prospect = await enUnaTransaccion(async () => {
         const p = await new ProspectRepository(orgId).create({
@@ -189,7 +226,7 @@ export function registerProspectRoutes(app: FastifyInstance): void {
         // Quién lo registró y de dónde viene (10-11); sin el nombre: la bitácora no se borra.
         await audit.record(ctx, {
           action: 'prospect.create', resourceType: 'Prospect', resourceId: p.id, branchId: body.branchId,
-          afterState: { source: body.source ?? null, nextStepOn: body.nextStepOn ?? null, referred: !!(body.referredByMemberId || body.referredByName) },
+          afterState: { source: body.source ?? null, nextStepOn: body.nextStepOn ?? null, referred: !!(body.referredByMemberId || body.referredByName), interestPlanId: body.interestPlanId ?? null },
         });
         return p;
       });
@@ -222,9 +259,12 @@ export function registerProspectRoutes(app: FastifyInstance): void {
         notes: z.string().max(500).nullish(),
         referredByMemberId: z.string().uuid().nullish(),
         referredByName: z.string().trim().max(120).nullish(),
+        /** El plan que preguntó (D-31); `null` lo quita. */
+        interestPlanId: z.string().uuid().nullish(),
       }).parse(cuerpo);
       const p = await sedeDelInteresado(request, 'members:create');
       if (p.convertedMemberId) throw conflict('Ese prospecto ya es socio', 'PROSPECT_CLOSED');
+      if (body.interestPlanId && body.interestPlanId !== p.interestPlanId) await exigirPlanDeLaSede(ctx.tenant.organizationId, body.interestPlanId, p.branchId);
       const telefono = body.phoneE164 === undefined ? p.phoneE164 : body.phoneE164 || null;
       const correo = body.email === undefined ? p.email : body.email?.trim() || null;
       if (!telefono && !correo) throw validation('Un prospecto sin teléfono ni correo no se puede contactar');
@@ -238,6 +278,7 @@ export function registerProspectRoutes(app: FastifyInstance): void {
         ...(body.notes !== undefined ? { notes: body.notes?.trim() || null } : {}),
         ...(body.referredByMemberId !== undefined ? { referredByMemberId: body.referredByMemberId ?? null } : {}),
         ...(body.referredByName !== undefined ? { referredByName: body.referredByName || null } : {}),
+        ...(body.interestPlanId !== undefined ? { interestPlanId: body.interestPlanId ?? null } : {}),
       };
       await enUnaTransaccion(async () => {
         await repo.update(p.id, patch);

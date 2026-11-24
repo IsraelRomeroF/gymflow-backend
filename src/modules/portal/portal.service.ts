@@ -15,7 +15,7 @@ import { AccessService, AttendanceRepository, EnrollmentRepository } from '../ac
 import { VisitPackRepository } from '../memberships/index.js';
 import { prioridadDe, type EstadoParaAvisos } from './notice-priority.js';
 import { BranchRepository, OrganizationRepository } from '../organization/index.js';
-import { PortalRepository, PortalAuthRepository, newInviteCode } from './portal.repository.js';
+import { MEMBER_IDLE_DAYS, PortalRepository, PortalAuthRepository, newInviteCode } from './portal.repository.js';
 import { MemberPushRepository, PortalNotificationsService } from './notificaciones.js';
 import type { Env } from '../../platform/env.js';
 import type { RequestContext } from '../../platform/context.js';
@@ -163,7 +163,8 @@ export class PortalService {
       organizationId: canje.organizationId,
       memberId: canje.memberId,
       tokenHash: hashToken(token),
-      ttlDays: env.SESSION_TTL_MEMBER_DAYS,
+      // D-04: nace con lo que aguanta sin abrirse y se corre con el uso (`findSession`). `SESSION_TTL_MEMBER_DAYS` ya no se lee.
+      ttlDays: MEMBER_IDLE_DAYS,
       userAgent: input.userAgent,
     });
 

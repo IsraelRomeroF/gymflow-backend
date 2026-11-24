@@ -98,6 +98,19 @@ export class StatementRepository extends TenantRepository {
     return { ...cortarPagina(filas as PagoConAutor[], limit, (u) => armarCursor(u.receivedAt.toISOString(), u.id)), total };
   }
 
+  /**
+   * D-18 (bloque 4.4): el día en que se dio por perdido cada cargo de la
+   * lista (solo los que tienen marca y siguen debiéndose).
+   */
+  async lostOnFor(chargeIds: readonly string[]): Promise<Map<string, Date>> {
+    if (chargeIds.length === 0) return new Map();
+    const filas = await this.db.charge.findMany({
+      where: this.scope({ id: { in: [...chargeIds] }, lostOn: { not: null }, status: { in: CON_DEUDA } }),
+      select: { id: true, lostOn: true },
+    });
+    return new Map(filas.map((f) => [f.id, f.lostOn!]));
+  }
+
   /** Los ajustes de varios cargos de una vez (descuentos, condonaciones, correcciones), en orden. */
   async adjustmentsFor(chargeIds: readonly string[]): Promise<Map<string, AdjustmentRecord[]>> {
     const out = new Map<string, AdjustmentRecord[]>();

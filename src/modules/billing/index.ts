@@ -36,3 +36,7 @@ export { DayPassRepository, type DayPassRecord } from './day-pass.repository.js'
 // Consumida por: `access` (la puerta reconoce el pase de prueba de hoy; bloque 3.3, D-08).
 export { TrialPassRepository, type TrialPassRecord } from './day-pass-prueba.repository.js';
 export type { ChargeRecord } from './charge.repository.js';
+
+// D-18 (fase 4, bloque 4.4): la deuda que se da por perdida. Lo consume
+// `scripts/plazos-estado.ts` (lo que haría la primera corrida, sin escribir).
+export { DeudaPerdidaRepository, type DeudaPorMarcar } from './deuda-perdida.js';

@@ -100,6 +100,8 @@ export class StatementService {
   private async conDetalle(lectura: StatementRepository, cargos: readonly ChargeRecord[]): Promise<StatementChargesPage['items']> {
     const ajustes = await lectura.adjustmentsFor(cargos.filter((c) => c.adjustedCents > 0n).map((c) => c.id));
     const nombres = await lectura.staffNames([...ajustes.values()].flat().map((a) => a.approvedByUserId));
-    return cargos.map((c) => serializeStatementCharge(c, ajustes.get(c.id) ?? [], nombres));
+    // D-18 (4.4): lo dado por perdido sigue debiéndose; el estado de cuenta dice desde cuándo.
+    const perdidos = await lectura.lostOnFor(cargos.map((c) => c.id));
+    return cargos.map((c) => serializeStatementCharge(c, ajustes.get(c.id) ?? [], nombres, perdidos.get(c.id) ?? null));
   }
 }

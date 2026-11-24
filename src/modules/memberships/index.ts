@@ -29,3 +29,8 @@ export { registerMembershipClosedHook, emitMembershipClosed, type MembershipClos
 // D-14 (fase 3, bloque 3.5): las anualidades vivas que «se renuevan solas». Lo consume
 // `scripts/anualidades-no-se-renuevan.ts` (la lista antes de aplicar, y la aplicación).
 export { prepagosQueSeRenuevan, apagarRenovacionDePrepagos, cambiarRenovacion, type PrepagoQueSeRenueva } from './anualidades.js';
+
+// D-18 (fase 4, bloque 4.4): «está de baja desde», calculado con la regla del núcleo.
+// Consumida por: analytics (las bajas del mes en el Inicio) y retention («Recuperar»).
+// `privacy` (la conservación, D-32) NO la consume todavía: es una decisión de Israel (informe 4.4).
+export { BajaRepository, bajaDeLosHechos, type HechosDeBaja, type SocioConBaja } from './baja.repository.js';

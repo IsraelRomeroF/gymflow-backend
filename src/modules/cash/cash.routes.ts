@@ -3,7 +3,10 @@ import { z } from 'zod';
 import {
   conflict, DomainError, formatMoney, forbidden, money, notFound, LIMITES_DE_LOS_TOPES_DEL_CAJON, type CashMovementType,
 } from '@gymflow/core';
-import { CashLimits, OpenCashSessionsLite } from '@gymflow/core/contracts';
+import {
+  CashAlerts, CashLimits, CashMovement, CashSession, CashSessionList, CashShiftAllowance, CloseCashSessionResult,
+  OpenCashSessionsLite, OwnerDrawFromDrawer, ShiftReport as ShiftReportContract,
+} from '@gymflow/core/contracts';
 import { CashSettingsRepository } from './cash-settings.repository.js';
 import { enUnaTransaccion } from '../../platform/db/unit-of-work.js';
 import { AuditService } from '../../platform/audit/audit.service.js';
@@ -14,6 +17,7 @@ import { contar, registerModuleUsage } from '../../platform/modules/usage.js';
 import { BranchRepository } from '../organization/index.js';
 import { CashRegisterRepository, CashSessionRepository, type CashMovementRecord, type CashSessionRecord } from './cash.repository.js';
 import { CashService, type ShiftReport } from './cash.service.js';
+import { CashAlertsService } from './cash-alerts.service.js';
 import { UserRepository } from '../identity/index.js';
 
 const idParam = z.object({ id: z.string().uuid() });
@@ -22,13 +26,13 @@ const iso = (d: Date): string => d.toISOString().slice(0, 10);
 
 type Nombres = ReadonlyMap<string, string>;
 
-/** Quién abrió y quién cerró: el corte responde por personas, no por ids. */
+/** Quién abrió, quién cerró y quién revisó: el corte responde por personas, no por ids. */
 async function nombresDe(orgId: string, sessions: readonly CashSessionRecord[]): Promise<Nombres> {
-  const ids = sessions.flatMap((s) => [s.openedByUserId, ...(s.closedByUserId ? [s.closedByUserId] : [])]);
+  const ids = sessions.flatMap((s) => [s.openedByUserId, ...(s.closedByUserId ? [s.closedByUserId] : []), ...(s.varianceReviewedByUserId ? [s.varianceReviewedByUserId] : [])]);
   return new UserRepository(orgId).namesById(ids);
 }
 
-function serializeSession(s: CashSessionRecord, nombres: Nombres = new Map()) {
+function serializeSession(s: CashSessionRecord, nombres: Nombres = new Map()): CashSession {
   return {
     id: s.id,
     branchId: s.branchId,
@@ -49,10 +53,18 @@ function serializeSession(s: CashSessionRecord, nombres: Nombres = new Map()) {
     countAttempts: s.countAttempts,
     openedAt: s.openedAt.toISOString(),
     closedAt: s.closedAt?.toISOString() ?? null,
+    // D-17 (bloque 4.3): el descuadre es de quien abrió, y su revisión.
+    responsibleUserId: s.openedByUserId,
+    responsibleName: nombres.get(s.openedByUserId) ?? null,
+    varianceStatus: s.varianceStatus,
+    varianceReviewedByUserId: s.varianceReviewedByUserId,
+    varianceReviewedByName: s.varianceReviewedByUserId ? nombres.get(s.varianceReviewedByUserId) ?? null : null,
+    varianceReviewedAt: s.varianceReviewedAt?.toISOString() ?? null,
+    varianceReviewNote: s.varianceReviewNote,
   };
 }
 
-function serializeMovement(m: CashMovementRecord) {
+function serializeMovement(m: CashMovementRecord): CashMovement {
   return {
     id: m.id,
     movementType: m.movementType,
@@ -62,6 +74,7 @@ function serializeMovement(m: CashMovementRecord) {
     createdByUserId: m.createdByUserId,
     approvedByUserId: m.approvedByUserId,
     at: m.at.toISOString(),
+    ownerDraw: m.expenseId !== null,
   };
 }
 
@@ -70,8 +83,8 @@ function serializeMovement(m: CashMovementRecord) {
  * corte ciego solo mide si el esperado NO llega a la pantalla antes del
  * conteo (MC-07): se omiten el esperado y lo cobrado en efectivo.
  */
-function serializeReport(r: ShiftReport, nombres: Nombres, ciego = false) {
-  const sinEfectivo = (xs: ReadonlyArray<{ method: string; amountCents: bigint }>) => xs.filter((x) => !ciego || x.method !== 'CASH');
+function serializeReport(r: ShiftReport, nombres: Nombres, ciego = false): ShiftReportContract {
+  const sinEfectivo = <M extends string>(xs: ReadonlyArray<{ method: M; amountCents: bigint }>) => xs.filter((x) => !ciego || x.method !== 'CASH');
   return {
     session: serializeSession(r.session, nombres),
     register: { id: r.register.id, code: r.register.code, name: r.register.name },
@@ -178,6 +191,7 @@ export function registerCashRoutes(app: FastifyInstance): void {
     method: 'POST',
     url: '/cash-sessions',
     security: { kind: 'permission', permission: 'cash:session:open' },
+    schema: respuesta(201, CashSession),
     handler: async (request, reply) => {
       const ctx = request.ctx!;
       const body = z.object({
@@ -204,19 +218,32 @@ export function registerCashRoutes(app: FastifyInstance): void {
     method: 'GET',
     url: '/cash-sessions',
     security: { kind: 'permission', permission: 'cash:session:read' },
-    handler: async (request) => {
+    schema: respuesta(200, CashSessionList),
+    handler: async (request): Promise<CashSessionList> => {
       const ctx = request.ctx!;
       const q = z.object({
         branchId: z.string().uuid().optional(),
         status: z.enum(['OPEN', 'CLOSED', 'RECONCILED']).optional(),
         businessDate: z.string().date().optional(),
+        // Vista «Cortes» (D-17, bloque 4.3): por rango de días, por quién abrió y por su diferencia
+        // (`PENDING` por revisar, `REVIEWED` revisados, `ANY` todo el que no cuadró).
+        from: z.string().date().optional(),
+        to: z.string().date().optional(),
+        openedByUserId: z.string().uuid().optional(),
+        variance: z.enum(['PENDING', 'REVIEWED', 'ANY']).optional(),
+        limit: z.coerce.number().int().min(1).max(300).optional(),
       }).parse(request.query);
       const sede = sedeDeConsulta(request, 'cash:session:read', q.branchId);
+      const dia = (d: string | undefined) => (d ? new Date(`${d}T00:00:00.000Z`) : undefined);
 
       const rows = await new CashSessionRepository(ctx.tenant.organizationId).list({
         branchId: sede ?? undefined,
         status: q.status,
-        businessDate: q.businessDate ? new Date(`${q.businessDate}T00:00:00.000Z`) : undefined,
+        businessDate: dia(q.businessDate),
+        from: dia(q.from), to: dia(q.to),
+        openedByUserId: q.openedByUserId,
+        variance: q.variance,
+        limit: q.limit,
       });
       const nombres = await nombresDe(ctx.tenant.organizationId, rows);
       return { sessions: rows.map((s) => serializeSession(s, nombres)) };
@@ -266,7 +293,8 @@ export function registerCashRoutes(app: FastifyInstance): void {
     method: 'GET',
     url: '/cash-sessions/:id',
     security: { kind: 'permission', permission: 'cash:session:read' },
-    handler: async (request) => {
+    schema: respuesta(200, ShiftReportContract),
+    handler: async (request): Promise<ShiftReportContract> => {
       const ctx = request.ctx!;
       const { id } = idParam.parse(request.params);
       const reporte = await service.shiftReport(ctx, id);
@@ -282,7 +310,8 @@ export function registerCashRoutes(app: FastifyInstance): void {
     method: 'POST',
     url: '/cash-sessions/:id/close',
     security: { kind: 'permission', permission: 'cash:session:close' },
-    handler: async (request) => {
+    schema: respuesta(200, CloseCashSessionResult),
+    handler: async (request): Promise<CloseCashSessionResult> => {
       const ctx = request.ctx!;
       const { id } = idParam.parse(request.params);
       const body = z.object({
@@ -295,7 +324,7 @@ export function registerCashRoutes(app: FastifyInstance): void {
       request.authorize('cash:session:close', { branchId: session.branchId });
       // El turno es de quien lo abrió (UX5-M-06): recepción y caja cortan el
       // SUYO. Cortar el de otra persona es de quien aprueba descuadres
-      // (encargado o gerente), porque el faltante queda a nombre del otro.
+      // (encargado o gerente), y el faltante sigue siendo de quien abrió (D-17).
       if (session.openedByUserId !== ctx.tenant.actorUserId && !request.holds('cash:variance:approve', session.branchId)) {
         throw forbidden('Este turno lo abrió otra persona: el corte lo hace ella o el gerente.');
       }
@@ -366,6 +395,7 @@ export function registerCashRoutes(app: FastifyInstance): void {
     method: 'POST',
     url: '/cash-sessions/:id/movements',
     security: { kind: 'permission', permission: 'cash:withdraw' },
+    schema: respuesta(201, CashMovement),
     handler: async (request, reply) => {
       const { id } = idParam.parse(request.params);
       const body = cuerpoDeMovimiento(['FLOAT_IN', 'WITHDRAWAL', 'EXPENSE', 'DEPOSIT', 'CORRECTION']).parse(request.body);
@@ -380,12 +410,127 @@ export function registerCashRoutes(app: FastifyInstance): void {
     method: 'POST',
     url: '/cash-sessions/:id/petty-movements',
     security: { kind: 'permission', permission: 'cash:petty:record' },
+    schema: respuesta(201, CashMovement),
     handler: async (request, reply) => {
       const { id } = idParam.parse(request.params);
       const body = cuerpoDeMovimiento(['FLOAT_IN', 'EXPENSE']).parse(request.body);
       const session = await turnoDe(request, id);
       request.requirePermission('cash:petty:record', session.branchId);
       return reply.status(201).send(await mover(request, session, body));
+    },
+  });
+
+  // ── D-17 · Caja, fase 4 (bloque 4.3) ─────────────────────────────────────
+
+  /**
+   * LA GERENCIA REVISA UN DESCUADRE Y LO CIERRA CON SU NOTA (D-17 b). Solo los
+   * cortes «por revisar» (más de $20 de diferencia). El descuadre sigue siendo
+   * de quien abrió el turno; la nota dice qué se resolvió. No descuenta nada.
+   */
+  route(app, {
+    method: 'POST',
+    url: '/cash-sessions/:id/variance/review',
+    security: { kind: 'permission', permission: 'cash:variance:approve' },
+    schema: respuesta(200, CashSession),
+    handler: async (request): Promise<CashSession> => {
+      const ctx = request.ctx!;
+      const { id } = idParam.parse(request.params);
+      const body = z.object({ note: z.string().trim().min(3).max(500) }).parse(request.body);
+      const session = await turnoDe(request, id);
+      request.authorize('cash:variance:approve', { branchId: session.branchId, reason: body.note });
+      const revisada = await service.reviewVariance(ctx, { sessionId: id, note: body.note });
+      return serializeSession(revisada, await nombresDe(ctx.tenant.organizationId, [revisada]));
+    },
+  });
+
+  /**
+   * CUÁNTO LE QUEDA A ESTA PERSONA EN ESTE TURNO (defecto D1 de 3.13): la
+   * pantalla lo dice ANTES de pedir la firma, en vez de que el 403 llegue
+   * cuando la dueña ya tecleó su contraseña. Topes y lo ya anotado; nada del
+   * efectivo del cajón (el corte sigue ciego).
+   */
+  route(app, {
+    method: 'GET',
+    url: '/cash-sessions/:id/allowance',
+    security: { kind: 'permission', permission: 'cash:withdraw', anyOf: ['cash:petty:record'] },
+    schema: respuesta(200, CashShiftAllowance),
+    handler: async (request): Promise<CashShiftAllowance> => {
+      const { id } = idParam.parse(request.params);
+      const session = await turnoDe(request, id);
+      // En la sede del turno tiene que poder mover el cajón (retirar o anotar gasto chico).
+      if (!request.holds('cash:petty:record', session.branchId)) request.requirePermission('cash:withdraw', session.branchId);
+      const a = await service.allowance(request.ctx!, session);
+      const c = (v: bigint | null) => (v === null ? null : cents(v));
+      return {
+        sessionId: a.sessionId,
+        withdrawal: { role: a.withdrawal.role, limitCents: c(a.withdrawal.limitCents), usedCents: cents(a.withdrawal.usedCents), remainingCents: c(a.withdrawal.remainingCents) },
+        petty: { limitCents: cents(a.petty.limitCents), floatInRemainingCents: cents(a.petty.floatInRemainingCents), expenseRemainingCents: cents(a.petty.expenseRemainingCents) },
+      };
+    },
+  });
+
+  /**
+   * «RETIRO DEL DUEÑO» DESDE EL CAJÓN: el retiro y su anotación en Movimientos
+   * en un solo acto (ver `CashService.ownerDraw`). Para el cajón es un retiro:
+   * mismo permiso, misma firma de la dueña y mismo tope por turno (D-15).
+   */
+  route(app, {
+    method: 'POST',
+    url: '/cash-sessions/:id/owner-draw',
+    security: { kind: 'permission', permission: 'cash:withdraw' },
+    schema: respuesta(201, OwnerDrawFromDrawer),
+    handler: async (request, reply) => {
+      const ctx = request.ctx!;
+      const { id } = idParam.parse(request.params);
+      const body = z.object({
+        amountCents: z.string().regex(/^[0-9]{1,12}$/, 'Importe en centavos, hasta 12 dígitos'),
+        reason: z.string().trim().min(3).max(200),
+        approvalToken: z.string().min(20).max(200).optional(),
+      }).parse(request.body);
+      const session = await turnoDe(request, id);
+      request.requirePermission('cash:withdraw', session.branchId);
+      const amountCents = BigInt(body.amountCents);
+      const aprobador = await request.verifyApprover(body.approvalToken, 'cash:withdraw', { branchId: session.branchId, resourceType: 'CashSession', resourceId: session.id, amountCents });
+      request.authorize('cash:withdraw', { branchId: session.branchId, reason: body.reason, amountCents, ...(aprobador ? { approvedByUserId: aprobador } : {}) });
+      const r = await service.ownerDraw(ctx, { sessionId: id, amountCents, reason: body.reason, approvedByUserId: aprobador });
+      return reply.status(201).send({
+        movement: serializeMovement(r.movement), expenseId: r.expenseId, month: r.periodMonth.toISOString().slice(0, 7),
+      } satisfies OwnerDrawFromDrawer);
+    },
+  });
+
+  /**
+   * LO QUE LA CAJA TIENE SIN RESOLVER, en las sedes de quien pregunta: cajas
+   * abiertas (y cuáles amanecieron sin cortar) y descuadres por revisar. Es de
+   * solo lectura: lo ve quien ve los cortes (la dueña incluida).
+   */
+  route(app, {
+    method: 'GET',
+    url: '/cash/alerts',
+    security: { kind: 'permission', permission: 'cash:session:read' },
+    schema: respuesta(200, CashAlerts),
+    handler: async (request): Promise<CashAlerts> => {
+      const orgId = request.ctx!.tenant.organizationId;
+      const q = z.object({ branchId: z.string().uuid().optional() }).parse(request.query);
+      if (q.branchId) request.requirePermission('cash:session:read', q.branchId);
+      // Sin sede: todas las suyas (nulo = todo el gimnasio).
+      const sedes = q.branchId ? [q.branchId] : request.branchScope('cash:session:read');
+      const avisos = new CashAlertsService();
+      const [abiertas, porRevisar] = await Promise.all([avisos.open(orgId, sedes), avisos.pendingVariances(orgId, sedes)]);
+      const nombres = await new UserRepository(orgId).namesById(abiertas.map((a) => a.openedByUserId));
+      return {
+        asOf: new Date().toISOString(),
+        open: abiertas.map((a) => ({
+          id: a.id, branchId: a.branchId, branchName: a.branchName, registerName: a.registerName,
+          openedByUserId: a.openedByUserId, openedByName: nombres.get(a.openedByUserId) ?? null,
+          openedAt: a.openedAt.toISOString(), businessDate: iso(a.businessDate), stale: a.stale,
+        })),
+        staleCount: abiertas.filter((a) => a.stale).length,
+        pendingVariances: {
+          count: porRevisar.count, shortageCents: cents(porRevisar.shortageCents), overageCents: cents(porRevisar.overageCents),
+          oldestBusinessDate: porRevisar.oldestBusinessDate ? iso(porRevisar.oldestBusinessDate) : null,
+        },
+      };
     },
   });
 

@@ -95,6 +95,8 @@ describe('declaración de seguridad de las rutas', () => {
       'GET /portal/coach',
       'GET /portal/consents',
       'GET /portal/me',
+      // Fase 4, bloque 4.8 (D-36): el socio ve y cambia sus datos de contacto.
+      'GET /portal/me/contact',
       'GET /portal/me/export',
       'GET /portal/notices',
       'GET /portal/notifications',
@@ -107,6 +109,7 @@ describe('declaración de seguridad de las rutas', () => {
       'GET /portal/statement',
       'GET /portal/statement/charges',
       'GET /portal/statement/payments',
+      'PATCH /portal/me/contact',
       'POST /portal/bookings/:id/cancel',
       'POST /portal/charges/:id/pay',
       'POST /portal/classes/:id/book',

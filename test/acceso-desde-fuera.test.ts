@@ -137,7 +137,10 @@ describe('D-01 · la API con dirección fija', () => {
   const entrar = (email: string, password: string, headers: Record<string, string> = {}) =>
     app.inject({ method: 'POST', url: '/auth/login', payload: { email, password }, headers });
   const cookieDe = (r: Awaited<ReturnType<typeof entrar>>, nombre: string) => r.cookies.find((c) => c.name === nombre);
-  const ip = () => `203.0.113.${1 + Math.floor(Math.random() * 250)}`;
+  // Una IP distinta en cada llamada. Antes salía al azar entre 250: una de cada 250 veces «otro lugar» repetía la IP
+  // de la intrusa y la prueba recibía 429 donde esperaba 401 (falló así en una corrida completa de la fase 4).
+  let siguienteIp = Math.floor(Math.random() * 100);
+  const ip = () => { siguienteIp += 1; return `203.0.113.${1 + (siguienteIp % 250)}`; };
 
   beforeAll(async () => {
     const previo = { panel: process.env.PANEL_PUBLIC_URL, portal: process.env.PORTAL_PUBLIC_URL };

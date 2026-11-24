@@ -4,6 +4,8 @@ import { PulseRepository, type Conteo, type PorSede } from './pulse.repository.j
 import { MovementsService } from './movements.service.js';
 import { AnalyticsService } from './analytics.service.js';
 import { TrialPassRepository } from '../billing/index.js';
+import { BajaRepository } from '../memberships/index.js';
+import { plazosDe } from '../../platform/plazos/plazos-del-socio.repository.js';
 import type { RequestContext } from '../../platform/context.js';
 
 const HORA = 3_600_000;
@@ -84,7 +86,9 @@ export class PulseService {
       repo.entradas(ayer, new Date(ayer.getTime() + transcurrido)),
       repo.altas(hoyFecha, manana),
       repo.altas(inicioMes, manana),
-      repo.bajas(inicioMes, manana),
+      // D-18 (bloque 4.4, edición puntual): baja = el acto de la ficha, la cancelación, o la membresía
+      // terminada hace el plazo del gimnasio (30 días) sin renovar. Antes solo contaba el acto.
+      plazosDe(orgId).then((p) => new BajaRepository(orgId).bajasEntre(inicioMes, manana, p.churnDays)),
       repo.enMora(),
       repo.cortesConFaltante(new Date(ahora.getTime() - 7 * DIA)),
       repo.cajasAbiertas(),

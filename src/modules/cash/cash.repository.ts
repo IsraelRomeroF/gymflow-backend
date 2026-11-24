@@ -1,4 +1,4 @@
-import { computeVariance, conflict, expectedCash, formatFolio, money, notFound, type CashMovementType, type CashSessionStatus, type Money, type PaymentMethodType, uuidv7, validation } from '@gymflow/core';
+import { computeVariance, conflict, descuadrePorRevisar, expectedCash, formatFolio, money, notFound, type CashMovementType, type CashSessionStatus, type Money, type PaymentMethodType, type VarianceReviewStatus, uuidv7, validation } from '@gymflow/core';
 import { PrismaCashSessionStatus, PrismaCashMovementType } from '@gymflow/db';
 import { TenantRepository } from '../../platform/db/tenant-repository.js';
 import { shiftContributors } from './shift-contributors.js';
@@ -36,6 +36,11 @@ export type CashSessionRecord = {
   countAttempts: number;
   openedAt: Date;
   closedAt: Date | null;
+  /** D-17 (bloque 4.3): la revisión de la diferencia. Nulo = nada que revisar. */
+  varianceStatus: VarianceReviewStatus | null;
+  varianceReviewedByUserId: string | null;
+  varianceReviewedAt: Date | null;
+  varianceReviewNote: string | null;
 };
 
 const SESSION_SELECT = {
@@ -44,6 +49,7 @@ const SESSION_SELECT = {
   openingFloatCents: true, expectedCashCents: true, countedCashCents: true,
   varianceCents: true, varianceReason: true, openedAt: true, closedAt: true,
   firstCountedCashCents: true, countAttempts: true,
+  varianceStatus: true, varianceReviewedByUserId: true, varianceReviewedAt: true, varianceReviewNote: true,
 } as const;
 
 export type CashMovementRecord = {
@@ -55,7 +61,26 @@ export type CashMovementRecord = {
   createdByUserId: string;
   approvedByUserId: string | null;
   at: Date;
+  /** «Retiro del dueño» (bloque 4.3): su anotación en Movimientos. */
+  expenseId: string | null;
 };
+
+const MOVEMENT_SELECT = {
+  id: true, cashSessionId: true, movementType: true, amountCents: true,
+  reason: true, createdByUserId: true, approvedByUserId: true, at: true, expenseId: true,
+} as const;
+
+/** Qué cortes pedir por su diferencia (D-17): por revisar, ya revisados, o cualquiera que no cuadró. */
+export type FiltroDeDescuadre = 'PENDING' | 'REVIEWED' | 'ANY';
+
+/** Una caja abierta, con los nombres que necesita un aviso. */
+export type CajaAbierta = {
+  id: string; branchId: string; branchName: string; registerName: string;
+  openedByUserId: string; openedAt: Date; businessDate: Date;
+};
+
+/** Los descuadres por revisar de un conjunto de sedes, sumados. */
+export type DescuadresPorRevisar = { count: number; shortageCents: bigint; overageCents: bigint; oldestBusinessDate: Date | null };
 
 export class CashRegisterRepository extends TenantRepository {
   async findById(id: string): Promise<CashRegisterRecord | null> {
@@ -150,13 +175,23 @@ export class CashSessionRepository extends TenantRepository {
     branchId?: string | undefined;
     status?: CashSessionStatus | undefined;
     businessDate?: Date | undefined;
+    /** Rango de días de negocio, los dos incluidos (vista «Cortes»). */
+    from?: Date | undefined;
+    to?: Date | undefined;
+    /** De quién es el turno: quien lo abrió (D-17). */
+    openedByUserId?: string | undefined;
+    variance?: FiltroDeDescuadre | undefined;
     limit?: number | undefined;
   } = {}): Promise<CashSessionRecord[]> {
+    const rango = opts.from || opts.to ? { businessDate: { ...(opts.from ? { gte: opts.from } : {}), ...(opts.to ? { lte: opts.to } : {}) } } : {};
     const rows = await this.db.cashSession.findMany({
       where: this.scope({
         ...(opts.branchId ? { branchId: opts.branchId } : {}),
         ...(opts.status ? { status: S[opts.status] } : {}),
-        ...(opts.businessDate ? { businessDate: opts.businessDate } : {}),
+        ...(opts.businessDate ? { businessDate: opts.businessDate } : rango),
+        ...(opts.openedByUserId ? { openedByUserId: opts.openedByUserId } : {}),
+        ...(opts.variance === 'ANY' ? { varianceCents: { not: 0n }, status: opts.status ? S[opts.status] : { not: S.OPEN } }
+          : opts.variance ? { varianceStatus: opts.variance } : {}),
       }),
       select: SESSION_SELECT,
       orderBy: { openedAt: 'desc' },
@@ -315,6 +350,8 @@ export class CashSessionRepository extends TenantRepository {
           countedCashCents: input.countedCashCents,
           varianceCents: variance.cents,
           varianceReason: input.varianceReason,
+          // D-17: más de $20 de diferencia (falte o sobre) nace «por revisar».
+          varianceStatus: descuadrePorRevisar(variance.cents) ? 'PENDING' : null,
         },
       });
     }, { timeout: 15_000 });
@@ -332,6 +369,8 @@ export class CashSessionRepository extends TenantRepository {
     approvedByUserId?: string | null;
     /** Día de negocio de la sede al hacerlo (DM-10), no el del turno. */
     businessDate: Date;
+    /** «Retiro del dueño»: la anotación en Movimientos creada en esta misma transacción. */
+    expenseId?: string | null;
   }): Promise<CashMovementRecord> {
     const row = await this.db.cashMovement.create({
       data: {
@@ -344,11 +383,9 @@ export class CashSessionRepository extends TenantRepository {
         createdByUserId: input.createdByUserId,
         approvedByUserId: input.approvedByUserId ?? null,
         businessDate: input.businessDate,
+        expenseId: input.expenseId ?? null,
       },
-      select: {
-        id: true, cashSessionId: true, movementType: true, amountCents: true,
-        reason: true, createdByUserId: true, approvedByUserId: true, at: true,
-      },
+      select: MOVEMENT_SELECT,
     });
     return row as CashMovementRecord;
   }
@@ -356,10 +393,7 @@ export class CashSessionRepository extends TenantRepository {
   async listMovements(sessionId: string): Promise<CashMovementRecord[]> {
     const rows = await this.db.cashMovement.findMany({
       where: this.scope({ cashSessionId: sessionId }),
-      select: {
-        id: true, cashSessionId: true, movementType: true, amountCents: true,
-        reason: true, createdByUserId: true, approvedByUserId: true, at: true,
-      },
+      select: MOVEMENT_SELECT,
       orderBy: { at: 'asc' },
     });
     return rows as CashMovementRecord[];
@@ -391,6 +425,54 @@ export class CashSessionRepository extends TenantRepository {
         AND "approvedByUserId" IS NULL
         AND "movementType"::text = ${movementType}`;
     return rows[0]?.total ?? 0n;
+  }
+
+  // ── D-17 · La revisión del descuadre (bloque 4.3) ────────────────────────
+
+  /**
+   * La gerencia cierra la revisión con su nota. Solo pasa de «por revisar» a
+   * «revisado», una vez: la condición va en el `WHERE`, así dos revisiones a la
+   * vez no se pisan (la segunda no encuentra nada que cambiar).
+   */
+  async reviewVariance(sessionId: string, input: { userId: string; note: string; at: Date }): Promise<boolean> {
+    const { count } = await this.db.cashSession.updateMany({
+      where: this.scope({ id: sessionId, varianceStatus: 'PENDING' }),
+      data: { varianceStatus: 'REVIEWED', varianceReviewedByUserId: input.userId, varianceReviewedAt: input.at, varianceReviewNote: input.note },
+    });
+    return count > 0;
+  }
+
+  /** Los descuadres por revisar. `sedes` nulo = todo el gimnasio. */
+  async pendingVariances(sedes: readonly string[] | null): Promise<DescuadresPorRevisar> {
+    if (sedes !== null && sedes.length === 0) return { count: 0, shortageCents: 0n, overageCents: 0n, oldestBusinessDate: null };
+    const filas = await this.db.cashSession.findMany({
+      where: this.scope({ varianceStatus: 'PENDING', ...(sedes ? { branchId: { in: [...sedes] } } : {}) }),
+      select: { varianceCents: true, businessDate: true },
+    });
+    let shortageCents = 0n; let overageCents = 0n; let oldestBusinessDate: Date | null = null;
+    for (const f of filas) {
+      const v = f.varianceCents ?? 0n;
+      if (v < 0n) shortageCents += -v; else overageCents += v;
+      if (!oldestBusinessDate || f.businessDate < oldestBusinessDate) oldestBusinessDate = f.businessDate;
+    }
+    return { count: filas.length, shortageCents, overageCents, oldestBusinessDate };
+  }
+
+  /** Las cajas abiertas, la más vieja primero, con el nombre de su caja y de su sede. `sedes` nulo = todo el gimnasio. */
+  async openWithNames(sedes: readonly string[] | null): Promise<CajaAbierta[]> {
+    if (sedes !== null && sedes.length === 0) return [];
+    const filas = await this.db.cashSession.findMany({
+      where: this.scope({ status: S.OPEN, ...(sedes ? { branchId: { in: [...sedes] } } : {}) }),
+      select: {
+        id: true, branchId: true, openedByUserId: true, openedAt: true, businessDate: true,
+        cashRegister: { select: { name: true } }, branch: { select: { name: true } },
+      },
+      orderBy: [{ openedAt: 'asc' }, { id: 'asc' }],
+    });
+    return filas.map((f) => ({
+      id: f.id, branchId: f.branchId, branchName: f.branch.name, registerName: f.cashRegister.name,
+      openedByUserId: f.openedByUserId, openedAt: f.openedAt, businessDate: f.businessDate,
+    }));
   }
 }
 

@@ -4,6 +4,9 @@ import { TenantRepository } from '../../platform/db/tenant-repository.js';
 import { olvidarZonas } from '../../platform/time/business-calendar.js';
 import { usageOf } from '../../platform/modules/usage.js';
 
+/** Lo que el panel ve de una sucursal. El teléfono y el horario los administra la plataforma (D-27): aquí solo se leen. */
+const SEDE = { id: true, code: true, name: true, addressLine: true, publicSlug: true, timezone: true, isActive: true, phone: true, openingHours: true } as const;
+
 export class BranchRepository extends TenantRepository {
   /**
    * Sucursal → organización, SIN contexto de tenant.
@@ -38,7 +41,7 @@ export class BranchRepository extends TenantRepository {
   async list() {
     return this.db.branch.findMany({
       where: this.scope({ deletedAt: null }),
-      select: { id: true, code: true, name: true, addressLine: true, publicSlug: true, timezone: true, isActive: true },
+      select: SEDE,
       orderBy: { code: 'asc' },
     });
   }
@@ -64,7 +67,7 @@ export class BranchRepository extends TenantRepository {
   async findById(id: string) {
     return this.db.branch.findFirst({
       where: this.scope({ id, deletedAt: null }),
-      select: { id: true, code: true, name: true, addressLine: true, publicSlug: true, timezone: true, isActive: true },
+      select: SEDE,
     });
   }
 
@@ -82,7 +85,7 @@ export class BranchRepository extends TenantRepository {
   async create(input: { code: string; name: string; addressLine: string | null; timezone: string | null }) {
     return this.db.branch.create({
       data: { id: uuidv7(), organizationId: this.organizationId, ...input, code: input.code.toUpperCase() },
-      select: { id: true, code: true, name: true, addressLine: true, publicSlug: true, timezone: true, isActive: true },
+      select: SEDE,
     });
   }
 

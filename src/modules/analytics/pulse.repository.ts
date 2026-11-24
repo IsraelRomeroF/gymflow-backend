@@ -92,14 +92,8 @@ export class PulseRepository extends TenantRepository {
        GROUP BY 1`;
   }
 
-  /** Bajas: socios dados de baja en la ventana. */
-  async bajas(desde: Date, hasta: Date): Promise<Conteo[]> {
-    return this.db.$queryRaw<Conteo[]>`
-      SELECT "homeBranchId" AS "branchId", COUNT(*)::int AS total
-        FROM "members"
-       WHERE "organizationId" = ${this.organizationId}::uuid AND "deletedAt" >= ${desde} AND "deletedAt" < ${hasta}
-       GROUP BY 1`;
-  }
+  // Las bajas del mes ya no se cuentan aquí (D-18, bloque 4.4): `BajaRepository.bajasEntre`
+  // de `memberships`, con la regla del núcleo (acto de la ficha, cancelación o plazo sin renovar).
 
   /** Socios con pago atrasado (en gracia o suspendidos). */
   async enMora(): Promise<Conteo[]> {

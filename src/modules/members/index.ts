@@ -59,3 +59,10 @@ export { MemberNoticeRepository, type NoticeKind } from './notice.repository.js'
 
 // Consumida por: intake (bloque 3.4). El responsable del celular compartido (D-09) y el tutor de un menor (D-10).
 export { guardianSchema, responsibleSchema, prepararResponsable, asentarResponsable, ResponsibleRepository, type GuardianInput, type ResponsibleInput } from './responsible.js';
+
+// Fase 4, bloque 4.8 (D-36): el socio cambia su contacto desde el portal. Consumida por: portal (las rutas
+// `/portal/me/contact`) y analytics (el renglón del Inicio que avisa al mostrador).
+export { cambiarContactoPropio, contactoPropio, contactoPropioSchema, olvidarFallosDeConfirmacion, type ContactoCambiado, type ContactoPropioInput } from './contacto-propio.js';
+export { ContactChangeRepository } from './contact-change.repository.js';
+// Las monta el módulo PORTAL (como la invitación): su permiso es del portal, y apagado el portal no existen.
+export { registerContactChangeRoutes } from './contact-changes.routes.js';

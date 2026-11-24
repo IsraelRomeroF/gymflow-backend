@@ -31,6 +31,8 @@ export type EngagementRow = {
    */
   baselineVisitsPerWeek: number | null;
   monthlyValueCents: bigint;
+  /** El plan de su membresía: lo que «Recuperar» dice de un perdido (bloque 4.4). */
+  planName: string | null;
 };
 
 /**
@@ -88,7 +90,8 @@ export class RetentionRepository extends TenantRepository {
                  AND e."membershipId" = ms."id"
                  AND e."eventType" = 'UNFROZEN'
                  AND (totales."last" IS NULL OR e."at" > totales."last")) AS "resumedAt",
-             COALESCE(p."priceCents", 0)::bigint AS "monthlyValueCents"
+             COALESCE(p."priceCents", 0)::bigint AS "monthlyValueCents",
+             p."name" AS "planName"
       FROM "members" m
       JOIN "memberships" ms ON ms."memberId" = m."id" AND ms."status" IN ${ESTADOS_VIVOS}
       JOIN "plans" p ON p."id" = ms."planId"
@@ -98,5 +101,20 @@ export class RetentionRepository extends TenantRepository {
         AND m."deletedAt" IS NULL
         ${filtro}
       ORDER BY m."joinedAt" ASC`, ...params);
+  }
+
+  /**
+   * La última visita de cada socio de la lista (día de operación), para
+   * «Recuperar» (bloque 4.4): los que están de baja ya no salen de
+   * `engagement`, que solo mide membresías vivas.
+   */
+  async ultimasVisitas(memberIds: readonly string[]): Promise<Map<string, Date>> {
+    if (memberIds.length === 0) return new Map();
+    const filas = await this.db.$queryRawUnsafe<Array<{ memberId: string; last: Date }>>(`
+      SELECT a."memberId", MAX(a."businessDate") AS "last"
+        FROM "attendance_events" a
+       WHERE a."organizationId" = $1::uuid AND a."memberId" = ANY($2::uuid[])
+       GROUP BY a."memberId"`, this.organizationId, [...memberIds]);
+    return new Map(filas.map((f) => [f.memberId, f.last]));
   }
 }

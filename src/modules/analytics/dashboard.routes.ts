@@ -105,6 +105,8 @@ export function registerDashboardRoutes(app: FastifyInstance): void {
         portfolio: f ? {
           outstandingCents: f.outstandingCents, overdueCents: f.overdueCents, delinquencyRate: morosidadDeLaFoto(f),
           membersBehind: f.membersBehind, membersBase: f.membersBase,
+          // D-18 (4.4, edición puntual): la foto de un mes cerrado no guarda lo dado por perdido.
+          lostCents: '0', lostMembers: 0,
         } : {
           outstandingCents: cents(d.outstandingCents),
           overdueCents: cents(d.overdueCents),
@@ -112,6 +114,9 @@ export function registerDashboardRoutes(app: FastifyInstance): void {
           // En socios, no en pesos: "24 de 248 atrasados" dice más que "vencido 100 %".
           membersBehind: d.membersBehind,
           membersBase: d.membersBase,
+          // D-18 (4.4, edición puntual): dada por perdida; ya no está en `outstandingCents`.
+          lostCents: cents(d.lostCents),
+          lostMembers: d.lostMembers,
         },
         activeMembers: f ? f.activeMembers : d.activeMembers,
         openCashSessions: d.openCashSessions.map((s) => ({

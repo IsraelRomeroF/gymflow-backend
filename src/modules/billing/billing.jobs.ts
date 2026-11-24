@@ -8,6 +8,7 @@ import { AuditService } from '../../platform/audit/audit.service.js';
 import type { RequestContext } from '../../platform/context.js';
 import { systemContext, type JobHandler, type JobResult } from '../../platform/jobs/types.js';
 import { BusinessCalendar, type DiaDeSedes } from '../../platform/time/business-calendar.js';
+import { markLostDebt } from './deuda-perdida.js';
 
 /**
  * Jobs del libro financiero (§29).
@@ -283,5 +284,7 @@ export const BILLING_JOBS: ReadonlyArray<{ name: string; handler: JobHandler }> 
   { name: 'billing.generate-cycle-charges', handler: generateCycleCharges },
   { name: 'billing.mark-overdue', handler: markOverdueCharges },
   { name: 'billing.mark-memberships-past-due', handler: markMembershipsPastDue },
+  // D-18 (bloque 4.4): la deuda de la suspendida que terminó sale de «Por cobrar» (no se borra).
+  { name: 'billing.mark-lost-debt', handler: markLostDebt },
   { name: 'billing.reconcile-balances', handler: reconcileBalances },
 ];

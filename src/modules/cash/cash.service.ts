@@ -1,17 +1,17 @@
 import {
   canClose, computeVariance, conflict, expectedCash, formatMoney, money,
   movementSignIsValid, notFound, signedMovementAmount,
-  summarizeShift, validation, DomainError, reglaDelCajon, topeDeRetiroDelPuesto,
-  type CashMovementType, type Money, type PaymentMethodType,
+  summarizeShift, validation, DomainError, reglaDelCajon, topeDeRetiroDelPuesto, retiroDisponibleDelPuesto,
+  type CashMovementType, type Money, type PaymentMethodType, type TopeDeRetiroDelPuesto,
 } from '@gymflow/core';
 import { BranchRepository } from '../organization/index.js';
 import { CashRegisterRepository, CashSessionRepository, type CashMovementRecord, type CashRegisterRecord, type CashSessionRecord } from './cash.repository.js';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import type { RequestContext } from '../../platform/context.js';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
-import { enUnaTransaccion } from '../../platform/db/unit-of-work.js';
+import { enUnidadDeDinero } from '../../platform/db/unit-of-work.js';
 import { CashSettingsRepository } from './cash-settings.repository.js';
-import { MonthlyCloseService } from '../finance/index.js';
+import { ExpensesRepository, MonthlyCloseService } from '../finance/index.js';
 
 /** Documento del turno: lo que recepción firma al cerrar. */
 export type ShiftReport = {
@@ -29,6 +29,16 @@ export type ShiftReport = {
   countedCashCents: bigint | null;
   varianceCents: bigint | null;
 };
+
+/** Lo que a una persona le queda por mover en un turno (bloque 4.3). */
+export type ShiftAllowance = {
+  sessionId: string;
+  withdrawal: { role: TopeDeRetiroDelPuesto; limitCents: bigint | null; usedCents: bigint; remainingCents: bigint | null };
+  petty: { limitCents: bigint; floatInRemainingCents: bigint; expenseRemainingCents: bigint };
+};
+
+/** El «Retiro del dueño» en Movimientos (`operating_expenses.category`). */
+const RETIRO_DEL_DUENO = 'OWNER_DRAW';
 
 export class CashService {
   private readonly audit = new AuditService();
@@ -188,45 +198,182 @@ export class CashService {
       );
     }
 
-    let esperadoCents = 0n;
-    const cerrada: CashSessionRecord = await sessions.closeLocked({
-      sessionId: input.sessionId,
-      closedByUserId: userId,
-      countedCashCents: input.countedCashCents,
-      varianceReason: input.varianceReason ?? null,
-      // Se calcula con el turno ya bloqueado: ningún cobro entra a medias.
-      calcular: async () => {
-        esperadoCents = await sessions.expectedCashCents(session);
-        const veredicto = canClose({
-          status: session.status,
-          counted: money(input.countedCashCents),
-          varianceReason: input.varianceReason ?? null,
-          expected: money(esperadoCents),
-        });
-        if (!veredicto.ok) {
-          const { variance } = computeVariance(money(esperadoCents), money(input.countedCashCents));
-          throw validation(`${veredicto.reason} (diferencia: ${variance.cents} centavos)`);
-        }
-        return { expectedCashCents: esperadoCents };
-      },
-    });
+    // D-17 (bloque 4.3): el cierre y su asiento se confirman juntos, en el turno de dinero del
+    // gimnasio. El conteo de arriba queda fuera a propósito (se conserva aunque el cierre se rechace).
+    return enUnidadDeDinero(orgId, async () => {
+      let esperadoCents = 0n;
+      const cerrada: CashSessionRecord = await sessions.closeLocked({
+        sessionId: input.sessionId,
+        closedByUserId: userId,
+        countedCashCents: input.countedCashCents,
+        varianceReason: input.varianceReason ?? null,
+        // Se calcula con el turno ya bloqueado: ningún cobro entra a medias.
+        calcular: async () => {
+          esperadoCents = await sessions.expectedCashCents(session);
+          const veredicto = canClose({
+            status: session.status,
+            counted: money(input.countedCashCents),
+            varianceReason: input.varianceReason ?? null,
+            expected: money(esperadoCents),
+          });
+          if (!veredicto.ok) {
+            const { variance } = computeVariance(money(esperadoCents), money(input.countedCashCents));
+            throw validation(`${veredicto.reason} (diferencia: ${variance.cents} centavos)`);
+          }
+          return { expectedCashCents: esperadoCents };
+        },
+      });
 
-    await this.audit.record(ctx, {
-      action: 'cash.session.close',
-      resourceType: 'cash_session',
-      resourceId: cerrada.id,
-      beforeState: { status: 'OPEN' },
-      afterState: {
-        expectedCashCents: esperadoCents.toString(),
-        countedCashCents: input.countedCashCents.toString(),
-        firstCountedCashCents: primero.toString(),
-        varianceCents: cerrada.varianceCents?.toString() ?? '0',
-      },
-      reason: input.varianceReason ?? null,
-      branchId: session.branchId,
-    });
+      await this.audit.record(ctx, {
+        action: 'cash.session.close',
+        resourceType: 'cash_session',
+        resourceId: cerrada.id,
+        beforeState: { status: 'OPEN' },
+        afterState: {
+          expectedCashCents: esperadoCents.toString(),
+          countedCashCents: input.countedCashCents.toString(),
+          firstCountedCashCents: primero.toString(),
+          varianceCents: cerrada.varianceCents?.toString() ?? '0',
+          // D-17: el descuadre es de quien ABRIÓ, lo corte quien lo corte.
+          responsibleUserId: session.openedByUserId,
+          closedByOther: session.openedByUserId !== userId,
+          varianceStatus: cerrada.varianceStatus,
+        },
+        reason: input.varianceReason ?? null,
+        branchId: session.branchId,
+      });
 
-    return { session: cerrada, varianceCents: cerrada.varianceCents ?? 0n };
+      return { session: cerrada, varianceCents: cerrada.varianceCents ?? 0n };
+    });
+  }
+
+  /**
+   * D-17 (b): la gerencia revisa un corte con más de $20 de diferencia y lo
+   * cierra con su nota. No mueve dinero ni cambia la diferencia (que ya cuenta
+   * en su día desde el corte): por eso se puede revisar aunque el mes del corte
+   * ya esté cerrado. Qué se hace con el faltante (hablarlo, reponerlo) se
+   * escribe en la nota; descontarlo del sueldo no lo hace el sistema.
+   */
+  async reviewVariance(ctx: RequestContext, input: { sessionId: string; note: string }): Promise<CashSessionRecord> {
+    const orgId = ctx.tenant.organizationId;
+    const userId = ctx.tenant.actorUserId;
+    if (!userId) throw validation('Revisar un descuadre exige un usuario');
+    const nota = input.note.trim();
+    if (nota.length < 3) throw validation('Escribe la nota de la revisión');
+
+    return enUnidadDeDinero(orgId, async () => {
+      const sessions = new CashSessionRepository(orgId);
+      const session = await sessions.findById(input.sessionId);
+      if (!session) throw notFound('Turno no encontrado');
+      const hecho = session.varianceStatus === 'PENDING'
+        && await sessions.reviewVariance(session.id, { userId, note: nota, at: new Date() });
+      if (!hecho) {
+        throw conflict(
+          session.varianceStatus === 'REVIEWED' ? 'Ese descuadre ya se revisó' : 'Ese corte no tiene una diferencia por revisar',
+          'VARIANCE_NOT_PENDING',
+        );
+      }
+      const v = session.varianceCents ?? 0n;
+      await this.audit.record(ctx, {
+        action: 'cash.variance.review',
+        resourceType: 'cash_session',
+        resourceId: session.id,
+        beforeState: { varianceStatus: 'PENDING' },
+        afterState: {
+          varianceStatus: 'REVIEWED',
+          varianceCents: v.toString(),
+          amountCents: (v < 0n ? -v : v).toString(),
+          responsibleUserId: session.openedByUserId,
+          ownShift: session.openedByUserId === userId,
+        },
+        reason: nota,
+        branchId: session.branchId,
+      });
+      const revisada = await sessions.findById(session.id);
+      if (!revisada) throw notFound('Turno no encontrado');
+      return revisada;
+    });
+  }
+
+  /**
+   * Lo que a ESTA persona le queda por mover en ESTE turno (bloque 4.3): la
+   * pantalla lo dice antes de pedir la firma. Es la misma cuenta que hace
+   * `addMovement` con `reglaDelCajon`; no revela nada del efectivo del cajón.
+   */
+  async allowance(ctx: RequestContext, session: CashSessionRecord): Promise<ShiftAllowance> {
+    const orgId = ctx.tenant.organizationId;
+    const userId = ctx.tenant.actorUserId;
+    if (!userId) throw validation('Los topes del turno son de una persona');
+    const sessions = new CashSessionRepository(orgId);
+    const [topes, retirado, fondo, gasto] = await Promise.all([
+      new CashSettingsRepository(orgId).get(),
+      sessions.withdrawnByUserCents(session.id, userId),
+      sessions.unsignedInSessionCents(session.id, 'FLOAT_IN'),
+      sessions.unsignedInSessionCents(session.id, 'EXPENSE'),
+    ]);
+    const puesto = topeDeRetiroDelPuesto(ctx.tenant.limits.maxCashWithdrawalCents);
+    const queda = (usado: bigint) => (topes.pettyLimitCents > usado ? topes.pettyLimitCents - usado : 0n);
+    return {
+      sessionId: session.id,
+      withdrawal: {
+        role: puesto,
+        limitCents: puesto === 'CON_TOPE' ? topes.withdrawalShiftLimitCents : puesto === 'NO_PUEDE' ? 0n : null,
+        usedCents: retirado,
+        remainingCents: retiroDisponibleDelPuesto({ puesto, topeRetiroCents: topes.withdrawalShiftLimitCents, retiradoEnElTurnoCents: retirado }),
+      },
+      petty: { limitCents: topes.pettyLimitCents, floatInRemainingCents: queda(fondo), expenseRemainingCents: queda(gasto) },
+    };
+  }
+
+  /**
+   * «RETIRO DEL DUEÑO» QUE SALE DEL CAJÓN (pendiente de 3.7 y 3.5; bloque 4.3).
+   *
+   * Un solo acto, una sola transacción: el retiro del cajón (para que el corte
+   * cuadre) y su anotación en Movimientos como «Retiro del dueño» (que se ve y
+   * no resta de la ganancia). Antes había que anotarlo en dos pantallas, y si
+   * se olvidaba la de Caja el corte daba faltante a nombre de quien abrió.
+   *
+   * Para el cajón es un retiro como cualquier otro (D-15): siempre con la
+   * firma de la dueña y, recepción, dentro de su tope por turno. Se anota en
+   * el mes en curso de la sede; si ese mes o el del turno ya están cerrados,
+   * 409 `MONTH_CLOSED` y no se mueve nada.
+   */
+  async ownerDraw(ctx: RequestContext, input: {
+    sessionId: string; amountCents: bigint; reason: string; approvedByUserId?: string | null;
+  }): Promise<{ movement: CashMovementRecord; expenseId: string; periodMonth: Date }> {
+    const orgId = ctx.tenant.organizationId;
+    const userId = ctx.tenant.actorUserId;
+    if (!userId) throw validation('Un movimiento de caja exige un usuario');
+    return enUnidadDeDinero(orgId, async () => {
+      const session = await new CashSessionRepository(orgId).findById(input.sessionId);
+      if (!session) throw notFound('Turno no encontrado');
+      if (session.status !== 'OPEN') throw conflict('El turno ya está cerrado', 'CASH_SESSION_CLOSED');
+      if (input.amountCents <= 0n) throw validation('El importe del retiro debe ser positivo');
+      const hoy = await this.businessDate(orgId, session.branchId);
+      // El retiro se anota en el mes de HOY: ese mes tiene que seguir abierto (el del turno lo mira `addMovement`).
+      await new MonthlyCloseService().assertOpen(orgId, hoy);
+      const periodMonth = new Date(Date.UTC(hoy.getUTCFullYear(), hoy.getUTCMonth(), 1));
+
+      const gasto = await new ExpensesRepository(orgId).create({
+        branchId: session.branchId, category: RETIRO_DEL_DUENO, description: input.reason.slice(0, 200),
+        amountCents: input.amountCents, periodMonth, createdByUserId: userId,
+      });
+      await this.audit.record(ctx, {
+        action: 'expense.create', resourceType: 'OperatingExpense', resourceId: gasto.id, branchId: session.branchId,
+        reason: input.reason,
+        afterState: {
+          category: RETIRO_DEL_DUENO, amountCents: input.amountCents.toString(), month: periodMonth.toISOString().slice(0, 7),
+          fromCashSessionId: session.id,
+        },
+        approvedByUserId: input.approvedByUserId ?? null,
+      });
+      // Si el cajón lo rechaza (falta la firma, pasa del tope, no hay tanto efectivo), la anotación de arriba se deshace con él.
+      const movement = await this.addMovement(ctx, {
+        sessionId: session.id, movementType: 'WITHDRAWAL', amountCents: input.amountCents, reason: input.reason,
+        approvedByUserId: input.approvedByUserId ?? null, expenseId: gasto.id,
+      });
+      return { movement, expenseId: gasto.id, periodMonth };
+    });
   }
 
   /**
@@ -243,9 +390,13 @@ export class CashService {
     reason: string;
     sign?: 1 | -1;
     approvedByUserId?: string | null;
+    /** «Retiro del dueño»: su anotación en Movimientos, creada en esta misma unidad (`ownerDraw`). */
+    expenseId?: string | null;
   }): Promise<CashMovementRecord> {
-    // Una unidad: si la bitácora no se escribe, la operación no ocurre (OPT2-14).
-    return enUnaTransaccion(async () => {
+    // Una unidad de dinero (bloque 4.3; antes, una transacción suelta): toma el turno del gimnasio antes
+    // de leer nada, así dos retiros a la vez no leen el mismo «retirado en el turno» ni el mismo efectivo
+    // disponible; y si la bitácora no se escribe, la operación no ocurre (OPT2-14).
+    return enUnidadDeDinero(ctx.tenant.organizationId, async () => {
       const orgId = ctx.tenant.organizationId;
       const userId = ctx.tenant.actorUserId;
       if (!userId) throw validation('Un movimiento de caja exige un usuario');
@@ -304,13 +455,17 @@ export class CashService {
         // El día de la SEDE en este instante (DM-10): un turno que cruza la
         // medianoche reparte sus gastos entre los dos días, como los pagos.
         businessDate: await new BusinessCalendar(orgId).today(session.branchId),
+        expenseId: input.expenseId ?? null,
       });
 
       await this.audit.record(ctx, {
         action: input.movementType === 'WITHDRAWAL' ? 'cash.withdraw' : 'cash.movement.create',
         resourceType: 'cash_movement',
         resourceId: movimiento.id,
-        afterState: { type: input.movementType, amountCents: firmado.cents.toString() },
+        afterState: {
+          type: input.movementType, amountCents: firmado.cents.toString(),
+          ...(input.expenseId ? { ownerDraw: true, expenseId: input.expenseId } : {}),
+        },
         reason: input.reason,
         approvedByUserId: input.approvedByUserId ?? null,
         branchId: session.branchId,

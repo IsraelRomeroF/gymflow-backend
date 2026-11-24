@@ -29,6 +29,9 @@ export type Dashboard = {
   outstandingCents: bigint;
   overdueCents: bigint;
   delinquencyRate: number;
+  /** D-18 (bloque 4.4, edición puntual): la deuda dada por perdida, que ya no está en `outstandingCents`. */
+  lostCents: bigint;
+  lostMembers: number;
   openCashSessions: Array<{
     id: string; branchId: string; registerCode: string;
     openedAt: Date; openingFloatCents: bigint;
@@ -188,6 +191,8 @@ export class AnalyticsService {
       outstandingCents: cartera.totalOutstandingCents,
       overdueCents: cartera.overdueCents,
       delinquencyRate: delinquencyRate(cartera.overdueCents, cartera.totalOutstandingCents),
+      lostCents: cartera.lostCents,
+      lostMembers: cartera.lostMembers,
       openCashSessions: cajas,
       branches: rankBranches(branches),
       packsValuedByListPrice: porListaDePrecios,
@@ -295,6 +300,9 @@ export class AnalyticsService {
     return {
       totalOutstandingCents: partes.reduce((a, p) => a + p.totalOutstandingCents, 0n),
       overdueCents: partes.reduce((a, p) => a + p.overdueCents, 0n),
+      lostCents: partes.reduce((a, p) => a + p.lostCents, 0n),
+      // Un socio debe en la sede donde se le cobró: sumando sedes puede contarse dos veces si debe en dos.
+      lostMembers: partes.reduce((a, p) => a + p.lostMembers, 0),
       byBranch: partes.flatMap((p) => p.byBranch),
     };
   }

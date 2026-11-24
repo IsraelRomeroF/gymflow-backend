@@ -339,6 +339,8 @@ export class ApprovalRequestRepository extends TenantRepository {
       // Bloque 3.5 (edición puntual): la devolución de una venta de tienda (D-13) y los topes del cajón (D-15).
       ...ventasDeTienda.map((v) => [v.id, `Venta de tienda${v.folio ? ` · folio ${v.folio}` : ''} del ${v.businessDate.toISOString().slice(0, 10)}`] as const),
       ...ids('CashLimits').map((id) => [id, 'Topes del cajón del gimnasio'] as const),
+      // Bloque 4.4 (edición puntual): los plazos de la deuda del gimnasio (D-18).
+      ...ids('MemberTerms').map((id) => [id, 'Plazos de la deuda del gimnasio'] as const),
       ...cierres,
     ]);
     return new Map(sols.filter((s) => s.resourceId && porRecurso.has(s.resourceId)).map((s) => [s.id, porRecurso.get(s.resourceId!)!]));

@@ -192,7 +192,11 @@ export function registerAuthRoutes(app: FastifyInstance, env: Env): void {
           ? await (async () => { const ps = await new StaffRepository(ctx.tenant.organizationId).platformSections(ctx.tenant.actorUserId!); return ps ? normalizeUnlocked(ps) : null; })()
           : normalizeUnlocked(await new StaffRepository(ctx.tenant.organizationId).unlockedSections(ctx.tenant.actorUserId!)),
         limits: serializeLimits(ctx.tenant.limits),
-        session: sesion ? { startedAt: sesion.startedAt.toISOString(), endsAt: sesion.endsAt.toISOString(), secondsLeft: segundosHasta(sesion.endsAt) } : null,
+        session: sesion ? {
+          startedAt: sesion.startedAt.toISOString(), endsAt: sesion.endsAt.toISOString(), secondsLeft: segundosHasta(sesion.endsAt),
+          // D-04: de qué lugar es. En el teléfono de la dueña `endsAt` es cuándo se cerraría si no se volviera a usar.
+          kind: sesion.kind, renews: sesion.renews, idleDays: sesion.idleDays, maxEndsAt: sesion.maxEndsAt.toISOString(),
+        } : null,
       };
     },
   });
@@ -212,6 +216,8 @@ export function registerAuthRoutes(app: FastifyInstance, env: Env): void {
         id: x.id, current: x.id === ctx.tenant.sessionId, device: x.device, deviceLabel: x.deviceLabel, ip: x.ip,
         createdAt: x.createdAt.toISOString(), lastSeenAt: x.lastSeenAt.toISOString(),
         expiresAt: x.expiresAt.toISOString(), endsAt: x.endsAt.toISOString(),
+        // D-04: mostrador (tiempo fijo) o teléfono de la dueña (se renueva con el uso).
+        kind: x.kind, renews: x.renews,
       }));
     },
   });

@@ -38,7 +38,7 @@ const TEMA: Readonly<Partial<Record<NoticeKind, PortalNotificationTopic>>> = {
 function destino(kind: NoticeKind): string {
   if (kind === 'PAYMENT_DUE_SOON' || kind === 'PAYMENT_OVERDUE' || kind === 'MEMBERSHIP_SUSPENDED') return '/pagos';
   if (kind === 'CLASS_TOMORROW' || kind === 'CLASS_HOLD_RELEASED') return '/clases';
-  if (kind === 'NEW_DEVICE' || kind.startsWith('PRIVACY_')) return '/cuenta';
+  if (kind === 'NEW_DEVICE' || kind === 'CONTACT_CHANGED' || kind.startsWith('PRIVACY_')) return '/cuenta';
   return '/';
 }
 

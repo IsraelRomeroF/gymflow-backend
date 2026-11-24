@@ -10,6 +10,11 @@ import type { AgingBucketKey } from '@gymflow/core';
  *
  * Todo se agrega en el MOTOR. Traer 4,000 cargos para sumarlos en memoria
  * funciona en desarrollo y se cae el día que la cartera crece.
+ *
+ * D-18 (fase 4, bloque 4.4): la cartera es LO COBRABLE. La deuda dada por
+ * perdida (`charges.lostOn`: su membresía llevó suspendida el plazo del
+ * gimnasio) no entra en el total, en lo vencido, en los tramos, en el reparto
+ * por sede ni en la lista de deudores; se informa aparte (`lostCents`).
  */
 
 export type AgingRow = {
@@ -29,6 +34,13 @@ export type Portfolio = {
   totalOutstandingCents: bigint;
   overdueCents: bigint;
   membersWithDebt: number;
+  /**
+   * D-18 (bloque 4.4): la deuda dada por perdida (`charges.lostOn`). NO está en
+   * ninguna de las cifras de arriba ni en los tramos: la cartera es lo
+   * cobrable. Sigue en el estado de cuenta de cada socio y se puede cobrar.
+   */
+  lostCents: bigint;
+  lostMembers: number;
   creditBalanceCents: bigint;
   byAging: AgingRow[];
   byBranch: BranchRow[];
@@ -65,6 +77,7 @@ export class PortfolioRepository extends TenantRepository {
       JOIN "members" mb ON mb."id" = c."memberId" AND mb."deletedAt" IS NULL
       WHERE c."organizationId" = $1::uuid
         AND c."status" IN ('OPEN','PARTIALLY_PAID','OVERDUE')
+        AND c."lostOn" IS NULL
         ${filtroSucursal}
       GROUP BY 1`, ...params);
 
@@ -78,6 +91,7 @@ export class PortfolioRepository extends TenantRepository {
       JOIN "members" mb ON mb."id" = c."memberId" AND mb."deletedAt" IS NULL
       WHERE c."organizationId" = $1::uuid
         AND c."status" IN ('OPEN','PARTIALLY_PAID','OVERDUE')
+        AND c."lostOn" IS NULL
         AND $2::date IS NOT NULL
         ${filtroSucursal}
       GROUP BY c."branchId"
@@ -95,6 +109,7 @@ export class PortfolioRepository extends TenantRepository {
       JOIN "members" mb ON mb."id" = c."memberId" AND mb."deletedAt" IS NULL
       WHERE c."organizationId" = $1::uuid
         AND c."status" IN ('OPEN','PARTIALLY_PAID','OVERDUE')
+        AND c."lostOn" IS NULL
         ${filtroSucursal}`, ...params);
 
     // El saldo a favor NO se resta de la cartera: son dos cifras distintas y
@@ -107,11 +122,25 @@ export class PortfolioRepository extends TenantRepository {
       WHERE "organizationId" = ${this.organizationId}::uuid
         AND "status" IN ('SUCCEEDED','REVERSED')`;
 
+    // Lo dado por perdido, aparte (misma regla de socios vivos que la cartera).
+    const perdida = await this.db.$queryRawUnsafe<Array<{ total: bigint; members: bigint }>>(`
+      SELECT COALESCE(SUM(c."amountCents" - c."allocatedCents" - c."adjustedCents"), 0)::bigint AS total,
+             COUNT(DISTINCT c."memberId")::bigint AS members
+      FROM "charges" c
+      JOIN "members" mb ON mb."id" = c."memberId" AND mb."deletedAt" IS NULL
+      WHERE c."organizationId" = $1::uuid
+        AND c."status" IN ('OPEN','PARTIALLY_PAID','OVERDUE')
+        AND c."lostOn" IS NOT NULL
+        AND $2::date IS NOT NULL
+        ${filtroSucursal}`, ...params);
+
     const t = totales[0];
     return {
       totalOutstandingCents: t?.total ?? 0n,
       overdueCents: t?.overdue ?? 0n,
       membersWithDebt: Number(t?.members ?? 0n),
+      lostCents: perdida[0]?.total ?? 0n,
+      lostMembers: Number(perdida[0]?.members ?? 0n),
       creditBalanceCents: credito[0]?.total ?? 0n,
       byAging: aging.map((r) => ({
         bucket: r.bucket as AgingRow['bucket'],
@@ -146,6 +175,7 @@ export class PortfolioRepository extends TenantRepository {
       JOIN "members" m ON m."id" = c."memberId" AND m."deletedAt" IS NULL
       WHERE c."organizationId" = $1::uuid
         AND c."status" IN ('OPEN','PARTIALLY_PAID','OVERDUE')
+        AND c."lostOn" IS NULL
         ${filtro}
       GROUP BY m."id", m."memberCode", m."firstName", m."lastName", m."homeBranchId"
       ORDER BY "outstandingCents" DESC

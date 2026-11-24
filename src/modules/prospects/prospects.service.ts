@@ -1,6 +1,7 @@
 import {
-  AUTO_MERGE_THRESHOLD, PROSPECT_OPEN_STAGES, closesProspect, conflict, deriveStage, dueOn, normalizedNameKey, prospectQueue, rankMatches, revisarMotivo, validation,
-  type FollowUpChannel, type FollowUpOutcome, type ProspectOpenStage,
+  AUTO_MERGE_THRESHOLD, PROSPECT_AUTO_CLOSE_CODE, PROSPECT_OPEN_STAGES, businessDateIn, closesProspect, conflict, deriveStage, dueOn, normalizedNameKey,
+  prospectAutoCloseOn, prospectClosesSoon, prospectQueue, rankMatches, revisarMotivo, validation,
+  type FollowUpChannel, type FollowUpOutcome, type ProspectActivity, type ProspectOpenStage,
 } from '@gymflow/core';
 import type { Prospect, ProspectContactResult } from '@gymflow/core/contracts';
 import { AuditService } from '../../platform/audit/audit.service.js';
@@ -14,6 +15,20 @@ import { ProspectRepository, type ProspectRecord } from './prospect.repository.j
 const dia = (d: Date | null): string | null => (d ? d.toISOString().slice(0, 10) : null);
 const aFecha = (d: string): Date => new Date(`${d}T00:00:00.000Z`);
 const CERRADO = (status: string) => status === 'CONVERTED' || status === 'LOST';
+
+/**
+ * Lo que cuenta para el cierre solo (D-31), en días de SU sede: un contacto a
+ * las 23:30 de Tijuana es de ese día allá, aunque en UTC ya sea mañana.
+ */
+export function actividadDe(
+  p: Pick<ProspectRecord, 'createdAt' | 'lastContactAt' | 'nextStepOn' | 'reopenedAt'>, zona: string,
+): ProspectActivity {
+  const enSede = (d: Date | null) => (d ? dia(businessDateIn(zona, d)) : null);
+  return { createdOn: enSede(p.createdAt)!, lastContactOn: enSede(p.lastContactAt), nextStepOn: dia(p.nextStepOn), reopenedOn: enSede(p.reopenedAt) };
+}
+
+/** Lo que la fila necesita además del interesado: la zona de su sede y el nombre del plan que preguntó. */
+export type ContextoDeFila = { zona: string; planes: ReadonlyMap<string, { name: string }> };
 
 /** Quién ya existe con ese contacto y ese nombre, para no registrar dos veces a la misma persona (10-07). */
 export type YaExiste =
@@ -34,7 +49,9 @@ export class ProspectService {
   }
 
   /** Contrato `Prospect` (`@gymflow/core/contracts`): la fila con su último contacto y su grupo de la bandeja. */
-  serialize(p: ProspectRecord, ultimo: { last: FollowUpRecord; count: number } | undefined, hoy: Date): Prospect {
+  serialize(p: ProspectRecord, ultimo: { last: FollowUpRecord; count: number } | undefined, hoy: Date, fila: ContextoDeFila): Prospect {
+    // Cuándo se cierra solo, con el día de SU sede (D-31). Cerrado, ya no aplica.
+    const cierraSolo = CERRADO(p.status) ? null : prospectAutoCloseOn(actividadDe(p, fila.zona));
     return {
       id: p.id, firstName: p.firstName, lastName: p.lastName, phoneE164: p.phoneE164, email: p.email, source: p.source,
       status: p.status, branchId: p.branchId, assignedToUserId: p.assignedToUserId, convertedMemberId: p.convertedMemberId, notes: p.notes,
@@ -45,6 +62,9 @@ export class ProspectService {
       queue: CERRADO(p.status) ? null : prospectQueue(dia(p.dueOn), dia(hoy)!),
       referredByMemberId: p.referredByMemberId, referredByName: p.referredByName,
       lostReasonCode: p.lostReasonCode, lostReason: p.lostReason, closedAt: p.closedAt ? p.closedAt.toISOString() : null,
+      interestPlanId: p.interestPlanId, interestPlanName: p.interestPlanId ? fila.planes.get(p.interestPlanId)?.name ?? null : null,
+      autoCloseOn: cierraSolo, autoCloseSoon: cierraSolo !== null && prospectClosesSoon(cierraSolo, dia(businessDateIn(fila.zona))!),
+      autoClosed: p.status === 'LOST' && p.lostReasonCode === PROSPECT_AUTO_CLOSE_CODE,
     };
   }
 

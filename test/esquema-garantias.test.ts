@@ -54,18 +54,22 @@ const SOLO_AGREGAR = [
   // `membership_price_changes` y `plan_price_changes` (bloque 3.6, D-19): la historia de un cambio de precio no se corrige.
   // `pos_sale_returns` (bloque 3.5, D-13): la devolución de una venta de tienda es un asiento; no se corrige ni se borra.
   'inventory_movements', 'member_consents', 'membership_events', 'membership_price_changes', 'payment_allocations', 'plan_price_changes', 'platform_audit_logs', 'pos_sale_lines', 'pos_sale_returns', 'privacy_conservation_starts',
+  // `recurring_expense_skips` (bloque 4.5, D-26): la propuesta descartada queda con quién y cuándo; no se corrige ni se borra.
+  'recurring_expense_skips',
   // `trial_passes` (bloque 3.3, D-08): un pase de prueba ya dado no se borra ni se corrige; si no, «uno por persona» no valdría.
   'trial_passes', 'visit_ledger_entries',
 ];
 const SIN_BORRAR = [
   // `approval_proxies` (bloque 3.1, D-02): el nombramiento de apoderado es la constancia de quién pudo firmar y de cuándo a cuándo.
   'approval_grants', 'approval_proxies', 'approval_requests', 'approval_signer_locks', 'billing_cycles', 'biometric_enrollments', 'branch_module_overrides', 'cash_sessions',
-  'chargebacks', 'charges', 'member_credentials', 'member_imports', 'member_intakes', 'member_legacy_codes', 'operating_expenses',
+  // `gym_change_requests` (bloque 4.6, D-27): la solicitud de cambio a GymFlow y su respuesta son la constancia de quién pidió qué.
+  'chargebacks', 'charges', 'gym_change_requests', 'member_credentials', 'member_imports', 'member_intakes', 'member_legacy_codes', 'operating_expenses',
   'organization_entitlements', 'organization_modules', 'payment_attempts', 'payments', 'platform_invoices',
   // `platform_notices` y `platform_price_changes` (bloque 3.11, D-37 y D-38): el aviso es la constancia de que se avisó antes de suspender, y de los cambios sale lo que valía un mes pasado.
   'platform_notices', 'platform_payments', 'platform_plans', 'platform_price_changes',
   // `pos_sale_flags` (bloque 3.5, D-13): la marca «por corregir» se resuelve, no se borra.
-  'pos_sale_flags', 'pos_sales', 'privacy_batch_items', 'privacy_batches', 'refunds',
+  // `recurring_expenses` (bloque 4.5, D-26): un gasto que se repite se deja de repetir, no se borra: de él salieron gastos ya confirmados.
+  'pos_sale_flags', 'pos_sales', 'privacy_batch_items', 'privacy_batches', 'recurring_expenses', 'refunds',
 ];
 const SIN_ACTUALIZAR = ['face_templates'];
 

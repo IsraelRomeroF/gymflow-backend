@@ -313,7 +313,7 @@ describe('portal útil sin procesador (2.8)', () => {
     const r = await get('/portal/sessions', uno.cookie);
     expect(r.statusCode, r.body).toBe(200);
     expect(diferenciasConElContrato(PortalSessions, r.json())).toEqual([]);
-    expect(r.json()).toMatchObject({ active: 2, current: { expiresAt: uno.expiresAt, idleDays: 7 } });
+    expect(r.json()).toMatchObject({ active: 2, current: { expiresAt: uno.expiresAt, idleDays: 30 } });
     expect((await get('/portal/sessions', dos.cookie)).json().current.expiresAt).toBe(dos.expiresAt);
   });
 

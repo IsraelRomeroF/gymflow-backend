@@ -11,6 +11,12 @@
  */
 export { registerProspectRoutes } from './prospects.routes.js';
 
+// Consumida por: `modules.ts`. El cierre solo de la noche (D-31, bloque 4.7).
+export { PROSPECT_JOBS } from './prospects.jobs.js';
+
+// Consumida por: intake. Los planes de la sucursal con su precio de lista, para la página pública del QR (D-31).
+export { planesPublicos } from './planes-publicos.js';
+
 // Consumida por: privacy. El prospecto que se convirtió en socio también se anonimiza con él (PS-08).
 export { ProspectRepository } from './prospect.repository.js';
 

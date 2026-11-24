@@ -11,6 +11,27 @@ export class OrganizationRepository extends TenantRepository {
   }
 
   /**
+   * El gimnasio de la sesión como lo pide el PANEL (`GET /organization`): con
+   * lo que su recibo imprime (D-27, bloque 4.6). `current()` no los trae a
+   * propósito: lo usan el portal y el alta pública. El logo se pide aparte.
+   */
+  async paraElPanel() {
+    const org = await this.db.organization.findFirst({
+      where: { id: this.organizationId, deletedAt: null },
+      select: { id: true, legalName: true, tradeName: true, timezone: true, defaultCurrency: true, rfc: true, phone: true, whatsapp: true, receiptLegend: true },
+    });
+    if (!org) return null;
+    const conLogo = await this.db.organization.count({ where: { id: this.organizationId, logo: { not: null } } });
+    return { ...org, hasLogo: conLogo > 0 };
+  }
+
+  /** El logo del gimnasio (`data:` URL) o null. */
+  async logo(): Promise<string | null> {
+    const org = await this.db.organization.findFirst({ where: { id: this.organizationId, deletedAt: null }, select: { logo: true } });
+    return org?.logo ?? null;
+  }
+
+  /**
    * Los datos del gimnasio que la plataforma administra (D-27) y lo que tiene
    * contratado (19-09): el plan de la plataforma, o `null` si el contrato es a
    * la medida. Solo se leen: desde el panel no se cambia ninguno.
@@ -20,6 +41,7 @@ export class OrganizationRepository extends TenantRepository {
       where: { id: this.organizationId, deletedAt: null },
       select: {
         legalName: true, tradeName: true, timezone: true, defaultCurrency: true, billingEmail: true, activatedAt: true,
+        rfc: true, phone: true, whatsapp: true, receiptLegend: true, logo: true,
         platformPlan: { select: { name: true, description: true, modules: true } },
       },
     });

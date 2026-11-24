@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { conflict, DomainError, forbidden, mesesDeConservacion, MODULES, notFound, validation } from '@gymflow/core';
-import { GymProfile } from '@gymflow/core/contracts';
+import { GymLogo, GymProfile } from '@gymflow/core/contracts';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { route } from '../../platform/http/registry.js';
 import { respuesta } from '../../platform/http/respuesta.js';
@@ -29,6 +29,21 @@ function zonaConocida(zona: string): boolean {
  * plataforma corrige la zona de la marca, la sede la sigue.
  */
 const zonaDeSede = () => z.string().trim().max(60).refine((v) => !v || zonaConocida(v), 'Zona horaria desconocida').nullish();
+
+/**
+ * LO QUE EL PANEL NO CAMBIA (D-27, opción d · bloque 4.6): razón social, RFC,
+ * nombre comercial, logo, teléfonos, horarios y leyenda del recibo los
+ * administra la plataforma. Una petición del panel que traiga alguno se
+ * rechaza con su porqué en vez de ignorarlo en silencio: quien la mandó sabe
+ * que el dato no cambió y a quién pedírselo.
+ */
+export const DATOS_DE_PLATAFORMA = ['legalName', 'tradeName', 'rfc', 'logo', 'phone', 'whatsapp', 'receiptLegend', 'openingHours', 'hours'] as const;
+function soloDatosDelPanel(body: unknown): void {
+  if (!body || typeof body !== 'object') return;
+  if (DATOS_DE_PLATAFORMA.some((k) => k in (body as Record<string, unknown>))) {
+    throw new DomainError('FORBIDDEN', 'Ese dato lo administra GymFlow y no se cambia desde el panel: pídelo en Mi gimnasio → «Pedir un cambio a GymFlow»', undefined, 'MANAGED_BY_PLATFORM');
+  }
+}
 
 const lista = (nombres: readonly string[]) => new Intl.ListFormat('es', { type: 'conjunction' }).format(nombres);
 
@@ -101,10 +116,19 @@ export function registerOrganizationRoutes(app: FastifyInstance): void {
     security: { kind: 'session' },
     handler: async (request) => {
       const ctx = request.ctx!;
-      const org = await new OrganizationRepository(ctx.tenant.organizationId).current();
+      const org = await new OrganizationRepository(ctx.tenant.organizationId).paraElPanel();
       if (!org) throw notFound('Organización no encontrada');
       return org;
     },
+  });
+
+  /** El logo del gimnasio para el encabezado del recibo. Aparte de `GET /organization`: es una imagen y casi ninguna pantalla la usa. */
+  route(app, {
+    method: 'GET',
+    url: '/organization/logo',
+    security: { kind: 'session' },
+    schema: respuesta(200, GymLogo),
+    handler: async (request): Promise<GymLogo> => ({ logo: await new OrganizationRepository(request.ctx!.tenant.organizationId).logo() }),
   });
 
   /**
@@ -151,6 +175,13 @@ export function registerOrganizationRoutes(app: FastifyInstance): void {
           monthsAfterArchive: mesesDeConservacion(privacidad.monthsAfterArchive),
         },
         branches: { open: sedes.filter((b) => b.isActive).length, closed: sedes.filter((b) => !b.isActive).length },
+        // RFC, logo, teléfonos, leyenda del recibo y el teléfono y horario de cada sucursal (bloque 4.6): solo lectura.
+        brand: {
+          rfc: org.rfc, phone: org.phone, whatsapp: org.whatsapp, receiptLegend: org.receiptLegend, logo: org.logo,
+          branches: sedes.map((b) => ({ id: b.id, code: b.code, name: b.name, isActive: b.isActive, phone: b.phone, openingHours: b.openingHours })),
+        },
+        // Quien llegó hasta aquí es la dueña o la gerencia: son quienes piden cambios (misma puerta que `POST /gym-change-requests`).
+        canRequestChange: true,
       };
     },
   });
@@ -190,6 +221,7 @@ export function registerOrganizationRoutes(app: FastifyInstance): void {
     security: { kind: 'permission', permission: 'settings:org' },
     handler: async (request, reply) => {
       const ctx = request.ctx!;
+      soloDatosDelPanel(request.body);
       const body = z.object({
         code: z.string().trim().regex(/^[A-Za-z]{3}[A-Za-z0-9]{0,5}$/, 'De 3 a 8 caracteres, empezando con 3 letras'),
         name: z.string().trim().min(2).max(80),
@@ -230,6 +262,7 @@ export function registerOrganizationRoutes(app: FastifyInstance): void {
     handler: async (request) => {
       const ctx = request.ctx!;
       const { id } = idParam.parse(request.params);
+      soloDatosDelPanel(request.body);
       const body = z.object({
         name: z.string().trim().min(2).max(80).optional(),
         addressLine: z.string().trim().max(200).nullish().transform((v) => (v === undefined ? undefined : v || null)),

@@ -6,12 +6,12 @@
  * `platform/http/fastify.d.ts` y aquí se implementa. `verifyApprover` (la
  * firma del segundo usuario) lo pone `approvals` al montarse (bloque 1.7).
  */
-import type { FastifyInstance, FastifyRequest } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
 import fp from 'fastify-plugin';
 import { DomainError, MODULE_BY_KEY, can, canPossess, isAllowed } from '@gymflow/core';
 import { buildTenant, type RequestContext } from '../../platform/context.js';
-import { sesionRequerida } from '../../platform/http/sesion.js';
+import { opcionesDeCookie, sesionRequerida } from '../../platform/http/sesion.js';
 import { AuthService, sirveConTemporal } from './auth.service.js';
 import { finDeSesion } from './fin-de-sesion.js';
 import type { Env } from '../../platform/env.js';
@@ -102,13 +102,16 @@ async function authPluginImpl(app: FastifyInstance, opts: { env: Env }) {
    * Si la cookie ya no sirve, deja dicho por qué (`request.sessionEnd`): la
    * ruta que exige sesión lo manda en su 401 (24-06).
    */
-  app.addHook('onRequest', async (request: FastifyRequest) => {
+  app.addHook('onRequest', async (request: FastifyRequest, reply: FastifyReply) => {
     const token = request.cookies?.[SESSION_COOKIE];
     if (!token) return;
 
     // Sin 2FA desde el 2026-10-09 (ADR-008): toda sesión nace completa.
-    const resolved = await auth.resolveSession(token);
+    const resolved = await auth.resolveSession(token, { userAgent: request.headers['user-agent'] });
     if (!resolved.ok) { request.sessionEnd = resolved.fin; return; }
+    // El teléfono de la dueña (D-04): la sesión se renovó con este uso; su cookie se vuelve a poner con
+    // la fecha nueva, la misma que quedó en la base. Es la MISMA sesión: revocarla la sigue cortando.
+    if (resolved.renovadaHasta) reply.setCookie(SESSION_COOKIE, token, opcionesDeCookie(request, opts.env, resolved.renovadaHasta));
     if (!resolved.user.organizationId) {
       // Quien opera la plataforma no pertenece a ningún gimnasio: no tiene
       // `ctx` (nunca actúa como personal de nadie), solo `platform`.

@@ -3,7 +3,7 @@ import { registerApprovalRoutes, registerApprovalVerifier, APPROVAL_JOBS } from 
 import { registerOrganizationRoutes } from './modules/organization/index.js';
 import { registerTenantRoutes, TENANT_JOBS } from './modules/tenants/index.js';
 import { registerMemberRoutes } from './modules/members/index.js';
-import { registerProspectRoutes } from './modules/prospects/index.js';
+import { registerProspectRoutes, PROSPECT_JOBS } from './modules/prospects/index.js';
 import { registerFollowUpRoutes } from './modules/follow-ups/index.js';
 import { registerCatalogRoutes } from './modules/catalog/index.js';
 import { registerMembershipRoutes, MEMBERSHIP_JOBS } from './modules/memberships/index.js';
@@ -58,7 +58,7 @@ export const BACKEND_MODULES: readonly BackendModule[] = [
   { name: 'catalog', module: 'core', register: (app) => registerCatalogRoutes(app) },
   { name: 'members', module: 'core', register: (app) => registerMemberRoutes(app) },
   // Prospectos y seguimientos salieron de `members` (auditoría 8, bloque 1.7).
-  { name: 'prospects', module: 'prospects', register: (app) => registerProspectRoutes(app) },
+  { name: 'prospects', module: 'prospects', register: (app) => registerProspectRoutes(app), jobs: PROSPECT_JOBS },
   { name: 'follow-ups', module: 'retention', register: (app) => registerFollowUpRoutes(app) },
   { name: 'memberships', module: 'core', register: (app) => registerMembershipRoutes(app), jobs: MEMBERSHIP_JOBS },
   {

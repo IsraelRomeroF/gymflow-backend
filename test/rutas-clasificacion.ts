@@ -91,6 +91,9 @@ export const CUERPOS: Record<string, Cuerpo> = {
   // D-15 (bloque 3.5): `/movements` es de quien retira; `/petty-movements`, de quien anota fondo y gasto chico.
   'POST /cash-sessions/:id/movements': () => ({ movementType: 'WITHDRAWAL', amountCents: '100', reason: MOTIVO }),
   'POST /cash-sessions/:id/petty-movements': () => ({ movementType: 'FLOAT_IN', amountCents: '100', reason: MOTIVO }),
+  // Fase 4 · bloque 4.3 (D-17): la revisión del descuadre lleva su nota; el retiro del dueño, importe y motivo.
+  'POST /cash-sessions/:id/variance/review': () => ({ note: MOTIVO }),
+  'POST /cash-sessions/:id/owner-draw': () => ({ amountCents: '100', reason: MOTIVO }),
   'POST /charges/:id/adjustments': () => ({ adjustmentType: 'DISCOUNT', amountCents: '100', reason: MOTIVO }),
   'POST /classes/schedules/:id/bookings': (g) => ({ memberId: g.ids.member }),
   'POST /intakes/:id/link': (g) => ({ memberId: g.ids.member }),
@@ -122,6 +125,9 @@ export const CUERPOS: Record<string, Cuerpo> = {
   'PUT /memberships/:id/price-protection': () => ({ protected: true, reason: MOTIVO }),
   // Fase 3 · bloque 3.5 (D-14).
   'PUT /memberships/:id/auto-renew': () => ({ autoRenew: false, reason: MOTIVO }),
+  // Fase 4 · bloque 4.4 (D-18): los plazos del socio. Los de la deuda piden además la firma de la dueña (428 sin ella).
+  'PUT /member-terms/retention': () => ({ dormantDays: 21, reason: MOTIVO }),
+  'PUT /member-terms/debt': () => ({ lostDebtDays: 90, reason: MOTIVO }),
   'POST /memberships/:id/debt-decision': () => ({ decision: 'FORGIVE', reason: MOTIVO }),
   'POST /memberships/:id/freeze': () => ({ days: 7, reason: MOTIVO }),
   'POST /memberships/:id/plan-change': (g) => ({ planId: g.ids.plan, reason: MOTIVO }),
@@ -158,12 +164,18 @@ export const CONSULTAS: Record<string, string | ((g: GimnasioDeRutas) => string)
   'GET /reports/daily': 'from=2026-01-01&to=2026-01-31',
   'GET /reports/movements': 'date=2026-01-15',
   'GET /expenses': (g) => `month=${g.mes}`,
+  // Fase 4 · bloque 4.5 (D-26): lo que se repite y lo que propone para un mes.
+  'GET /expenses/recurring': (g) => `month=${g.mes}`,
   // Fase 3 · bloque 3.7: el resumen de a quién toca lo que se firma.
   'GET /reports/signature-brief': (g) => `resourceType=Member&resourceId=${g.ids.member}`,
 };
 
 /** Rutas con permiso que tienen los cuatro puestos: ninguna cuenta del catálogo recibe 403 de la puerta. */
-export const PERMISO_DE_TODOS: string[] = ['GET /inventory', 'GET /plans', 'GET /plans/:id', 'GET /plans/:id/quote', 'GET /products'];
+export const PERMISO_DE_TODOS: string[] = [
+  'GET /inventory', 'GET /plans', 'GET /plans/:id', 'GET /plans/:id/quote', 'GET /products',
+  // Fase 4 · bloque 4.4 (D-18): los plazos del socio los lee toda pantalla que dice uno (ninguna escribe su número).
+  'GET /member-terms',
+];
 
 /** Rutas con parámetro que no nombra un recurso de un gimnasio (no hay «ajeno» que pedir). */
 export const SIN_RECURSO_DE_GIMNASIO: Record<string, string> = {
@@ -180,8 +192,16 @@ export const SIN_404_AJENO: Record<string, { status: number[]; porque: string; s
 
 /** Rutas con permiso que valen para todo el gimnasio: no miran la sede del recurso, y por qué. */
 export const DE_ORGANIZACION: Record<string, string> = {
+    // Fase 4 · bloque 4.5 (D-26): a quién se le anota un pago de nómina. Nombre y puesto de todo el personal, sin sueldos;
+    // exige anotar gastos para TODO el gimnasio (la dueña y la gerencia), no en una sede.
+    'GET /expenses/payees': 'el personal es de todo el gimnasio: exige el permiso con alcance de organización',
     // Bloque 3.5 (D-15): los topes del cajón son del gimnasio, no de una sede; los ve quien ve o mueve la caja en cualquiera.
     'GET /cash/limits': 'los topes del cajón valen para todo el gimnasio',
+    // Fase 4 · bloque 4.4 (D-18): los plazos del socio son del gimnasio, no de una sede.
+    'GET /member-terms': 'los plazos del socio valen para todo el gimnasio',
+    'PUT /member-terms/retention': 'los plazos de retención son del gimnasio: exige `retention:terms:set` sobre toda la organización',
+    'PUT /member-terms/debt': 'los plazos de la deuda son del gimnasio: exige `billing:debt-terms:set` sobre toda la organización, y la firma de la dueña',
+    'GET /members/:id/standing': 'expediente único: si el socio está de baja (D-18) se pregunta desde cualquier sede; lo que debe solo se le dice a quien ve estados de cuenta',
     // Bloque 3.5 (D-12): lo que debe un socio se ve como su estado de cuenta, desde cualquier sede.
     'GET /members/:id/debt': 'expediente único',
     // El expediente del socio es ÚNICO en la organización: se cobra y se
@@ -277,6 +297,10 @@ export const LECTURAS_SIN_FILTRO_DE_SEDE: Record<string, string> = {
   'GET /access/face/status': 'el estado del motor facial no es de ninguna sede',
   'GET /intakes/pending-count': 'no recibe sede: cuenta las altas de las sedes de quien pide',
   'GET /prospects/pending': 'no recibe sede: cuenta los interesados de las sedes de quien pide',
+  // Fase 4 · bloque 4.7 (D-31): la vista previa del cierre solo.
+  'GET /prospects/auto-close': 'no recibe sede: cuenta los interesados por cerrarse solos de las sedes de quien pide',
   'GET /expenses': 'no recibe sede: quien ve solo sus sedes no ve los gastos de las demás ni los del gimnasio',
+  // Fase 4 · bloque 4.5 (D-26).
+  'GET /expenses/recurring': 'no recibe sede: quien ve solo sus sedes no ve lo que se repite en las demás ni lo de todo el gimnasio',
   'GET /member-imports': 'no recibe sede: lista las importaciones de las sedes de quien pide',
 };

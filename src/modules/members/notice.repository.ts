@@ -5,7 +5,9 @@ export type NoticeKind = 'PAYMENT_DUE_SOON' | 'PAYMENT_OVERDUE' | 'CLASS_TOMORRO
   // Solicitudes de privacidad (1.10, 21-02): la constancia de entrada, la respuesta y que ya quedó hecho.
   | 'PRIVACY_REQUEST_RECEIVED' | 'PRIVACY_REQUEST_RESOLVED' | 'PRIVACY_REQUEST_DONE'
   // Su lugar apartado sin pagar se liberó una hora antes de la clase (D-16; 3.16).
-  | 'CLASS_HOLD_RELEASED';
+  | 'CLASS_HOLD_RELEASED'
+  // Su celular o su correo cambió desde el portal (D-36; fase 4, bloque 4.8): si no fue él, que se entere.
+  | 'CONTACT_CHANGED';
 
 export type NoticeRecord = { id: string; kind: NoticeKind; title: string; body: string; createdAt: Date; readAt: Date | null };
 

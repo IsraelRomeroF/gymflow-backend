@@ -30,10 +30,15 @@ export function comoSeSaldo(
 }
 
 /** Un cargo del estado de cuenta: el cargo, cómo quedó saldado y sus ajustes con quien los autorizó. */
-export function serializeStatementCharge(c: ChargeRecord, ajustes: readonly AdjustmentRecord[], nombres: ReadonlyMap<string, string>): StatementCharge {
+export function serializeStatementCharge(
+  c: ChargeRecord, ajustes: readonly AdjustmentRecord[], nombres: ReadonlyMap<string, string>,
+  /** D-18 (4.4): el día en que se dio por perdido, si pasó y se sigue debiendo. */
+  lostOn: Date | null = null,
+): StatementCharge {
   return {
     ...serializeCharge(c),
     settledBy: comoSeSaldo(c, ajustes),
+    lostOn: lostOn ? lostOn.toISOString().slice(0, 10) : null,
     adjustments: ajustes.map((a) => ({
       ...serializeAdjustment(a),
       approvedByName: a.approvedByUserId ? nombres.get(a.approvedByUserId) ?? null : null,

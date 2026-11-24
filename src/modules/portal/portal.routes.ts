@@ -21,6 +21,7 @@ import { CIERRE_DEL_SOCIO, MEMBER_IDLE_DAYS, PortalAuthRepository, PortalReposit
 import { PORTAL_PAGINA, PortalService, tieneComprobante } from './portal.service.js';
 import { PortalNotificationsService } from './notificaciones.js';
 import { ofertaPara } from './oferta.js';
+import { registerPortalContactRoutes } from './contacto.routes.js';
 import type { Env } from '../../platform/env.js';
 
 const idParam = z.object({ id: z.string().uuid() });
@@ -85,6 +86,8 @@ function pagoDelSocio(p: { id: string; method: PortalPayment['method']; status: 
 type SesionDeSocio = { organizationId: string; memberId: string; /** La hora tope de la sesión de ESTE teléfono. */ expiresAt: Date; /** La sesión de ESTE teléfono: a ella se atan sus notificaciones (3.10). */ sessionId: string };
 /** Una consulta por petición: la puerta de módulos y el handler preguntan lo mismo. */
 const resueltas = new WeakMap<FastifyRequest, Promise<SesionDeSocio>>();
+/** Las peticiones en las que la sesión se renovó con el uso (D-04): al responder se vuelve a poner su cookie con la fecha nueva. */
+const renovadas = new WeakMap<FastifyRequest, { token: string; hasta: Date }>();
 
 /**
  * Por qué terminó el portal en ese teléfono, con el mismo catálogo de `reason`
@@ -94,7 +97,7 @@ const resueltas = new WeakMap<FastifyRequest, Promise<SesionDeSocio>>();
 const FIN_DEL_PORTAL = {
   NO_SESSION: 'Sesión requerida',
   SESSION_EXPIRED: 'Tu acceso en este teléfono venció. Pide en recepción un código nuevo para volver a entrar.',
-  SESSION_IDLE: 'Pasaron varios días sin abrir el portal y se cerró en este teléfono. Pide en recepción un código nuevo.',
+  SESSION_IDLE: `Pasaron ${MEMBER_IDLE_DAYS} días sin abrir el portal y se cerró en este teléfono. Pide en recepción un código nuevo.`,
   SESSION_LOGGED_OUT: 'Cerraste el portal en este teléfono. Pide en recepción un código nuevo para volver a entrar.',
   SESSION_CLOSED_EVERYWHERE: 'El portal se cerró en todos tus teléfonos. Pide en recepción un código nuevo para volver a entrar.',
   ACCOUNT_DEACTIVATED: 'Tu cuenta ya no está activa en este gimnasio. Pregunta en recepción.',
@@ -119,6 +122,7 @@ export function requireMemberSession(request: FastifyRequest): Promise<SesionDeS
       const vista = await moduleViewOf(session.organizationId);
       if (vista.serviceStatus !== 'ACTIVE') throw new DomainError('FORBIDDEN', 'El servicio de tu gimnasio no está activo. Pregunta en recepción.');
       if (!vista.org.has('member_portal')) throw moduleDisabled('Portal del socio');
+      if (session.renovada) renovadas.set(request, { token, hasta: session.expiresAt });
       return { organizationId: session.organizationId, memberId: session.memberId, expiresAt: session.expiresAt, sessionId: session.id };
     })();
     resueltas.set(request, sesion);
@@ -130,6 +134,17 @@ export function registerPortalRoutes(app: FastifyInstance, env: Env): void {
   const service = new PortalService();
   // La puerta de módulos pregunta de qué gimnasio es el socio sin conocer al portal.
   registerMemberOrganizationResolver((request) => requireMemberSession(request).then((s) => s.organizationId, () => null));
+  // D-04 (bloque 4.1): el portal queda abierto mientras se use. Cuando un uso corrió el vencimiento de la
+  // sesión, la respuesta vuelve a poner la cookie de ESE teléfono con la misma fecha que quedó en la base
+  // (en cualquier ruta de socio, también las de otros módulos). Salir la borra: ahí no se vuelve a poner.
+  app.addHook('onSend', async (request, reply) => {
+    const r = renovadas.get(request);
+    if (!r) return;
+    renovadas.delete(request);
+    const url = request.routeOptions.url;
+    if (url === '/portal/logout' || url === '/portal/logout-all') return;
+    reply.setCookie(PORTAL_COOKIE, r.token, opcionesDeCookie(request, env, r.hasta));
+  });
   registerModuleUsage('member_portal', async (orgId) => ({
     inUse: contar(await new PortalAuthRepository().activeSessions(orgId), 'socio con el portal activo en su teléfono', 'socios con el portal activo en su teléfono'),
     blockers: [],
@@ -520,4 +535,7 @@ export function registerPortalRoutes(app: FastifyInstance, env: Env): void {
       return notificaciones.desuscribir(organizationId, memberId, endpoint);
     },
   });
+
+  // ── Fase 4, bloque 4.8 · D-36: el socio cambia su celular, su correo y su contacto de emergencia ──
+  registerPortalContactRoutes(app);
 }

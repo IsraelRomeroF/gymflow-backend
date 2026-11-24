@@ -10,6 +10,8 @@ import { BranchRepository, OrganizationRepository } from '../organization/index.
 import { EnrollmentService, pendientesDeLaPuerta } from '../access/index.js';
 import { RetentionService } from '../retention/index.js';
 import { ProspectRepository } from '../prospects/index.js';
+import { ContactChangeRepository } from '../members/index.js';
+import { CashAlertsService } from '../cash/index.js';
 import { medianoche } from './pulse.service.js';
 import { HomeRepository } from './home.repository.js';
 
@@ -80,6 +82,13 @@ export function registerHomeRoutes(app: FastifyInstance): void {
           const cajas = await repo.cajasDeAyer(sedes, await hoyDe(sedes));
           return renglon(cajas.length, 'warn', { detail: cajas.slice(0, 4) });
         },
+        // D-17 (bloque 4.3): cortes con más de $20 de diferencia sin revisar, para quien los revisa.
+        variances: async () => {
+          const sedes = sedesCon('cash:variance:approve', 'cash');
+          if (sedes.length === 0) return null;
+          const p = await new CashAlertsService().pendingVariances(orgId, sedes);
+          return renglon(p.count, 'warn', { amountCents: p.shortageCents.toString() });
+        },
         biometrics: async () => {
           const sedes = new Set(sedesCon('audit:read', 'biometrics'));
           if (sedes.size === 0) return null;
@@ -105,6 +114,13 @@ export function registerHomeRoutes(app: FastifyInstance): void {
         coachless: async () => {
           const r = await repo.nuevosSinCoach(sedesCon('members:coach:assign'), new Date(ahora.getTime() - DIAS_DE_SOCIO_NUEVO * 86_400_000));
           return renglon(r.total, 'info', { detail: r.nombres });
+        },
+        // D-36 (4.8): socios que cambiaron su celular o su correo desde el portal y nadie del mostrador lo ha
+        // confirmado con ellos. Para quien da acceso al portal en esa sede; ámbar si alguno pasó a compartir celular.
+        contactChanges: async () => {
+          const r = await new ContactChangeRepository(orgId).pendientesPorSede(
+            sedesCon('members:portal:invite', 'member_portal'), request.holds('members:portal:invite', null) && modulos.org.has('member_portal'));
+          return renglon(r.total, r.compartidos > 0 ? 'warn' : 'info', { detail: r.nombres });
         },
         // La misma cuenta que la bandeja de interesados (2.4): los que tocan hoy más los que nadie ha contactado.
         prospects: async () => {
