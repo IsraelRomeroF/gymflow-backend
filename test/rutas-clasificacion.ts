@@ -82,7 +82,11 @@ export const CUERPOS: Record<string, Cuerpo> = {
   'PATCH /users/:id': () => ({ reason: MOTIVO, fullName: 'Recepción de rutas' }),
   'POST /access/decisions/:id/collect': () => ({ method: 'CASH', amountCents: '100' }),
   'POST /access/gateways/:id/heartbeat': () => ({ policyVersion: 'v1' }),
+  'POST /approvals/requests/:id/answer': () => ({ answer: 'Sí, ya está contado' }),
   'POST /approvals/requests/:id/approve': () => ({ password: 'no-es-la-contraseña' }),
+  // Fase 3 · bloque 3.7: la firma de la dueña en el aviso (busca el texto y su solicitud antes de mirar la contraseña).
+  'POST /consent-documents/:id/sign': () => ({ password: 'no-es-la-contraseña' }),
+  'POST /approvals/requests/:id/ask': () => ({ question: '¿De qué socio es?' }),
   'POST /cash-sessions/:id/close': () => ({ countedCashCents: '0' }),
   'POST /cash-sessions/:id/movements': () => ({ movementType: 'FLOAT_IN', amountCents: '100', reason: MOTIVO }),
   'POST /charges/:id/adjustments': () => ({ adjustmentType: 'DISCOUNT', amountCents: '100', reason: MOTIVO }),
@@ -93,6 +97,8 @@ export const CUERPOS: Record<string, Cuerpo> = {
   'POST /members/:id/biometric-enrollments/face': (g) => ({ branchId: g.sedeB, frames: ['A'.repeat(120)], reto: 'turn_left', reason: MOTIVO }),
   // Fase 2 · bloque 2.3 (biometría): «Actualizar» valida los cuadros antes de buscar el enrolamiento.
   'POST /biometric-enrollments/:id/renew': () => ({ frames: ['A'.repeat(120)] }),
+  // Fase 3 · bloque 3.3 (pase de prueba, D-08): valida la sede antes de buscar al socio.
+  'POST /members/:id/trial-pass': (g) => ({ branchId: g.sedeB }),
   'POST /members/:id/charges': (g) => ({ chargeType: 'MANUAL_ADJUSTMENT', concept: 'Cargo de rutas', subtotalCents: '100', reason: MOTIVO, branchId: g.sedeB }),
   'POST /members/:id/consents': () => ({ consentType: 'MARKETING', granted: true }),
   'POST /members/:id/credentials': () => ({ kind: 'PIN', pin: '4821' }),
@@ -108,6 +114,7 @@ export const CUERPOS: Record<string, Cuerpo> = {
   'POST /members/:id/routine': (g) => ({ routineId: g.ids.routine }),
   'POST /members/:id/visit-packs': (g) => ({ planId: g.ids.plan, saleKey: 'rutas-paquete-0001', branchId: g.sedeB }),
   'POST /memberships/:id/change-plan': (g) => ({ planId: g.ids.plan, reason: MOTIVO }),
+  'PUT /memberships/:id/price-protection': () => ({ protected: true, reason: MOTIVO }),
   'POST /memberships/:id/debt-decision': () => ({ decision: 'FORGIVE', reason: MOTIVO }),
   'POST /memberships/:id/freeze': () => ({ days: 7, reason: MOTIVO }),
   'POST /memberships/:id/plan-change': (g) => ({ planId: g.ids.plan, reason: MOTIVO }),
@@ -145,6 +152,8 @@ export const CONSULTAS: Record<string, string | ((g: GimnasioDeRutas) => string)
   'GET /reports/daily': 'from=2026-01-01&to=2026-01-31',
   'GET /reports/movements': 'date=2026-01-15',
   'GET /expenses': (g) => `month=${g.mes}`,
+  // Fase 3 · bloque 3.7: el resumen de a quién toca lo que se firma.
+  'GET /reports/signature-brief': (g) => `resourceType=Member&resourceId=${g.ids.member}`,
 };
 
 /** Rutas con permiso que tienen los cuatro puestos: ninguna cuenta del catálogo recibe 403 de la puerta. */
@@ -208,13 +217,24 @@ export const DE_ORGANIZACION: Record<string, string> = {
   'GET /consent-documents/:id/review': 'textos de la organización',
   'GET /access/face/status': 'el estado del motor facial no es de ninguna sede (la lectura del código se la saltaba: llevaba `module:` entre la URL y la seguridad)',
   'GET /members/:id/day-passes': 'expediente único: los pases del día del socio, como sus paquetes de visitas',
+  // Fase 3 · bloque 3.3 (biometría y entrada).
+  'GET /members/:id/trial-pass': 'expediente único: el pase de prueba es uno por persona en TODO el gimnasio; cualquier sede pregunta si ya lo usó',
+  'PUT /access/face-rule': 'la regla «entrar solo con rostro» (D-06) es del gimnasio entero: exige `settings:org` sobre toda la organización',
   // Fase 2 · bloque 2.7 (dirección).
   'GET /plans/:id/impact': 'catálogo: el impacto de un plan se cuenta en todo el gimnasio (lo pide quien tiene `catalog:manage` sobre toda la organización)',
+  // Fase 3 · bloque 3.7 (dirección): el aviso de privacidad es de todo el gimnasio y lo firma quien firma por todo el gimnasio.
+  'GET /consent-documents/signature-requests': 'textos de la organización',
+  'POST /consent-documents/:id/sign': 'el aviso de privacidad es de todo el gimnasio: exige `approvals:grant` sobre toda la organización',
+  'POST /consent-documents/:id/sign/reject': 'el aviso de privacidad es de todo el gimnasio: exige `approvals:grant` sobre toda la organización',
+  'GET /plans/:id/protected-prices': 'catálogo (D-19, bloque 3.6): quiénes conservan su precio en un plan se revisa para todo el gimnasio, con `catalog:manage` sobre la organización',
+  'PUT /memberships/:id/price-protection': 'catálogo (D-19, bloque 3.6): marcar que una membresía conserva su precio es una decisión de precio de todo el gimnasio (`catalog:manage` sobre la organización), no del mostrador de una sede',
   // Fase 2 · bloque 2.2 (ficha del socio).
   'GET /members/:id/pos-sales': 'expediente único: las compras de la tienda del socio, como su estado de cuenta (cobro cruzado entre sedes)',
   'GET /members/:id/history': 'expediente único: la historia del socio; cada parte se filtra dentro con el permiso de quien pregunta sobre la sede de casa',
   // Fase 2 · bloque 2.4 (captación).
   'GET /members/:id/onboarding': 'expediente único: lo que falta para terminar el alta se atiende en cualquier sede; cuánto debe solo lo ve quien puede cobrar en la sede del socio',
+  // Fase 3 · bloque 3.4 (altas).
+  'GET /members/:id/shared-phone': 'expediente único: con quién comparte celular y quién responde por el número; a quien no ve teléfonos en la sede del socio no se le dice nada (`hidden`)',
   'GET /prospects/sources': 'catálogo de «¿Cómo se enteró?» del gimnasio', 'PUT /prospects/sources': 'catálogo de «¿Cómo se enteró?» del gimnasio (lo cambia quien configura la organización)',
   // Fase 2 · bloque 2.5 (clases).
   'GET /members/:id/bookings': 'expediente único: las clases del socio (también las que toma en otra sede) se ven desde su ficha en cualquier sede; cuál es su cargo solo lo recibe quien ve estados de cuenta en la sede del socio',
@@ -231,6 +251,8 @@ export const SEDE_SIN_403: Record<string, { status: number; porque: string }> = 
 
 /** Lecturas sin parámetro que no reciben `branchId` (responden lo de las sedes de quien pide, o no son de sede). */
 export const LECTURAS_SIN_FILTRO_DE_SEDE: Record<string, string> = {
+  // Fase 3 · bloque 3.3: la regla del rostro es del gimnasio; las cuentas que trae son solo de las sedes de quien pregunta.
+  'GET /access/face-rule': 'no recibe sede: la regla es del gimnasio y las cuentas por sucursal son solo las de las sedes de quien pregunta',
   'GET /members/biometric-renewals': 'no recibe sede: quien no tiene la bitácora ve solo los socios de sus sedes',
   'GET /members/follow-ups/latest': 'recibe socios, no sede: de los que no son de sus sedes no devuelve nada',
   'GET /biometric-enrollments/pending-deletion': 'no recibe sede: filtra por las sedes de quien pide',

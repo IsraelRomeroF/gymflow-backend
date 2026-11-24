@@ -18,7 +18,7 @@ const SE_LES_ESCRIBE = new Set(['ONBOARDING_AT_RISK', 'SLIPPING', 'DORMANT']);
 const MS_DIA = 86_400_000;
 const fechaDe = (d: Date) => d.toISOString().slice(0, 10);
 
-const enCero = (): OutboundCounts => ({ MEMBERSHIP_SUSPENDED: 0, PAYMENT_OVERDUE: 0, PAYMENT_DUE_SOON: 0, MEMBERSHIP_ENDING: 0, WE_MISS_YOU: 0 });
+const enCero = (): OutboundCounts => ({ MEMBERSHIP_SUSPENDED: 0, PAYMENT_OVERDUE: 0, PAYMENT_DUE_SOON: 0, MEMBERSHIP_ENDING: 0, WE_MISS_YOU: 0, PRICE_CHANGE: 0 });
 function contar(motivos: readonly OutboundKind[]): OutboundCounts {
   const c = enCero();
   for (const k of motivos) if ((OUTBOUND_KINDS as readonly string[]).includes(k)) c[k] += 1;
@@ -154,6 +154,12 @@ export class OutboundService {
       });
     }
     await paso('te-extrañamos', () => this.generarTeExtranamos(organizationId, repo));
+    // Los avisos de cambio de precio que el momento del cambio no alcanzó a armar (D-19).
+    await paso('cambio-de-precio', async () => {
+      const r = await this.avisarCambiosDePrecio(organizationId);
+      if (r.truncated) result.truncated = true;
+      return r.created;
+    });
     await paso('uno-por-socio', async () => { await repo.reemplazar(); return 0; });
     return result;
   }
@@ -189,6 +195,30 @@ export class OutboundService {
     return repo.crear(nuevos);
   }
 
+  /**
+   * EL AVISO DE UN CAMBIO DE PRECIO (D-19, bloque 3.6): un mensaje por
+   * membresía tocada, para que recepción le avise al socio antes de su
+   * siguiente pago. Se llama en cuanto el cambio queda confirmado (gancho de
+   * `catalog`) y otra vez en el job diario, por si aquel falló. Idempotente
+   * por `dedupeKey`. Nada sale solo: quedan en «Mensajes» (D-34).
+   */
+  async avisarCambiosDePrecio(organizationId: string): Promise<{ created: number; truncated: boolean }> {
+    const repo = new OutboundRepository(organizationId);
+    let created = 0;
+    // Un aumento puede tocar a miles: por lotes, hasta 20 por llamada (el job sigue con el resto).
+    for (let vuelta = 0; vuelta < 20; vuelta++) {
+      const filas = await repo.cambiosDePrecio();
+      if (filas.length === 0) return { created, truncated: false };
+      created += await repo.crear(filas.map((f): Nuevo => ({
+        kind: 'PRICE_CHANGE', memberId: f.memberId, branchId: f.homeBranchId, membershipId: f.membershipId, priceChangeId: f.id,
+        dedupeKey: `PRICE_CHANGE:${f.id}`,
+      })));
+      if (filas.length < LOTE) { await repo.reemplazar(); return { created, truncated: false }; }
+    }
+    await repo.reemplazar();
+    return { created, truncated: true };
+  }
+
   // ── Armar ────────────────────────────────────────────────────────────────
 
   private async membrete(organizationId: string): Promise<Membrete> {
@@ -205,6 +235,7 @@ export class OutboundService {
       kind: f.kind, firstName: f.firstName, gimnasio: m.gimnasio,
       sede: m.variasSedes && f.homeBranchId ? m.sedes.get(f.homeBranchId) ?? null : null,
       concept: f.concept, dueCents: f.dueCents, dueDate: f.dueDate, planName: f.planName, periodEnd: f.periodEnd,
+      priceFromCents: f.priceFromCents, priceToCents: f.priceToCents,
       engagementState: f.engagementState, enLinea: m.enLinea,
     });
   }

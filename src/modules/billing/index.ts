@@ -33,4 +33,6 @@ export { precioDeCuotaDe } from './precio-de-cuota.js';
 //   · El pase del día (1.8) lo consume `access`: la puerta pregunta si el
 //     socio trae un pase pagado de hoy. El pase es su cargo, así que vive aquí.
 export { DayPassRepository, type DayPassRecord } from './day-pass.repository.js';
+// Consumida por: `access` (la puerta reconoce el pase de prueba de hoy; bloque 3.3, D-08).
+export { TrialPassRepository, type TrialPassRecord } from './day-pass-prueba.repository.js';
 export type { ChargeRecord } from './charge.repository.js';

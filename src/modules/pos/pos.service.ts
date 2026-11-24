@@ -1,17 +1,18 @@
 import {
   affectsDrawer, canVoidSale, conflict, money, notFound, priceSale, validation,
-  inventoryRequiresReason, inventorySignIsValid,
+  inventoryRequiresReason, inventorySignIsValid, precioDeTienda, MEMBER_PRICE_STATUSES,
   type InventoryMovementType, type PaymentMethodType, type SaleLineInput,
 } from '@gymflow/core';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 import { CashService, CashSessionRepository } from '../cash/index.js';
 import { MemberRepository } from '../members/index.js';
+import { MembershipRepository } from '../memberships/index.js';
 import { enUnidadDeDinero } from '../../platform/db/unit-of-work.js';
 import { InventoryRepository } from './inventory.repository.js';
 import { ProductRepository, type ProductRecord } from './product.repository.js';
 import { isUniqueViolation } from '../../platform/db/prisma-errors.js';
-import { PosSaleRepository, type PosSaleLineRecord, type PosSaleRecord } from './pos-sale.repository.js';
+import { PosSaleRepository, type DatosDeLinea, type PosSaleLineRecord, type PosSaleRecord } from './pos-sale.repository.js';
 import type { RequestContext } from '../../platform/context.js';
 
 export type SaleDetail = {
@@ -27,18 +28,53 @@ export class PosService {
 
   async createProduct(ctx: RequestContext, input: {
     sku: string; name: string; priceCents: bigint; tracksInventory?: boolean;
+    memberPriceCents?: bigint | null; costCents?: bigint | null;
   }): Promise<ProductRecord> {
     const orgId = ctx.tenant.organizationId;
     if (input.priceCents < 0n) throw validation('El precio no puede ser negativo');
+    exigirPreciosCoherentes(input.priceCents, input.memberPriceCents ?? null);
 
     const product = await new ProductRepository(orgId).create(input);
     await this.audit.record(ctx, {
       action: 'pos.product.create',
       resourceType: 'product',
       resourceId: product.id,
-      afterState: { sku: product.sku, priceCents: product.priceCents.toString() },
+      afterState: estadoDeProducto(product),
     });
     return product;
+  }
+
+  /**
+   * Cambia un producto: nombre, vigencia, precio de público, precio de socio
+   * y costo (D-21; los dos últimos opcionales, `null` los quita). Queda con el
+   * antes y el después: es lo primero que se pregunta cuando el corte de
+   * productos no cuadra. Lo ya vendido no cambia: cada línea guardó su precio
+   * y su costo de ese día.
+   */
+  async updateProduct(ctx: RequestContext, id: string, patch: {
+    name?: string; priceCents?: bigint; isActive?: boolean; memberPriceCents?: bigint | null; costCents?: bigint | null;
+  }): Promise<ProductRecord> {
+    const repo = new ProductRepository(ctx.tenant.organizationId);
+    const antes = await repo.findById(id);
+    if (!antes) throw notFound('Producto no encontrado');
+    exigirPreciosCoherentes(patch.priceCents ?? antes.priceCents, patch.memberPriceCents !== undefined ? patch.memberPriceCents : antes.memberPriceCents);
+    const despues = await repo.update(id, patch);
+    if (!despues) throw notFound('Producto no encontrado');
+    await this.audit.record(ctx, {
+      action: 'pos.product.update', resourceType: 'product', resourceId: id,
+      beforeState: estadoDeProducto(antes), afterState: estadoDeProducto(despues),
+    });
+    return despues;
+  }
+
+  /**
+   * ¿A este socio le toca hoy el precio de socio? (D-21: socios con membresía
+   * vigente; `MEMBER_PRICE_STATUSES` del núcleo). Lo usa la venta y lo
+   * consulta la pantalla para mostrar el mismo total que se va a cobrar.
+   */
+  async precioDeSocioAplica(organizationId: string, memberId: string): Promise<boolean> {
+    const viva = await new MembershipRepository(organizationId).findLiveForMember(memberId);
+    return !!viva && MEMBER_PRICE_STATUSES.includes(viva.status);
   }
 
   // ── Venta ─────────────────────────────────────────────────────────────────
@@ -84,18 +120,25 @@ export class PosService {
       if (!p.isActive) throw validation(`El producto ${p.sku} no está activo`);
     }
 
+    let esSocioVigente = false;
     if (input.memberId) {
       const member = await new MemberRepository(orgId).findById(input.memberId);
       if (!member) throw notFound('Socio no encontrado');
+      esSocioVigente = await this.precioDeSocioAplica(orgId, input.memberId);
     }
 
     // El precio se toma del CATÁLOGO, nunca del cliente: aceptarlo del body
-    // permitiría vender a cualquier precio desde una petición manipulada.
-    const { lines, total } = priceSale(input.lines.map((l) => ({
-      productId: l.productId,
-      quantity: l.quantity,
-      unitPrice: money(porId.get(l.productId)!.priceCents),
-    })));
+    // permitiría vender a cualquier precio desde una petición manipulada. El de
+    // socio (D-21) lo decide aquí el servidor: producto que lo tiene y venta
+    // ligada a un socio con membresía vigente. Cada línea guarda a qué precio
+    // salió y lo que costaba el producto hoy (para la ganancia del Tablero).
+    const lineData = new Map<string, DatosDeLinea>();
+    const { lines, total } = priceSale(input.lines.map((l) => {
+      const p = porId.get(l.productId)!;
+      const precio = precioDeTienda(p, esSocioVigente);
+      lineData.set(l.productId, { priceKind: precio.kind, unitCostCents: p.costCents });
+      return { productId: l.productId, quantity: l.quantity, unitPrice: money(precio.unitPriceCents) };
+    }));
 
     // Turno, folio, venta, existencias y asiento en UNA unidad de dinero (1.3):
     // toma primero el candado de la organización, como el cobro, y así una
@@ -130,6 +173,7 @@ export class PosService {
           soldByUserId: userId,
           businessDate,
           lines,
+          lineData,
           // Venta y descuento de existencias van en la MISMA transacción: si el
           // stock no alcanza, no queda una venta a medias contando producto que
           // nunca salió del estante.
@@ -144,6 +188,7 @@ export class PosService {
             method: input.method,
             folio,
             lines: lines.length,
+            ...(esSocioVigente && [...lineData.values()].some((d) => d.priceKind === 'MEMBER') ? { memberPrice: true } : {}),
           },
           branchId: input.branchId,
         });
@@ -268,6 +313,21 @@ export class PosService {
     const [stock] = await inventory.stockFor(input.branchId, [input.productId]);
     return { movementId: movimiento.id, quantityOnHand: stock?.quantityOnHand ?? 0 };
   }
+}
+
+/** El precio de socio es un precio MENOR o igual al de público: uno mayor sería un error de captura. */
+function exigirPreciosCoherentes(priceCents: bigint, memberPriceCents: bigint | null): void {
+  if (memberPriceCents !== null && memberPriceCents > priceCents) {
+    throw validation('El precio de socio no puede ser mayor que el precio de público');
+  }
+}
+
+/** Lo que la bitácora guarda de un producto. */
+function estadoDeProducto(p: ProductRecord) {
+  return {
+    sku: p.sku, name: p.name, priceCents: p.priceCents.toString(), isActive: p.isActive,
+    memberPriceCents: p.memberPriceCents?.toString() ?? null, costCents: p.costCents?.toString() ?? null,
+  };
 }
 
 /** La misma clave debe ser la misma venta: misma sede, método y socio (BE2-09). */

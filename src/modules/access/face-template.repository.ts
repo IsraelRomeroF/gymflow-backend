@@ -62,6 +62,26 @@ export class FaceTemplateRepository extends TenantRepository {
   }
 
   /**
+   * ROSTROS EN ESPERA (D-32; bloque 3.9): plantillas de enrolamientos sin
+   * revocar cuyo socio está dado de baja y sin anonimizar. No se reconocen
+   * (el padrón los deja fuera) pero siguen guardadas por si regresa: si lo
+   * reactivan, vuelve a reconocerse sin registrarlo otra vez; si no, el
+   * cierre diario las borra a los 30 días de la baja. `bajaEl` es el instante
+   * de la baja y `sedeDelSocio` la sede con cuyo calendario se cuentan los días.
+   */
+  async deExsocios(): Promise<Array<{ enrollmentId: string; memberId: string; branchId: string; bajaEl: Date; sedeDelSocio: string | null }>> {
+    const filas = await this.db.faceTemplate.findMany({
+      where: this.scope({ enrollment: { revokedAt: null, member: { deletedAt: { not: null }, anonymizedAt: null } } }),
+      select: { enrollmentId: true, memberId: true, branchId: true, enrollment: { select: { member: { select: { deletedAt: true, homeBranchId: true } } } } },
+      orderBy: { createdAt: 'asc' },
+    });
+    return filas.map((f) => ({
+      enrollmentId: f.enrollmentId, memberId: f.memberId, branchId: f.branchId,
+      bajaEl: f.enrollment.member.deletedAt!, sedeDelSocio: f.enrollment.member.homeBranchId,
+    }));
+  }
+
+  /**
    * Plantillas que quedaron sin razón de existir: de socios anonimizados
    * (antes de A1-N1 anonimizar solo revocaba), de enrolamientos ya revocados
    * y, si se pide `bajasAntesDe`, de socios dados de baja antes de esa fecha

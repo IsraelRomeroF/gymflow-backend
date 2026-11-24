@@ -1,24 +1,33 @@
 import {
-  APPROVAL_HISTORY_WINDOW_MS, APPROVAL_REQUEST_TTL_MS, DomainError, canApprove, conflict, forbidden, formatMoney, isAllowed, money, notFound, validation,
+  APPROVAL_HISTORY_WINDOW_MS, APPROVAL_REASK_LIMIT, APPROVAL_REQUEST_TTL_MS, DomainError, canApprove, conflict, forbidden, formatMoney, isAllowed, money, notFound, validation,
   type ApprovalDelivery, type PermissionKey,
 } from '@gymflow/core';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { systemContext } from '../../platform/jobs/types.js';
 import { enUnaTransaccion } from '../../platform/db/unit-of-work.js';
+import { DemasiadosIntentos } from '../../platform/http/rate-limit.js';
 import { cifrarSensible, descifrarSensible } from '../../platform/sensitive.js';
 import type { RequestContext } from '../../platform/context.js';
 import { ApprovalService, type Operacion } from './approval.service.js';
 import { AuthUserRepository, PushService, UserRepository, type AuthService } from '../identity/index.js';
-import { ApprovalGrantRepository, ApprovalReachRepository, ApprovalRequestRepository, type Solicitud } from './approval.repository.js';
+import { ApprovalGrantRepository, ApprovalReachRepository, ApprovalRequestRepository, type RechazoPrevio, type Solicitud } from './approval.repository.js';
 
 export type { Solicitud };
+
+/** El «no» anterior de la misma operación, con el nombre de quien lo dio (D-03). */
+export type RechazoAnterior = { requestId: string; at: Date; byUserId: string | null; byName: string | null; reason: string | null };
+/** La pregunta de quien firma y lo que se le contestó (D-03). */
+export type Pregunta = { text: string; at: Date; byUserId: string | null; byName: string | null; answer: string | null; answeredAt: Date | null };
+/** Lo que D-03 le agrega a una solicitud al mostrarla. */
+export type ConHistoria = { previousRejection: RechazoAnterior | null; question: Pregunta | null; attempt: number };
+export type SolicitudConHistoria = Omit<Solicitud, 'question'> & ConHistoria;
 
 /**
  * Lo que ve quien pidió la firma. `delivery` y `secondsLeft` los calcula el
  * servidor: la firma se entrega mientras no se use (29-03) y la cuenta
  * regresiva no depende del reloj de la PC del mostrador (29-06).
  */
-export type EstadoDeSolicitud = Solicitud & {
+export type EstadoDeSolicitud = SolicitudConHistoria & {
   approvalToken: string | null;
   approverName: string | null;
   /** Solo en una aprobada: su firma sigue lista, ya se usó o venció sin usarse. */
@@ -28,7 +37,7 @@ export type EstadoDeSolicitud = Solicitud & {
 };
 
 /** Una solicitud ya resuelta, como se lee en «Resueltas hoy» (20-05). */
-export type SolicitudResuelta = Solicitud & {
+export type SolicitudResuelta = SolicitudConHistoria & {
   requesterName: string | null; approverName: string | null; context: string | null;
   mine: boolean; resolvedAt: Date; delivery: ApprovalDelivery | null;
 };
@@ -55,7 +64,13 @@ export class RemoteApprovalService {
   private readonly audit = new AuditService();
   private readonly users = new AuthUserRepository();
 
-  async request(ctx: RequestContext, input: Operacion & { permission: PermissionKey; summary: string; reason?: string | undefined }): Promise<Solicitud> {
+  /**
+   * Pedir la firma. D-03: si esa operación ya se rechazó en las últimas 24
+   * horas, quien pide tiene que contestar ese «no» (`reply`) y la solicitud
+   * queda ligada a él; y la misma operación no se pide más de 3 veces en una
+   * hora (la 4.ª es un 429 que dice a qué hora se puede otra vez).
+   */
+  async request(ctx: RequestContext, input: Operacion & { permission: PermissionKey; summary: string; reason?: string | undefined; reply?: string | undefined }): Promise<SolicitudConHistoria> {
     const actor = ctx.tenant.actorUserId;
     if (!actor) throw new DomainError('UNAUTHENTICATED', 'Sesión requerida');
     const orgId = ctx.tenant.organizationId;
@@ -69,7 +84,25 @@ export class RemoteApprovalService {
     const { approvers } = await this.firmas.whoCanApprove(ctx, input.permission, op);
     if (approvers.length === 0) throw conflict('Nadie más puede autorizar esta operación');
 
+    const operacion = await this.firmas.estadoDeLaOperacion(orgId, input.permission, op.resourceId!);
+    if (operacion.proximaSolicitud) {
+      const quienes = approvers.map((a) => a.fullName).join(' o ');
+      throw new DemasiadosIntentos(
+        (operacion.proximaSolicitud.getTime() - Date.now()) / 1000,
+        `Ya se pidió ${APPROVAL_REASK_LIMIT.max} veces en una hora: habla con ${quienes}. Se puede volver a pedir a las ${await this.firmas.horaLocal(orgId, op.branchId, operacion.proximaSolicitud)}.`,
+      );
+    }
+    const rechazo = operacion.rechazo;
+    const reply = input.reply?.trim() || null;
+    if (rechazo && !reply) {
+      throw new DomainError('CONFLICT',
+        `${rechazo.approverName ?? 'Quien autoriza'} ya la rechazó a las ${await this.firmas.horaLocal(orgId, op.branchId, rechazo.decidedAt)}: para volver a pedirla, escríbele una respuesta`,
+        rechazo.rejectReason ? `Su motivo: «${rechazo.rejectReason}»` : undefined, 'APPROVAL_REPLY_REQUIRED');
+    }
+
     const s = await solicitudes.create({
+      // La respuesta solo existe frente a un «no»: sin él, no se guarda.
+      previousRequestId: rechazo?.id ?? null, reply: rechazo ? reply : null,
       requestedByUserId: actor, permission: input.permission,
       branchId: op.branchId ?? null, resourceType: op.resourceType ?? null, resourceId: op.resourceId ?? null,
       amountCents: op.amountCents ?? null, summary: input.summary, reason: input.reason ?? null,
@@ -83,18 +116,25 @@ export class RemoteApprovalService {
         permission: s.permission, summary: s.summary, amountCents: importe(s), resourceType: s.resourceType, resourceId: s.resourceId,
         // Aviso en la bitácora: el panel no dijo de qué se trataba y el servidor lo dedujo (29-01, fase 0).
         ...(op.resourceTypeInferred ? { resourceTypeInferred: true } : {}),
+        // Se vuelve a pedir lo rechazado (D-03): a qué «no» responde, qué se contestó y qué vez es en la hora.
+        ...(rechazo ? { previousRequestId: rechazo.id, reply: s.reply } : {}),
+        attempt: operacion.pedidas + 1,
       },
     });
+    const yaRechazada = rechazo ? `Ya la rechazaste a las ${await this.firmas.horaLocal(orgId, op.branchId, rechazo.decidedAt)}. Te responden: «${s.reply}». ` : '';
     // Al teléfono de quien puede firmar (DP-10). Si no llega, la solicitud sigue viva en la bandeja.
     // A cuántos teléfonos salió se anota en la solicitud (29-05): el mostrador
     // lee «le llegó el aviso» solo si de verdad salió. No se espera: pedir no
     // tarda lo que tarde el proveedor de avisos.
     void new PushService().sendToUsers(orgId, approvers.map((a) => a.userId), {
-      title: 'Autorización pendiente',
-      body: `${input.summary}${s.amountCents ? ` · ${formatMoney(money(s.amountCents))}` : ''}. Vence en ${minutos(APPROVAL_REQUEST_TTL_MS)} minutos.`,
+      title: rechazo ? 'Te vuelven a pedir lo que rechazaste' : 'Autorización pendiente',
+      body: `${yaRechazada}${input.summary}${s.amountCents ? ` · ${formatMoney(money(s.amountCents))}` : ''}. Vence en ${minutos(APPROVAL_REQUEST_TTL_MS)} minutos.`,
       url: '/autorizaciones', tag: `approval-${s.id}`,
     }).then((n) => new ApprovalRequestRepository(orgId).markNotified(s.id, n)).catch(() => undefined);
-    return s;
+    return {
+      ...s, question: null, attempt: operacion.pedidas + 1,
+      previousRejection: rechazo ? { requestId: rechazo.id, at: rechazo.decidedAt, byUserId: rechazo.approverUserId, byName: rechazo.approverName, reason: rechazo.rejectReason } : null,
+    };
   }
 
   /**
@@ -110,7 +150,8 @@ export class RemoteApprovalService {
     const { approvalToken, delivery } = s.status === 'APPROVED' ? await this.entrega(orgId, s) : { approvalToken: null, delivery: null };
     const approverName = s.approverUserId ? (await this.users.findById(s.approverUserId))?.fullName ?? null : null;
     const secondsLeft = s.status === 'PENDING' ? Math.max(0, Math.ceil((s.expiresAt.getTime() - Date.now()) / 1000)) : 0;
-    return { ...s, approvalToken, approverName, delivery, secondsLeft };
+    const [conHistoria] = await this.conHistoria(orgId, [s]);
+    return { ...conHistoria!, approvalToken, approverName, delivery, secondsLeft };
   }
 
   async cancel(ctx: RequestContext, id: string): Promise<void> {
@@ -130,7 +171,7 @@ export class RemoteApprovalService {
    * `vistas`: la pantalla las está mostrando; se anota la primera vez (29-05).
    * El contador del marco consulta la misma bandeja sin mostrarlas y no cuenta.
    */
-  async inbox(ctx: RequestContext, opts: { vistas?: boolean } = {}): Promise<Array<Solicitud & { requesterName: string | null; context: string | null }>> {
+  async inbox(ctx: RequestContext, opts: { vistas?: boolean } = {}): Promise<Array<SolicitudConHistoria & { requesterName: string | null; context: string | null }>> {
     const orgId = ctx.tenant.organizationId;
     const yo = ctx.tenant.actorUserId!;
     // La bandeja se consulta seguido: aquí se cierran y se asientan las que
@@ -143,14 +184,15 @@ export class RemoteApprovalService {
     const mias = pendientes.filter((s) => isAllowed(canApprove(ctx.tenant, s.permission as PermissionKey, {
       organizationId: orgId, branchId: s.branchId ?? undefined, ...(s.amountCents !== null && s.permission !== 'billing:discount:apply' ? { amountCents: s.amountCents } : {}),
     })));
-    const [nombres, contexto] = await Promise.all([
+    const [nombres, contexto, historia] = await Promise.all([
       new UserRepository(orgId).namesById(mias.map((s) => s.requestedByUserId)),
       solicitudes.context(mias),
+      this.conHistoria(orgId, mias),
     ]);
     const ahora = new Date();
     const nuevas = opts.vistas ? mias.filter((s) => !s.seenAt).map((s) => s.id) : [];
     await solicitudes.markSeen(nuevas, ahora);
-    return mias.map((s) => ({
+    return historia.map((s) => ({
       ...s, seenAt: s.seenAt ?? (nuevas.includes(s.id) ? ahora : null),
       requesterName: nombres.get(s.requestedByUserId) ?? null, context: contexto.get(s.id) ?? null,
     }));
@@ -174,13 +216,15 @@ export class RemoteApprovalService {
     const visibles = todas.filter((s) => s.requestedByUserId === yo || isAllowed(canApprove(ctx.tenant, s.permission as PermissionKey, {
       organizationId: orgId, branchId: s.branchId ?? undefined, ...(s.amountCents !== null && s.permission !== 'billing:discount:apply' ? { amountCents: s.amountCents } : {}),
     })));
-    const [nombres, contexto, firmas] = await Promise.all([
+    const [nombres, contexto, historia, firmas] = await Promise.all([
       new UserRepository(orgId).namesById(visibles.flatMap((s) => [s.requestedByUserId, ...(s.approverUserId ? [s.approverUserId] : [])])),
       solicitudes.context(visibles),
+      // En «Resueltas hoy» no se dice «2.ª vez»: basta el «no» al que respondía y lo que se preguntó.
+      this.conHistoria(orgId, visibles, { sinIntento: true }),
       new ApprovalReachRepository(orgId).grantStates(visibles.flatMap((s) => (s.status === 'APPROVED' && s.grantId ? [s.grantId] : []))),
     ]);
     const ahora = new Date();
-    const entrega = (s: Solicitud): ApprovalDelivery | null => {
+    const entrega = (s: Pick<Solicitud, 'status' | 'grantId'>): ApprovalDelivery | null => {
       if (s.status !== 'APPROVED' || !s.grantId) return null;
       const f = firmas.get(s.grantId);
       if (!f) return null;
@@ -189,7 +233,7 @@ export class RemoteApprovalService {
     return {
       scope: firma ? 'all' : 'mine',
       windowHours: Math.round(APPROVAL_HISTORY_WINDOW_MS / 3_600_000),
-      requests: visibles.map((s) => ({
+      requests: historia.map((s) => ({
         ...s, mine: s.requestedByUserId === yo, resolvedAt: s.decidedAt ?? s.expiresAt, delivery: entrega(s),
         requesterName: nombres.get(s.requestedByUserId) ?? null,
         approverName: s.approverUserId ? nombres.get(s.approverUserId) ?? null : null,
@@ -257,6 +301,85 @@ export class RemoteApprovalService {
     await this.audit.record(ctx, {
       action: 'approval.remote.reject', resourceType: 'ApprovalRequest', resourceId: id, branchId: s.branchId, reason,
       afterState: { permission: s.permission, summary: s.summary, amountCents: importe(s), resourceType: s.resourceType, resourceId: s.resourceId },
+    });
+  }
+
+  /**
+   * «PREGUNTAR» EN VEZ DE RECHAZAR (D-03). Antes, para pedir un dato («¿de qué
+   * socio?») había que decir que no y obligar a empezar de nuevo. Quien puede
+   * firmarla pregunta; la solicitud sigue pendiente, con su reloj otra vez
+   * completo, y quien la pidió contesta en una línea. Una pregunta a la vez.
+   */
+  async ask(ctx: RequestContext, id: string, question: string): Promise<void> {
+    const orgId = ctx.tenant.organizationId;
+    const yo = ctx.tenant.actorUserId!;
+    const s = await this.find(orgId, id);
+    if (s.requestedByUserId === yo) throw forbidden('La pregunta la hace quien autoriza');
+    if (!(await this.firmas.puedeFirmar(orgId, yo, s.permission as PermissionKey, opDe(s)))) throw notFound('Solicitud no encontrada');
+    if (s.status !== 'PENDING') throw conflict('La solicitud ya no está pendiente');
+    if (s.question && !s.answer) throw conflict('Ya hay una pregunta esperando respuesta');
+    const hecho = await new ApprovalRequestRepository(orgId).ask(id, { question, byUserId: yo, expiresAt: new Date(Date.now() + APPROVAL_REQUEST_TTL_MS) });
+    if (!hecho) throw conflict('La solicitud ya no está pendiente');
+    await this.audit.record(ctx, {
+      action: 'approval.remote.ask', resourceType: 'ApprovalRequest', resourceId: id, branchId: s.branchId,
+      afterState: { permission: s.permission, summary: s.summary, amountCents: importe(s), resourceType: s.resourceType, resourceId: s.resourceId, question },
+    });
+    // A quien la pidió, por si dejó la pantalla: el diálogo y la franja también lo dicen.
+    void new PushService().sendToUsers(orgId, [s.requestedByUserId], {
+      title: 'Te preguntan antes de autorizar', body: `${s.summary}: «${question}»`, url: '/autorizaciones', tag: `approval-${s.id}`,
+    }).catch(() => undefined);
+  }
+
+  /** Quien pidió contesta la pregunta de quien firma (D-03). */
+  async answer(ctx: RequestContext, id: string, answer: string): Promise<void> {
+    const orgId = ctx.tenant.organizationId;
+    const s = await this.find(orgId, id);
+    if (s.requestedByUserId !== ctx.tenant.actorUserId) throw notFound('Solicitud no encontrada');
+    if (s.status !== 'PENDING') throw conflict('La solicitud ya no está pendiente');
+    if (!s.question || s.answer) throw conflict('No hay ninguna pregunta por contestar');
+    const hecho = await new ApprovalRequestRepository(orgId).answer(id, { answer, expiresAt: new Date(Date.now() + APPROVAL_REQUEST_TTL_MS) });
+    if (!hecho) throw conflict('La solicitud ya no está pendiente');
+    await this.audit.record(ctx, {
+      action: 'approval.remote.answer', resourceType: 'ApprovalRequest', resourceId: id, branchId: s.branchId,
+      afterState: { permission: s.permission, summary: s.summary, amountCents: importe(s), resourceType: s.resourceType, resourceId: s.resourceId, question: s.question, answer },
+    });
+    if (s.questionByUserId) {
+      void new PushService().sendToUsers(orgId, [s.questionByUserId], {
+        title: 'Te contestaron', body: `${s.summary}: «${answer}»`, url: '/autorizaciones', tag: `approval-${s.id}`,
+      }).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Lo que D-03 agrega al mostrar una solicitud: el «no» al que responde (con
+   * el nombre de quien lo dio), la pregunta con su contestación y qué vez es
+   * en la última hora.
+   */
+  private async conHistoria(orgId: string, sols: readonly Solicitud[], opts: { sinIntento?: boolean } = {}): Promise<SolicitudConHistoria[]> {
+    if (sols.length === 0) return [];
+    const solicitudes = new ApprovalRequestRepository(orgId);
+    const rechazos = await solicitudes.rejectionsById(sols.flatMap((s) => (s.previousRequestId ? [s.previousRequestId] : [])));
+    const [nombres, intentos] = await Promise.all([
+      new UserRepository(orgId).namesById([
+        ...[...rechazos.values()].flatMap((r: RechazoPrevio) => (r.approverUserId ? [r.approverUserId] : [])),
+        ...sols.flatMap((s) => (s.questionByUserId ? [s.questionByUserId] : [])),
+      ]),
+      Promise.all(sols.map(async (s) => {
+        if (opts.sinIntento || !s.resourceId) return 1;
+        const { n } = await solicitudes.requestedSince(s.permission, s.resourceId, new Date(s.createdAt.getTime() - APPROVAL_REASK_LIMIT.perMs), s.createdAt);
+        // Una ya autorizada no se cuenta a sí misma en esa consulta.
+        return Math.max(1, s.status === 'APPROVED' ? n + 1 : n);
+      })),
+    ]);
+    return sols.map((s, i) => {
+      const r = s.previousRequestId ? rechazos.get(s.previousRequestId) : undefined;
+      return {
+        ...s, attempt: intentos[i]!,
+        previousRejection: r ? { requestId: r.id, at: r.decidedAt, byUserId: r.approverUserId, byName: r.approverUserId ? nombres.get(r.approverUserId) ?? null : null, reason: r.rejectReason } : null,
+        question: s.question && s.questionAt
+          ? { text: s.question, at: s.questionAt, byUserId: s.questionByUserId, byName: s.questionByUserId ? nombres.get(s.questionByUserId) ?? null : null, answer: s.answer, answeredAt: s.answeredAt }
+          : null,
+      };
     });
   }
 

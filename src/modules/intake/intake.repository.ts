@@ -14,6 +14,8 @@ export const datosBorrados = (r: { firstName: string }): boolean => r.firstName 
 const DATOS_BORRADOS = {
   firstName: ELIMINADO, lastName: ELIMINADO, nameKey: '', phoneE164: null, email: null, birthDate: null,
   emergencyContactName: null, emergencyContactPhone: null, healthNotes: null, ip: null, userAgent: null,
+  // El tutor de un menor también es una persona con nombre y celular (bloque 3.4).
+  guardianName: null, guardianPhoneE164: null,
   // Lo corregido por recepción también son datos personales.
   corrections: Prisma.DbNull, correctedAt: null, correctedByUserId: null,
 };
@@ -38,6 +40,9 @@ export type IntakeRecord = {
   emergencyContactPhone: string | null;
   memberSince: Date | null;
   healthNotes: string | null;
+  /** Papá, mamá o tutor que escribió quien tiene de 15 a 17 años (D-10). */
+  guardianName: string | null;
+  guardianPhoneE164: string | null;
   acceptedConsents: AcceptedConsentRow[];
   ip: string | null;
   userAgent: string | null;
@@ -62,6 +67,7 @@ export type DatosDelBorrador = {
   phoneE164: string | null; email: string | null; birthDate: Date | null;
   emergencyContactName: string | null; emergencyContactPhone: string | null;
   memberSince: Date | null; healthNotes: string | null;
+  guardianName: string | null; guardianPhoneE164: string | null;
   acceptedConsents: readonly AcceptedConsentRow[];
   ip: string | null; userAgent: string | null;
 };
@@ -70,7 +76,7 @@ const SELECT = {
   id: true, branchId: true, status: true, firstName: true, lastName: true,
   phoneE164: true, email: true, birthDate: true,
   emergencyContactName: true, emergencyContactPhone: true,
-  memberSince: true, healthNotes: true, acceptedConsents: true,
+  memberSince: true, healthNotes: true, acceptedConsents: true, guardianName: true, guardianPhoneE164: true,
   ip: true, userAgent: true, submittedAt: true, memberId: true, rejectionReason: true,
   reviewedAt: true, reviewedByUserId: true,
   corrections: true, correctedAt: true, correctedByUserId: true,
@@ -101,6 +107,8 @@ export class IntakeRepository extends TenantRepository {
         emergencyContactPhone: input.emergencyContactPhone,
         memberSince: input.memberSince,
         healthNotes: cifrarSensible(input.healthNotes),
+        guardianName: input.guardianName,
+        guardianPhoneE164: input.guardianPhoneE164,
         acceptedConsents: input.acceptedConsents as Prisma.InputJsonValue,
         ip: input.ip,
         userAgent: input.userAgent,
@@ -143,6 +151,7 @@ export class IntakeRepository extends TenantRepository {
         phoneE164: input.phoneE164, email: input.email, birthDate: input.birthDate,
         emergencyContactName: input.emergencyContactName, emergencyContactPhone: input.emergencyContactPhone,
         memberSince: input.memberSince, healthNotes: cifrarSensible(input.healthNotes),
+        guardianName: input.guardianName, guardianPhoneE164: input.guardianPhoneE164,
         acceptedConsents: input.acceptedConsents as Prisma.InputJsonValue,
         ip: input.ip, userAgent: input.userAgent, submittedAt: new Date(),
         corrections: Prisma.DbNull, correctedAt: null, correctedByUserId: null,

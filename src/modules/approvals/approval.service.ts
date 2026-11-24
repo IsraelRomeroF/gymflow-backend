@@ -1,6 +1,7 @@
 import { verify as argonVerify } from '@node-rs/argon2';
 import {
-  APPROVAL_GRANT_TTL_MS, APPROVAL_REQUEST_TTL_MS, APPROVAL_RESOURCE_OPTIONAL, DomainError, approvalFailureStep, approvalResourceTypesFor,
+  APPROVAL_GRANT_TTL_MS, APPROVAL_REASK_LIMIT, APPROVAL_REJECTION_MEMORY_MS, APPROVAL_REQUEST_TTL_MS, APPROVAL_RESOURCE_OPTIONAL, DomainError,
+  approvalFailureStep, approvalRejectLockUntil, approvalResourceTypesFor,
   canApprove, forbidden, isAllowed, isApprovalResourceType, monthOfMonthlyCloseResourceId, validation,
   type ApprovalFailureStep, type ApprovalReach, type ApprovalResourceType, type PermissionKey,
 } from '@gymflow/core';
@@ -8,7 +9,7 @@ import { AuditService } from '../../platform/audit/audit.service.js';
 import { systemContext } from '../../platform/jobs/types.js';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 import { AuthUserRepository, GrantRepository, PushService, UserRepository, type AuthService } from '../identity/index.js';
-import { ApprovalGrantRepository, ApprovalReachRepository, ApprovalRequestRepository, ApprovalSignerLockRepository } from './approval.repository.js';
+import { ApprovalGrantRepository, ApprovalReachRepository, ApprovalRequestRepository, ApprovalSignerLockRepository, type RechazoPrevio } from './approval.repository.js';
 import { generateOpaqueToken, hashToken } from '../../platform/crypto.js';
 import type { RequestContext } from '../../platform/context.js';
 
@@ -34,6 +35,20 @@ type CausaDeFallo = 'CONTRASENA' | 'EN_PAUSA' | 'DESCONOCIDO' | 'MISMA_PERSONA' 
 export type FalloDeFirma = { causa: 'CONTRASENA' | 'EN_PAUSA'; failedCount?: number; step?: ApprovalFailureStep; pausedUntil?: Date | null };
 
 type Firmante = { id: string; fullName: string; passwordHash: string };
+
+/**
+ * CÓMO ESTÁ UNA OPERACIÓN (D-03): el «no» que sigue vigente, hasta cuándo no
+ * se firma en el mostrador y cuántas veces se pidió en la última hora.
+ */
+export type EstadoDeOperacion = {
+  rechazo: (RechazoPrevio & { approverName: string | null }) | null;
+  /** Tras un «no»: hasta cuándo solo se firma desde la sesión de quien firma. */
+  bloqueoLocalHasta: Date | null;
+  pedidas: number;
+  tope: number;
+  /** Con el tope alcanzado: cuándo se puede volver a pedir. */
+  proximaSolicitud: Date | null;
+};
 
 /** El registro del asiento: el de la operación si se conoce; si no, la firma misma. */
 const recursoDelAsiento = (op: OperacionRevisada, grantId?: string) => (op.resourceType
@@ -75,6 +90,10 @@ export class ApprovalService {
     const orgId = ctx.tenant.organizationId;
     const op = await this.revisarOperacion(orgId, input.permission, input, { exigirTipo: false });
     if (!input.email && !input.approverUserId) throw validation('Falta decir quién autoriza');
+    // D-03: lo que se rechazó hace menos de 30 minutos no se firma en el
+    // mostrador, ni con la contraseña correcta: solo quien firma, desde su
+    // sesión. Va antes de comparar la contraseña: aquí no se prueba ninguna.
+    await this.negarSiSeRechazoHacePoco(ctx, input.permission, op, input.email ? input.email.trim().toLowerCase().slice(0, 200) : `elegido:${input.approverUserId}`);
     // En el asiento del fallo: el correo tecleado o, si se eligió por nombre, a quién se eligió.
     const correo = input.email ? input.email.trim().toLowerCase().slice(0, 200) : `elegido:${input.approverUserId}`;
     const fallo = (causa: CausaDeFallo, firmante: string | null, extra: Omit<FalloDeFirma, 'causa'> = {}) =>
@@ -198,6 +217,50 @@ export class ApprovalService {
     return { branchId: op.branchId, resourceId: op.resourceId, amountCents: op.amountCents, resourceType: tipo, resourceTypeInferred: deducido };
   }
 
+  /**
+   * El estado de una operación para D-03. El «no» deja de estar vigente si
+   * después alguien la autorizó (a distancia o, pasados los 30 minutos, en el
+   * mostrador): un «sí» posterior manda.
+   */
+  async estadoDeLaOperacion(orgId: string, permission: string, resourceId: string, ahora = new Date()): Promise<EstadoDeOperacion> {
+    const solicitudes = new ApprovalRequestRepository(orgId);
+    const [previo, pedidas] = await Promise.all([
+      solicitudes.lastRejection(permission, resourceId, new Date(ahora.getTime() - APPROVAL_REJECTION_MEMORY_MS)),
+      solicitudes.requestedSince(permission, resourceId, new Date(ahora.getTime() - APPROVAL_REASK_LIMIT.perMs)),
+    ]);
+    const vigente = previo && !(await new ApprovalGrantRepository(orgId).signedSince(permission, resourceId, previo.decidedAt)) ? previo : null;
+    const rechazo = vigente
+      ? { ...vigente, approverName: vigente.approverUserId ? (await this.users.findById(vigente.approverUserId))?.fullName ?? null : null }
+      : null;
+    return {
+      rechazo,
+      bloqueoLocalHasta: rechazo ? approvalRejectLockUntil(rechazo.decidedAt, ahora) : null,
+      pedidas: pedidas.n, tope: APPROVAL_REASK_LIMIT.max,
+      proximaSolicitud: pedidas.n >= APPROVAL_REASK_LIMIT.max && pedidas.primera ? new Date(pedidas.primera.getTime() + APPROVAL_REASK_LIMIT.perMs) : null,
+    };
+  }
+
+  /** D-03: el intento de firmar en el mostrador lo recién rechazado se niega y queda en «Para revisar». */
+  private async negarSiSeRechazoHacePoco(ctx: RequestContext, permission: string, op: OperacionRevisada, correo: string): Promise<void> {
+    if (!op.resourceId) return;
+    const orgId = ctx.tenant.organizationId;
+    const { rechazo, bloqueoLocalHasta } = await this.estadoDeLaOperacion(orgId, permission, op.resourceId);
+    if (!rechazo || !bloqueoLocalHasta) return;
+    await this.audit.record(ctx, {
+      action: 'approval.local.after_reject', ...recursoDelAsiento(op), branchId: op.branchId ?? null,
+      afterState: {
+        permission, amountCents: op.amountCents?.toString() ?? null, resourceId: op.resourceId, email: correo,
+        rejectedRequestId: rechazo.id, rejectedAt: rechazo.decidedAt.toISOString(), rejectedByUserId: rechazo.approverUserId,
+        lockedUntil: bloqueoLocalHasta.toISOString(),
+      },
+    });
+    const quien = rechazo.approverName ?? 'Quien autoriza';
+    const minutos = Math.max(1, Math.round((Date.now() - rechazo.decidedAt.getTime()) / 60_000));
+    throw new DomainError('CONFLICT',
+      `${quien} la rechazó hace ${minutos} min: hasta las ${await this.horaLocal(orgId, op.branchId, bloqueoLocalHasta)} no se firma aquí, solo desde su teléfono`,
+      'Pídesela a su teléfono con tu respuesta a ese «no».', 'APPROVAL_REJECTED_RECENTLY');
+  }
+
   /** Emite la firma de un solo uso, atada a la operación y al importe. */
   async crearFirma(organizationId: string, approverUserId: string, requestedByUserId: string, permission: PermissionKey, op: Operacion): Promise<{ token: string; expiresAt: Date; grantId: string }> {
     const token = generateOpaqueToken();
@@ -267,6 +330,8 @@ export class ApprovalService {
   async whoCanApprove(ctx: RequestContext, permission: PermissionKey, op: Operacion): Promise<{
     approvers: Array<{ fullName: string; userId: string; pausedUntil: string | null; reach: ApprovalReach }>;
     requestTtlSeconds: number; grantTtlSeconds: number;
+    /** D-03: el «no» vigente y el tope de esta operación; null si no se dijo de qué registro se trata. */
+    operation: EstadoDeOperacion | null;
   }> {
     const orgId = ctx.tenant.organizationId;
     // Nadie se autoriza a sí mismo; firma quien tiene la segunda firma: el
@@ -278,14 +343,16 @@ export class ApprovalService {
     }
     const ids = out.map((a) => a.userId);
     // Cómo se va a enterar cada uno (29-05): aviso en su teléfono, panel abierto o ninguna de las dos.
-    const [pausas, alcance] = await Promise.all([
+    const [pausas, alcance, operation] = await Promise.all([
       new ApprovalSignerLockRepository(orgId).pausesFor(ids),
       new ApprovalReachRepository(orgId).reachOf(ids, new PushService().publicKey() !== null),
+      op.resourceId ? this.estadoDeLaOperacion(orgId, permission, op.resourceId) : Promise.resolve(null),
     ]);
     return {
       approvers: out.map((a) => ({ ...a, pausedUntil: pausas.get(a.userId)?.toISOString() ?? null, reach: alcance.get(a.userId) ?? 'none' })),
       requestTtlSeconds: APPROVAL_REQUEST_TTL_MS / 1000,
       grantTtlSeconds: APPROVAL_GRANT_TTL_MS / 1000,
+      operation,
     };
   }
 
@@ -383,7 +450,7 @@ export class ApprovalService {
   }
 
   /** La hora en la zona de la sede (o del gimnasio), como la lee el mostrador. */
-  private async horaLocal(orgId: string, branchId: string | null | undefined, d: Date): Promise<string> {
+  async horaLocal(orgId: string, branchId: string | null | undefined, d: Date): Promise<string> {
     const zona = await new BusinessCalendar(orgId).timezoneFor(branchId ?? null);
     return d.toLocaleTimeString('es-MX', { timeZone: zona, hour: '2-digit', minute: '2-digit', hour12: false });
   }

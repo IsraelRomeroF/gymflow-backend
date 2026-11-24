@@ -76,10 +76,15 @@ describe('personal a la medida y coach con sus socios', () => {
     const libera = await app.inject({ method: 'PUT', url: `/users/${gerente.json().user.id}/sections`, headers: { cookie: dueno }, payload: { sections: ['personal'], reason: 'Que contrate él' } });
     expect(libera.statusCode, libera.body).toBe(200);
     expect((await yo(dueno)).permissions).not.toContain('staff:manage');
-    expect((await yo(dueno)).permissions).not.toContain('expenses:manage');
+    // D-23 (fase 3, 3.7): los gastos, la nómina y sus retiros los sigue anotando AUNQUE haya gerente
+    // (antes dejaba de poder); lo que deja de poder con gerente es cerrar el mes sola.
+    expect((await yo(dueno)).permissions).toContain('expenses:manage');
+    expect((await yo(dueno)).permissions).not.toContain('reports:month:close');
     // Se va el gerente: lo vuelve a tener.
     await getDb().user.update({ where: { id: gerente.json().user.id }, data: { isActive: false } });
     expect((await yo(dueno)).permissions).toContain('staff:manage');
+    // Y sin gerente cierra el mes ella, con su contraseña (D-23).
+    expect((await yo(dueno)).permissions).toContain('reports:month:close');
   });
 
   it('permisos por persona: se encienden y apagan acciones de la lista, sobre el puesto', async () => {

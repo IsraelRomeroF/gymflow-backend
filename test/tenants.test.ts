@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { makeApp, loginAs, PASSWORD, correoUnico, loginPlataforma } from './helpers.js';
+import { cancelarCambiosAnunciados, ponerPrecios } from './precios-de-prueba.js';
 import { closeDb, getDb } from '../src/platform/db/client.js';
 
 /**
@@ -196,14 +197,9 @@ describe('alta de marcas desde la plataforma', () => {
     // Los precios no se inventan: sin ellos la plataforma no factura.
     const precios = (await app.inject({ method: 'GET', url: '/platform/prices', headers: { cookie: plataforma } })).json().prices;
     expect(precios.find((p: { key: string }) => p.key === 'core')).toBeTruthy();
-    for (const k of ['core', 'cash', 'classes']) {
-      await app.inject({ method: 'PUT', url: `/platform/prices/${k}`, headers: { cookie: plataforma }, payload: { monthlyCents: '0' } });
-    }
-    await app.inject({ method: 'PUT', url: '/platform/prices/training', headers: { cookie: plataforma }, payload: { monthlyCents: '0' } });
-    // Fijar: básico 1500, Caja 300, Clases 500 (de prueba, no tarifas reales).
-    for (const [k, c] of [['core', '150000'], ['cash', '30000'], ['classes', '50000']]) {
-      expect((await app.inject({ method: 'PUT', url: `/platform/prices/${k}`, headers: { cookie: plataforma }, payload: { monthlyCents: c } })).statusCode).toBe(200);
-    }
+    // Fijar: básico 1500, Caja 300, Clases 500 (de prueba, no tarifas reales). Directo en la base (bloque 3.11):
+    // desde D-38, cambiar por la API un precio que ya existe lo ANUNCIA con un mes de aviso, no lo cambia.
+    await ponerPrecios({ core: 150000n, cash: 30000n, classes: 50000n, training: 0n });
     const resumen = (await app.inject({ method: 'GET', url: `/platform/organizations/${orgId}/billing`, headers: { cookie: plataforma } })).json();
     expect(resumen.monthly.totalCents).toBe('230000');
     expect(resumen.monthly.lines.map((l: { key: string }) => l.key).sort()).toEqual(['cash', 'classes', 'core']);
@@ -224,12 +220,16 @@ describe('alta de marcas desde la plataforma', () => {
     expect(emitir.json().totalCents).toBe('230000');
     // Un mes, una factura.
     expect((await emitirEl()).statusCode).toBe(409);
-    // Cambiar el precio después no toca la factura emitida.
-    await app.inject({ method: 'PUT', url: '/platform/prices/classes', headers: { cookie: plataforma }, payload: { monthlyCents: '99900' } });
+    // Cambiar el precio después no toca la factura emitida, ni la mensualidad de hoy (D-38, bloque 3.11):
+    // el cambio queda ANUNCIADO y la marca conserva lo que tenía hasta la fecha avisada.
+    const anuncio = await app.inject({ method: 'PUT', url: '/platform/prices/classes', headers: { cookie: plataforma }, payload: { monthlyCents: '99900' } });
+    expect(anuncio.json()).toMatchObject({ changed: 0, scheduled: [{ moduleKey: 'classes', afterCents: '99900', status: 'PENDING' }] });
     const porVencer = (await app.inject({ method: 'GET', url: `/platform/organizations/${orgId}/billing`, headers: { cookie: plataforma } })).json();
     expect(porVencer.invoices.find((f: { id: string }) => f.id === emitir.json().id).totalCents).toBe('230000');
     expect(porVencer.status.code).toBe('POR_VENCER');
-    expect(porVencer.monthly.totalCents).toBe('279900');
+    expect(porVencer.monthly.totalCents).toBe('230000');
+    expect(porVencer.upcoming).toMatchObject({ effectiveFrom: anuncio.json().scheduled[0].effectiveFrom, totalCents: '279900' });
+    await cancelarCambiosAnunciados(['classes']);
     // La plataforma la ve entre las pendientes de todas las marcas.
     const pendientes = (await app.inject({ method: 'GET', url: '/platform/invoices', headers: { cookie: plataforma } })).json().invoices;
     expect(pendientes.some((f: { id: string }) => f.id === emitir.json().id)).toBe(true);
@@ -302,7 +302,7 @@ describe('alta de marcas desde la plataforma', () => {
     expect(modulo('pos')).toMatchObject({ contracted: false, inPlan: false });
 
     // La mensualidad: la línea del plan más el agregado a su precio (si lo tiene).
-    await app.inject({ method: 'PUT', url: '/platform/prices/prospects', headers: { cookie: plataforma }, payload: { monthlyCents: '25000' } });
+    await ponerPrecios({ prospects: 25000n });
     const cobro = (await app.inject({ method: 'GET', url: `/platform/organizations/${orgId}/billing`, headers: { cookie: plataforma } })).json();
     expect(cobro.monthly.lines.map((l: { name: string; monthlyCents: string }) => [l.name, l.monthlyCents])).toEqual([[`Plan Básico ${sufijo}`, '180000'], ['Prospectos', '25000']]);
     expect(cobro.monthly.totalCents).toBe('205000');

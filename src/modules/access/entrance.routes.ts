@@ -1,13 +1,33 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { notFound } from '@gymflow/core';
-import { AccessAttemptPreview, AccessAttemptResult, ManualEntryPolicy } from '@gymflow/core/contracts';
+import { AccessAttemptPreview, AccessAttemptResult, AccessGrantResult, AccessResolution, ManualEntryPolicy } from '@gymflow/core/contracts';
 import { route } from '../../platform/http/registry.js';
 import { sedeDeConsulta } from '../../platform/http/branch-scope.js';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 import { AccessRepository } from './access.repository.js';
-import { AccessService } from './access.service.js';
+import { AccessService, type FaceAuthorization } from './access.service.js';
 import { idParam, respuesta, resueltosDe, serializeDecision } from './access.serializers.js';
+
+/**
+ * D-06 · ¿QUIÉN AUTORIZA la entrada de quien no tiene su rostro registrado?
+ *
+ *   · La gerencia, en su propia sesión (`access:entry:authorize`): el permiso
+ *     no viene con el mostrador ni se le puede liberar a recepción.
+ *   · O la dueña con su firma (`approvalToken`), en el mostrador o desde su
+ *     teléfono, atada a ESE socio: es el camino cuando la gerencia no está.
+ *
+ * `null` = nadie con autoridad: la entrada no se registra.
+ */
+async function quienAutoriza(request: FastifyRequest, op: { branchId: string; memberId: string; reason: string; approvalToken?: string | undefined }): Promise<FaceAuthorization | null> {
+  const actor = request.ctx!.tenant.actorUserId;
+  if (actor && request.holds('access:entry:authorize', op.branchId)) {
+    request.authorize('access:entry:authorize', { branchId: op.branchId, reason: op.reason });
+    return { byUserId: actor, reason: op.reason, signature: false };
+  }
+  const firmante = await request.verifyApprover(op.approvalToken, 'access:entry:authorize', { branchId: op.branchId, resourceType: 'Member', resourceId: op.memberId });
+  return firmante ? { byUserId: firmante, reason: op.reason, signature: true } : null;
+}
 
 /** La puerta: registrar la entrada, la política del mostrador, el paso concedido y lo que pasó. */
 export function registerEntranceRoutes(app: FastifyInstance): void {
@@ -68,6 +88,7 @@ export function registerEntranceRoutes(app: FastifyInstance): void {
         reason: r.decision.reason,
         warning: r.decision.warning,
         consumedVisit: r.decision.consumesVisit,
+        reentry: r.decision.reentry,
         policyVersion: r.decision.policyVersion,
         decisionId: r.record.id,
         attendanceId: r.attendanceId,
@@ -100,6 +121,7 @@ export function registerEntranceRoutes(app: FastifyInstance): void {
         reason: r.decision.reason,
         warning: r.decision.warning,
         wouldConsumeVisit: r.decision.consumesVisit,
+        reentry: r.decision.reentry,
         overridable: r.decision.overridable,
         policyVersion: r.decision.policyVersion,
         outstandingCents: r.outstandingCents?.toString() ?? null,
@@ -130,15 +152,26 @@ export function registerEntranceRoutes(app: FastifyInstance): void {
    * El principio 8 de la visión: si el sistema impidiera dejar pasar a un
    * moroso, el personal encontraría un atajo por fuera y el dato se perdería.
    * Con nombre y motivo, queda registrado. Visibilidad, no prohibición.
+   *
+   * LA EXCEPCIÓN ES EL ROSTRO (D-06, fase 3): a quien no lo tiene registrado
+   * no lo deja pasar recepción con un motivo. Sobre su rechazo
+   * `BIOMETRIC_REQUIRED` —o sobre cualquier otro, si le falta el rostro— el
+   * paso es la AUTORIZACIÓN de la gerencia para esa visita: la da quien tiene
+   * `access:entry:authorize`, o la dueña con su firma (`approvalToken`).
    */
   route(app, {
     method: 'POST',
     url: '/access/decisions/:id/grant',
     security: { kind: 'permission', permission: 'access:manual_grant' },
+    schema: respuesta(201, AccessGrantResult),
     handler: async (request, reply) => {
       const ctx = request.ctx!;
       const { id } = idParam.parse(request.params);
-      const body = z.object({ reason: z.string().min(3).max(300) }).parse(request.body);
+      const body = z.object({
+        reason: z.string().min(3).max(300),
+        /** La firma de la dueña, cuando quien registra no es la gerencia (D-06). */
+        approvalToken: z.string().min(20).max(200).optional(),
+      }).parse(request.body);
 
       const original = await new AccessRepository(ctx.tenant.organizationId).findDecision(id);
       if (!original) throw notFound('Decisión no encontrada');
@@ -154,13 +187,50 @@ export function registerEntranceRoutes(app: FastifyInstance): void {
         shiftUsageCount: delDia.filter((d) => d.overrideReason !== null).length,
       });
 
-      const r = await service.grantManually(ctx, { decisionId: id, reason: body.reason });
+      // D-06: sin rostro, el paso lo autoriza la gerencia (o la dueña con su firma). La firma
+      // solo se consume si hace falta; si no hay quien autorice, el servicio lo rechaza.
+      const sinRostro = original.memberId !== null
+        && (original.denialReason === 'BIOMETRIC_REQUIRED' || await service.faltaElRostro(ctx, original.branchId, original.memberId));
+      const faceAuthorization = sinRostro && original.memberId
+        ? await quienAutoriza(request, { branchId: original.branchId, memberId: original.memberId, reason: body.reason, approvalToken: body.approvalToken })
+        : null;
+
+      const r = await service.grantManually(ctx, { decisionId: id, reason: body.reason, faceAuthorization });
+      const autorizo = faceAuthorization && r.record.overriddenByUserId === faceAuthorization.byUserId
+        ? (await new AccessRepository(ctx.tenant.organizationId).nombresDePersonal([faceAuthorization.byUserId])).get(faceAuthorization.byUserId) ?? null
+        : null;
       return reply.status(201).send({
         outcome: r.decision.outcome,
+        // Solo si, autorizado y todo, la política dijo que no por otra cosa (p. ej. se suspendió mientras tanto).
+        reason: r.decision.reason,
         decisionId: r.record.id,
         attendanceId: r.attendanceId,
+        reentry: r.decision.reentry,
+        consumedVisit: r.decision.consumesVisit,
         overriddenFrom: id,
-      });
+        authorizedByName: autorizo,
+      } satisfies AccessGrantResult);
+    },
+  });
+
+  /**
+   * ¿Ya se resolvió ese rechazo? Quien espera en el mostrador la autorización
+   * de la gerencia (D-06) lo pregunta cada pocos segundos y sigue solo.
+   */
+  route(app, {
+    method: 'GET',
+    url: '/access/decisions/:id/resolution',
+    security: { kind: 'permission', permission: 'access:monitor' },
+    schema: respuesta(200, AccessResolution),
+    handler: async (request): Promise<AccessResolution> => {
+      const { id } = idParam.parse(request.params);
+      const repo = new AccessRepository(request.ctx!.tenant.organizationId);
+      const original = await repo.findDecision(id);
+      if (!original) throw notFound('Decisión no encontrada');
+      request.requirePermission('access:monitor', original.branchId);
+      const resolucion = await repo.resolucionDe(id);
+      const quien = resolucion?.overriddenByUserId ? (await repo.nombresDePersonal([resolucion.overriddenByUserId])).get(resolucion.overriddenByUserId) ?? null : null;
+      return { resolved: resolucion !== null, byName: quien, at: resolucion?.at.toISOString() ?? null };
     },
   });
 

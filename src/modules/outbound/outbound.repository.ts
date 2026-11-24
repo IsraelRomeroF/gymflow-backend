@@ -21,6 +21,8 @@ export type OutboundRow = {
   firstName: string; lastName: string; memberCode: string; phoneE164: string | null; homeBranchId: string | null;
   concept: string | null; dueCents: bigint | null; dueDate: Date | null;
   planName: string | null; periodEnd: Date | null;
+  /** Solo PRICE_CHANGE (D-19, bloque 3.6): de cuánto a cuánto cambió lo que paga por periodo. */
+  priceFromCents: bigint | null; priceToCents: bigint | null;
   resolvedByName: string | null;
 };
 
@@ -37,6 +39,8 @@ export type AlcanceDeMensajes = {
 export type Nuevo = {
   memberId: string; branchId: string | null; kind: OutboundKind; dedupeKey: string;
   chargeId?: string | null; membershipId?: string | null; engagementState?: string | null;
+  /** Solo PRICE_CHANGE: la fila de `membership_price_changes` de la que avisa. */
+  priceChangeId?: string | null;
 };
 
 /** Lo más grave primero: así se ordena la lista y así se decide cuál gana por socio. */
@@ -47,13 +51,15 @@ const DESDE = Prisma.sql`
   JOIN "members" m ON m."id" = o."memberId" AND m."organizationId" = o."organizationId"
   LEFT JOIN "charges" c ON c."id" = o."chargeId" AND c."organizationId" = o."organizationId"
   LEFT JOIN "memberships" ms ON ms."id" = o."membershipId" AND ms."organizationId" = o."organizationId"
-  LEFT JOIN "plans" p ON p."id" = ms."planId"`;
+  LEFT JOIN "plans" p ON p."id" = ms."planId"
+  LEFT JOIN "membership_price_changes" pc ON pc."id" = o."priceChangeId" AND pc."organizationId" = o."organizationId"`;
 
 const COLUMNAS = Prisma.sql`
   o."id", o."kind", o."status", o."memberId", o."branchId", o."createdAt", o."resolvedAt", o."body", o."engagementState",
   m."firstName", m."lastName", m."memberCode", m."phoneE164", m."homeBranchId",
   c."concept", (c."amountCents" - c."allocatedCents" - c."adjustedCents") AS "dueCents", c."dueDate",
   p."name" AS "planName", ms."currentPeriodEnd" AS "periodEnd",
+  pc."fromPriceCents" AS "priceFromCents", pc."toPriceCents" AS "priceToCents",
   (SELECT u."fullName" FROM "users" u WHERE u."id" = o."resolvedByUserId") AS "resolvedByName"`;
 
 /**
@@ -61,6 +67,8 @@ const COLUMNAS = Prisma.sql`
  * con el día `hoy`. La lista lo aplica al leer (quien pagó hace diez minutos
  * no aparece) y el job lo usa, negado, para cerrar lo que ya no hace falta.
  * Un hecho que ya no se encuentra (NULL) cuenta como que dejó de existir.
+ * El aviso de un cambio de precio (D-19) vive mientras la membresía siga viva
+ * en ese plan y no haya otro cambio más nuevo que la toque.
  */
 const hechoVivo = (hoy: Date) => Prisma.sql`COALESCE((
   (o."kind" = 'PAYMENT_DUE_SOON' AND o."chargeId" IS NOT NULL AND c."status" IN ('OPEN', 'PARTIALLY_PAID') AND c."dueDate" >= ${hoy}::date
@@ -75,6 +83,9 @@ const hechoVivo = (hoy: Date) => Prisma.sql`COALESCE((
      AND EXISTS (SELECT 1 FROM "memberships" v WHERE v."memberId" = o."memberId" AND v."organizationId" = o."organizationId" AND v."status" IN ('TRIALING', 'ACTIVE', 'PAST_DUE'))
      AND NOT EXISTS (SELECT 1 FROM "attendance_events" a WHERE a."organizationId" = o."organizationId" AND a."memberId" = o."memberId" AND a."at" > o."createdAt")
      AND NOT EXISTS (SELECT 1 FROM "follow_ups" f WHERE f."organizationId" = o."organizationId" AND f."memberId" = o."memberId" AND f."createdAt" > o."createdAt"))
+  OR (o."kind" = 'PRICE_CHANGE' AND pc."id" IS NOT NULL AND ms."status" NOT IN ('CANCELED', 'EXPIRED')
+     AND ms."planId" = (SELECT a."planId" FROM "plan_price_changes" a WHERE a."id" = pc."planPriceChangeId")
+     AND NOT EXISTS (SELECT 1 FROM "membership_price_changes" n WHERE n."membershipId" = pc."membershipId" AND n."organizationId" = pc."organizationId" AND n."createdAt" > pc."createdAt"))
 ), false)`;
 
 /** Se puede mandar: el socio sigue en el padrón, tiene celular y el mensaje no caducó por viejo. */
@@ -159,6 +170,7 @@ export class OutboundRepository extends TenantRepository {
       data: nuevos.map((n) => ({
         id: uuidv7(), organizationId: this.organizationId, memberId: n.memberId, branchId: n.branchId, kind: n.kind, dedupeKey: n.dedupeKey,
         chargeId: n.chargeId ?? null, membershipId: n.membershipId ?? null, engagementState: n.engagementState ?? null,
+        priceChangeId: n.priceChangeId ?? null,
       })),
       skipDuplicates: true,
     });
@@ -184,7 +196,9 @@ export class OutboundRepository extends TenantRepository {
 
   /**
    * UNO POR SOCIO: de dinero, queda el más grave (y de esos, el más nuevo);
-   * de «te extrañamos», el más nuevo. Los demás se cierran como reemplazados.
+   * de «te extrañamos», el más nuevo; del cambio de precio, el más nuevo (un
+   * recordatorio de pago no tapa el aviso del precio). Los demás se cierran
+   * como reemplazados.
    */
   async reemplazar(): Promise<number> {
     return this.db.$executeRaw`
@@ -192,7 +206,7 @@ export class OutboundRepository extends TenantRepository {
          SET "status" = 'EXPIRED', "resolvedAt" = now(), "closeReason" = 'SUPERSEDED'
         FROM (
           SELECT o."id", ROW_NUMBER() OVER (
-                   PARTITION BY o."memberId", (o."kind" = 'WE_MISS_YOU')
+                   PARTITION BY o."memberId", (CASE o."kind" WHEN 'WE_MISS_YOU' THEN 1 WHEN 'PRICE_CHANGE' THEN 2 ELSE 0 END)
                    ORDER BY ${GRAVEDAD}, o."createdAt" DESC, o."id" DESC) AS "lugar"
             FROM "outbound_messages" o
            WHERE o."organizationId" = ${this.organizationId}::uuid AND o."status" = 'PENDING'
@@ -258,6 +272,24 @@ export class OutboundRepository extends TenantRepository {
          AND ms."currentPeriodEnd" > ${hoy}::date AND ms."currentPeriodEnd" <= ${hoy}::date + ${DIAS_DE_ANTICIPACION}::int
          AND ${this.sinMensaje(Prisma.sql`(CASE WHEN ms."autoRenew" THEN 'PAYMENT_DUE_SOON:M:' ELSE 'MEMBERSHIP_ENDING:' END) || ms."id"::text || ':' || to_char(ms."currentPeriodEnd", 'YYYY-MM-DD')`)}
          AND ${sqlDeSede(Prisma.sql`m."homeBranchId"`, sedes)} LIMIT ${LOTE}`;
+  }
+
+  /**
+   * Cambios de precio recientes (D-19, bloque 3.6) que todavía no tienen su
+   * aviso: una fila de `membership_price_changes` por membresía tocada. No
+   * depende del día de la sede: el precio cambió para todo el gimnasio a la vez.
+   */
+  cambiosDePrecio() {
+    return this.db.$queryRaw<Array<{ id: string; membershipId: string; memberId: string; homeBranchId: string | null }>>`
+      SELECT pc."id", pc."membershipId", pc."memberId", m."homeBranchId"
+        FROM "membership_price_changes" pc
+        JOIN "members" m ON m."id" = pc."memberId" AND m."organizationId" = pc."organizationId" AND m."deletedAt" IS NULL AND m."phoneE164" IS NOT NULL
+        JOIN "memberships" ms ON ms."id" = pc."membershipId" AND ms."status" NOT IN ('CANCELED', 'EXPIRED')
+       WHERE pc."organizationId" = ${this.organizationId}::uuid AND pc."createdAt" > now() - make_interval(days => ${DIAS_DE_VIGENCIA}::int)
+         AND pc."toPriceCents" <> pc."fromPriceCents"
+         AND NOT EXISTS (SELECT 1 FROM "membership_price_changes" n WHERE n."membershipId" = pc."membershipId" AND n."organizationId" = pc."organizationId" AND n."createdAt" > pc."createdAt")
+         AND ${this.sinMensaje(Prisma.sql`'PRICE_CHANGE:' || pc."id"::text`)}
+       ORDER BY pc."createdAt", pc."id" LIMIT ${LOTE}`;
   }
 
   /** Socios a los que ya se les resolvió un «te extrañamos» (mandado o descartado) desde `desde`: no se les arma otro tan pronto. */

@@ -48,7 +48,33 @@ export class OrganizationRepository extends TenantRepository {
         typeof acceso.allowAccessWhilePastDue === 'boolean'
           ? acceso.allowAccessWhilePastDue
           : DEFAULT_ACCESS_SETTINGS.allowAccessWhilePastDue,
+      // D-06 (fase 3, bloque 3.3): nace apagada; la enciende la gerencia en Biometría.
+      requireFaceToEnter: acceso.requireFaceToEnter === true,
     };
+  }
+
+  /**
+   * D-06 (bloque 3.3): enciende o apaga «nadie entra sin su rostro, salvo que
+   * la gerencia autorice esa visita». Guarda también cuándo y quién, para
+   * decirlo en la pantalla. Lo llama `access` (`PUT /access/face-rule`), que
+   * asienta el cambio en la bitácora.
+   */
+  async setRequireFaceToEnter(enabled: boolean, byUserId: string | null): Promise<void> {
+    const org = await this.db.organization.findFirst({ where: { id: this.organizationId }, select: { settings: true } });
+    const settings = { ...((org?.settings ?? {}) as Record<string, unknown>) };
+    settings.access = {
+      ...((settings.access ?? {}) as Record<string, unknown>),
+      requireFaceToEnter: enabled, requireFaceChangedAt: new Date().toISOString(), requireFaceChangedByUserId: byUserId,
+    };
+    await this.db.organization.updateMany({ where: { id: this.organizationId }, data: { settings: settings as Prisma.InputJsonValue } });
+  }
+
+  /** Cuándo y quién cambió por última vez la regla del rostro (D-06). */
+  async requireFaceLastChange(): Promise<{ at: Date; byUserId: string | null } | null> {
+    const org = await this.db.organization.findFirst({ where: { id: this.organizationId }, select: { settings: true } });
+    const acceso = (((org?.settings ?? {}) as Record<string, unknown>).access ?? {}) as Record<string, unknown>;
+    if (typeof acceso.requireFaceChangedAt !== 'string') return null;
+    return { at: new Date(acceso.requireFaceChangedAt), byUserId: typeof acceso.requireFaceChangedByUserId === 'string' ? acceso.requireFaceChangedByUserId : null };
   }
 
   /** Ajustes del arranque (DP-07): hoy, si el gerente atiende el mostrador (gimnasio de una persona y media). */

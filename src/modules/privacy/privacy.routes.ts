@@ -3,6 +3,7 @@ import { registerExportRoutes } from './export.routes.js';
 import { registerAnonymizeRoutes } from './anonymize.routes.js';
 import { registerRequestRoutes } from './requests.routes.js';
 import { registerPortalPrivacyRoutes } from './portal-privacy.routes.js';
+import { registerConservationRoutes } from './conservation.routes.js';
 import { inscribirEfectosDeRetiro } from './efectos-de-retiro.js';
 
 /**
@@ -16,6 +17,8 @@ export function registerPrivacyRoutes(app: FastifyInstance): void {
   inscribirEfectosDeRetiro();
   registerExportRoutes(app);
   registerAnonymizeRoutes(app);
+  // Conservación (D-32, bloque 3.9): plazos, rostros en espera y la lista mensual que firma el dueño.
+  registerConservationRoutes(app);
   registerRequestRoutes(app);
   registerPortalPrivacyRoutes(app);
 }

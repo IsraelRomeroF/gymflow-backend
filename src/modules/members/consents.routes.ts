@@ -7,6 +7,7 @@ import { respuesta } from '../../platform/http/respuesta.js';
 import { ConsentRepository } from './consent.repository.js';
 import { firmarConsentimiento, retirarConsentimiento } from './consent.service.js';
 import { registerConsentDocumentRoutes } from './consent-documents.routes.js';
+import { registerNoticeSignatureRoutes } from './aviso-firma.routes.js';
 import { ConsentDocumentRepository } from './consent-document.repository.js';
 import { MemberRepository } from './member.repository.js';
 import { firmaBiometricaPorRenovarDe, firmasBiometricasPorRenovar, renovarFirmaBiometrica } from './biometric-renewal.js';
@@ -16,6 +17,8 @@ import { consentSchema, idParam } from './members.serializers.js';
 export function registerConsentRoutes(app: FastifyInstance): void {
   // Los textos (revisar, corregir y borrar borradores) van con sus firmas.
   registerConsentDocumentRoutes(app);
+  // La firma de la dueña en el aviso de privacidad (3.7, D-25).
+  registerNoticeSignatureRoutes(app);
 
   // ── Consentimientos ───────────────────────────────────────────────────────
   /**

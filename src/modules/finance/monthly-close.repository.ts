@@ -73,19 +73,14 @@ export class MonthlyCloseRepository extends TenantRepository {
     return rows[0]?.primero ?? null;
   }
 
-  /**
-   * Dinero que entró en el rango pero pertenece a un mes YA CERRADO (su fecha
-   * de negocio cae en él y se registró después del cierre): se reconoce en
-   * el mes corriente con la etiqueta "ajuste de meses anteriores".
-   */
-  async priorAdjustmentsCents(from: Date, to: Date): Promise<bigint> {
-    const rows = await this.db.$queryRaw<Array<{ total: bigint | null }>>`
-      SELECT COALESCE(SUM(p."amountCents"), 0)::bigint AS total
-        FROM "payments" p
-        JOIN "monthly_closes" mc ON mc."organizationId" = p."organizationId"
-         AND p."businessDate" >= mc."month" AND p."businessDate" < (mc."month" + interval '1 month')
-       WHERE p."organizationId" = ${this.organizationId}::uuid AND p."status" = 'SUCCEEDED'
-         AND p."receivedAt" > mc."closedAt" AND p."receivedAt" >= ${from} AND p."receivedAt" < ${to}`;
-    return rows[0]?.total ?? 0n;
+  /** Los cierres cuyo mes cae en `[from, to)`: para decir «octubre está cerrado» en un periodo que lo toca. */
+  async cerradosEntre(from: Date, to: Date): Promise<MonthlyCloseRecord[]> {
+    const primerMes = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), 1));
+    return this.db.monthlyClose.findMany({ where: this.scope({ month: { gte: primerMes, lt: to } }), select: SELECT, orderBy: { month: 'asc' } }) as unknown as Promise<MonthlyCloseRecord[]>;
+  }
+
+  /** El mes cerrado en el que cae esa fecha de negocio, o null. */
+  async cierreDe(fecha: Date): Promise<MonthlyCloseRecord | null> {
+    return this.find(new Date(Date.UTC(fecha.getUTCFullYear(), fecha.getUTCMonth(), 1)));
   }
 }

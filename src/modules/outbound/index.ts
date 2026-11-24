@@ -23,3 +23,6 @@ export { OUTBOUND_JOBS } from './outbound.jobs.js';
 // por mandar»: la misma cuenta que la campana. Hoy nadie la consume.
 export { OutboundService } from './outbound.service.js';
 export type { AlcanceDeMensajes } from './outbound.repository.js';
+
+// D-19 (bloque 3.6): al cambiar el precio de un plan, arma el aviso al teléfono de cada socio tocado.
+export { registerOutboundHooks } from './hooks.js';

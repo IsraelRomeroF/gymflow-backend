@@ -155,7 +155,7 @@ describe('bandeja de salida: qué mensajes nacen, quién los ve y qué pasa al m
   it('gerencia ve todo el gimnasio, lo más grave primero, con el texto ya escrito', async () => {
     const l = await lista(s.gerente);
     expect(l.total).toBe(7);
-    expect(l.counts).toEqual({ MEMBERSHIP_SUSPENDED: 1, PAYMENT_OVERDUE: 2, PAYMENT_DUE_SOON: 2, MEMBERSHIP_ENDING: 1, WE_MISS_YOU: 1 });
+    expect(l.counts).toEqual({ MEMBERSHIP_SUSPENDED: 1, PAYMENT_OVERDUE: 2, PAYMENT_DUE_SOON: 2, MEMBERSHIP_ENDING: 1, WE_MISS_YOU: 1, PRICE_CHANGE: 0 });
     expect(l.pending[0]!.kind).toBe('MEMBERSHIP_SUSPENDED');
     expect(l.pending.at(-1)!.kind).toBe('WE_MISS_YOU');
     const org = await getDb().organization.findUniqueOrThrow({ where: { id: g.organizationId } });
@@ -307,6 +307,7 @@ describe('bandeja de salida: lo que dice cada mensaje', () => {
   const base = {
     firstName: 'Natalia', gimnasio: 'Gimnasio Fuerza', sede: null, concept: 'Mensualidad', dueCents: 65_000n,
     dueDate: new Date('2026-11-24T00:00:00Z'), planName: 'Mensual', periodEnd: new Date('2026-11-24T00:00:00Z'), engagementState: null, enLinea: false,
+    priceFromCents: null, priceToCents: null,
   };
 
   it('saluda con el nombre y el gimnasio, y cada motivo dice lo suyo con la fecha del calendario', () => {

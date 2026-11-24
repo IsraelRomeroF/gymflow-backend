@@ -6,7 +6,7 @@ import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 import { PortfolioRepository } from '../billing/index.js';
 import { AnalyticsRepository } from './analytics.repository.js';
 import { MovementsRepository } from './movements.repository.js';
-import { ExpensesRepository, prorrateoDiario } from '../finance/index.js';
+import { ExpensesRepository, ajustesPorMes, prorrateoDiario, restaDeLaGanancia, retirosDelDueno } from '../finance/index.js';
 import type { RequestContext } from '../../platform/context.js';
 
 /**
@@ -44,6 +44,14 @@ export type Dashboard = {
   fixedExpensesCents: bigint;
   /** UTILIDAD: lo ganado (servicio prestado) menos gastos de caja y fijos. */
   profitCents: bigint;
+  /** Retiros del dueño de los meses del periodo (positivo): se informan, no restan (D-23). */
+  ownerDrawsCents: bigint;
+  /** Costo de lo vendido en la tienda (negativo): la utilidad ya lo resta (D-21). */
+  costOfGoodsCents: bigint;
+  /** Piezas vendidas de productos sin costo registrado. */
+  soldWithoutCost: number;
+  /** «Ajustes de ‹mes›» anotados en los meses del periodo (D-22). */
+  adjustments: Array<{ month: string; cents: bigint; count: number }>;
   /** El periodo anterior de la misma duración, para comparar. */
   previous: { from: string; to: string; collectedCents: bigint; accruedCents: bigint; profitCents: bigint };
 };
@@ -55,6 +63,11 @@ type Dinero = {
   gastosCaja: bigint;
   sobrantesCaja: bigint;
   gastosFijos: bigint;
+  retiros: bigint;
+  /** Costo de lo vendido (negativo) y piezas sin costo. */
+  costoVendido: bigint;
+  sinCosto: number;
+  ajustes: Array<{ month: string; cents: bigint; count: number }>;
 };
 
 function suma(mapa: Map<string | null, bigint>, clave: string | null, valor: bigint): void {
@@ -181,12 +194,17 @@ export class AnalyticsService {
       cashExpensesCents: dinero.gastosCaja,
       cashOverageCents: dinero.sobrantesCaja,
       fixedExpensesCents: dinero.gastosFijos,
-      profitCents: totalDevengado + dinero.gastosCaja + dinero.gastosFijos,
+      // Utilidad = lo ganado − gastos de caja y faltantes − gastos fijos − costo de lo vendido (D-21).
+      profitCents: totalDevengado + dinero.gastosCaja + dinero.gastosFijos + dinero.costoVendido,
+      ownerDrawsCents: dinero.retiros,
+      costOfGoodsCents: dinero.costoVendido,
+      soldWithoutCost: dinero.sinCosto,
+      adjustments: dinero.ajustes,
       previous: {
         ...(() => { const r = anterior(range, comparar); return { from: iso(r.from), to: iso(r.to) }; })(),
         collectedCents: [...previo.cobradoPorSede.values()].reduce((a, b) => a + b, 0n),
         accruedCents: [...previo.devengadoPorSede.values()].reduce((a, b) => a + b, 0n),
-        profitCents: [...previo.devengadoPorSede.values()].reduce((a, b) => a + b, 0n) + previo.gastosCaja + previo.gastosFijos,
+        profitCents: [...previo.devengadoPorSede.values()].reduce((a, b) => a + b, 0n) + previo.gastosCaja + previo.gastosFijos + previo.costoVendido,
       },
     };
   }
@@ -200,14 +218,15 @@ export class AnalyticsService {
     const repo = new AnalyticsRepository(orgId);
     const dentro = <T extends { branchId: string | null }>(rows: T[]): T[] =>
       branchIds ? rows.filter((r) => r.branchId !== null && branchIds.includes(r.branchId)) : rows;
-    const [movT, inmediatoT, periodosT, visitasT, gastos] = await Promise.all([
+    const [movT, inmediatoT, periodosT, visitasT, gastos, costosT] = await Promise.all([
       new MovementsRepository(orgId).porDia(range.from, range.to),
       repo.accruedImmediate(range.from, range.to),
       repo.periodCharges(range.from, range.to),
       repo.visitRecognition(range.from, range.to),
       new ExpensesRepository(orgId).vigentes(range.from, range.to),
+      repo.costOfGoodsSold(range.from, range.to),
     ]);
-    const [mov, inmediato, periodos, visitas] = [dentro(movT), dentro(inmediatoT), dentro(periodosT), dentro(visitasT)] as const;
+    const [mov, inmediato, periodos, visitas, costos] = [dentro(movT), dentro(inmediatoT), dentro(periodosT), dentro(visitasT), dentro(costosT)] as const;
 
     // Cobrado = LA definición de "dinero que entró" (BE2-15): la misma suma
     // que Movimientos, sin notas de crédito y con las devoluciones restadas.
@@ -257,9 +276,15 @@ export class AnalyticsService {
       suma(devengadoPorSede, r.branchId, split.earned.cents + split.expired.cents);
     }
 
-    const fijos = prorrateoDiario(branchIds === null ? gastos : gastos.filter((g) => g.branchId !== null && branchIds.includes(g.branchId)), range.from, range.to);
+    // El retiro del dueño no es gasto (D-23): se informa aparte y no se prorratea.
+    const queRestan = gastos.filter(restaDeLaGanancia);
+    const fijos = prorrateoDiario(branchIds === null ? queRestan : queRestan.filter((g) => g.branchId !== null && branchIds.includes(g.branchId)), range.from, range.to);
     const gastosFijos = [...fijos.values()].reduce((a, b) => a + b, 0n);
-    return { cobradoPorSede, devengadoPorSede, porListaDePrecios, gastosCaja, sobrantesCaja, gastosFijos };
+    return {
+      cobradoPorSede, devengadoPorSede, porListaDePrecios, gastosCaja, sobrantesCaja, gastosFijos,
+      retiros: retirosDelDueno(gastos, branchIds), ajustes: ajustesPorMes(gastos, branchIds),
+      costoVendido: -costos.reduce((a, c) => a + BigInt(c.costCents), 0n), sinCosto: costos.reduce((a, c) => a + c.sinCosto, 0),
+    };
   }
 
   /** La cartera de toda la organización, o la suma de la de cada sede permitida. */

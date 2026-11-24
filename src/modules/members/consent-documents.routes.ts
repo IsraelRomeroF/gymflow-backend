@@ -17,7 +17,8 @@ export function registerConsentDocumentRoutes(app: FastifyInstance): void {
     method: 'GET',
     url: '/consent-documents/:id/review',
     module: 'core',
-    security: { kind: 'permission', permission: 'members:consent:read' },
+    // `settings:consent:read` (3.7, D-25): la dueña revisa el borrador que va a firmar.
+    security: { kind: 'permission', permission: 'members:consent:read', anyOf: ['settings:consent:read'] },
     schema: respuesta(200, ConsentDocumentReview),
     handler: async (request) => {
       const { id } = idParam.parse(request.params);

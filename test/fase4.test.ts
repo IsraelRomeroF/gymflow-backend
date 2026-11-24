@@ -30,7 +30,9 @@ describe('fase 4 · cierre de mes', () => {
     const tablero = await app.inject({ method: 'GET', url: `/dashboard?from=${mes}-01&to=2024-04-01&fresh=1`, headers: { cookie: owner } });
     expect(tablero.statusCode, tablero.body).toBe(200);
     expect(tablero.json().closed?.closedAt).toBeTruthy();
-    expect(tablero.json().priorAdjustmentsCents).toMatch(/^\d+$/);
+    // D-22 (3.7): el mes cerrado se sirve de su foto; lo tardío va etiquetado en `adjustments` (antes `priorAdjustmentsCents`).
+    expect(tablero.json().closed).toMatchObject({ fromSnapshot: true });
+    expect(tablero.json().adjustments).toEqual([]);
 
     const lista = await app.inject({ method: 'GET', url: '/reports/monthly-closes', headers: { cookie: owner } });
     expect(lista.json().closes.some((c: { month: string }) => c.month === mes)).toBe(true);

@@ -12,7 +12,7 @@ import { DemasiadosIntentos, MENSAJE_POR_SUCURSAL, tiempoParaReintentar } from '
 import { contar, registerModuleUsage } from '../../platform/modules/usage.js';
 import { isModuleOnAt } from '../../platform/modules/module-state.js';
 import { AuditService } from '../../platform/audit/audit.service.js';
-import { ConsentDocumentRepository, listarTextos, publicarTexto, retirarTexto } from '../members/index.js';
+import { ConsentDocumentRepository, esAvisoPorFirmar, guardianSchema, listarTextos, pedirFirmaDelAviso, publicarTexto, responsibleSchema, retirarTexto } from '../members/index.js';
 import { IntakeRepository, datosBorrados } from './intake.repository.js';
 import { IntakeService, correccionesVigentes } from './intake.service.js';
 import { registerOnboardingRoutes } from './onboarding.routes.js';
@@ -51,12 +51,30 @@ const draftBody = z.object({
   emergencyContactPhone: telefonoMx().nullish().transform((v) => v || null),
   memberSince: z.coerce.date().nullish().transform((v) => v ?? null),
   healthNotes: z.string().max(1000).nullish().transform((v) => v ?? null),
+  // D-10: «¿Tienes 18 años o más?» y, de 15 a 17, su papá, mamá o tutor.
+  adult: z.boolean().nullish().transform((v) => v ?? null),
+  guardianName: nombrePersona(120).or(z.literal('')).nullish().transform((v) => v || null),
+  guardianPhone: telefonoMx().nullish().transform((v) => v || null),
   consents: z.array(z.object({
     consentType: z.enum(['PRIVACY_NOTICE', 'HOUSE_RULES', 'HEALTH_DATA', 'MARKETING']),
     version: z.string().min(1).max(40),
     granted: z.boolean(),
   })).max(10),
 });
+
+/**
+ * Lo que decide quien revisa además de corregir (bloque 3.4): el responsable
+ * del celular compartido (D-09) y la firma del tutor en el mostrador (D-10),
+ * con lo de la salud, que solo el tutor puede autorizar.
+ */
+const decisionBody = {
+  corrections: correctionsBody.optional(),
+  responsible: responsibleSchema.optional(),
+  guardian: guardianSchema.extend({
+    healthConsent: z.boolean().default(false),
+    healthNotes: z.string().trim().max(1000).nullish(),
+  }).optional(),
+};
 
 export function registerIntakeRoutes(app: FastifyInstance, env: Env): void {
   // Quien ya llenó sus datos espera respuesta: no se apaga con altas por revisar.
@@ -234,7 +252,8 @@ export function registerIntakeRoutes(app: FastifyInstance, env: Env): void {
       request.requirePermission('members:intake:read', v.intake.branchId);
       // La nota de salud es un dato SENSIBLE: la ve quien tiene su permiso,
       // no cualquiera que revise altas. Los demás solo saben que existe.
-      const veSalud = request.holds('members:health:read', v.intake.branchId);
+      // De un menor no se enseña ninguna (D-10): lo de salud lo autoriza y lo dice su tutor al firmar.
+      const veSalud = !v.minor && request.holds('members:health:read', v.intake.branchId);
       if (veSalud && v.intake.healthNotes) {
         await audit.record(request.ctx!, {
           action: 'health.read', resourceType: 'MemberIntake', resourceId: v.intake.id, branchId: v.intake.branchId,
@@ -259,12 +278,15 @@ export function registerIntakeRoutes(app: FastifyInstance, env: Env): void {
           emergencyContactPhone: v.intake.emergencyContactPhone,
           memberSince: day(v.intake.memberSince),
           healthNotes: veSalud ? v.intake.healthNotes : null,
-          hasHealthNotes: !!v.intake.healthNotes,
+          hasHealthNotes: !v.minor && !!v.intake.healthNotes,
           acceptedConsents: v.intake.acceptedConsents,
           submittedAt: v.intake.submittedAt.toISOString(),
           corrections: Object.keys(corrections).length > 0 ? corrections as Record<string, string | null> : null,
           correctedAt: iso(v.intake.correctedAt),
           correctedByName: corrigio,
+          minor: v.minor,
+          guardianName: v.intake.guardianName,
+          guardianPhoneE164: v.intake.guardianPhoneE164,
         },
         suggestion: v.suggestion,
         // Con nombre y código: recepción decide "es la misma persona" viendo a
@@ -310,14 +332,14 @@ export function registerIntakeRoutes(app: FastifyInstance, env: Env): void {
     schema: respuesta(201, IntakeResolved),
     handler: async (request, reply) => {
       const { id } = idParam.parse(request.params);
-      const { force, corrections } = z.object({
+      const { force, corrections, responsible, guardian } = z.object({
         force: z.boolean().default(false),
         // Lo que recepción completa o corrige en este momento; se suma a lo que ya había guardado.
-        corrections: correctionsBody.optional(),
+        ...decisionBody,
       }).parse(request.body ?? {});
       await autorizarSede(request, id);
       const c = limpias(corrections);
-      const r = await service.approve(request.ctx!, id, { force, ...(c ? { corrections: c } : {}) });
+      const r = await service.approve(request.ctx!, id, { force, responsible, guardian, ...(c ? { corrections: c } : {}) });
       return reply.status(201).send(r);
     },
   });
@@ -331,10 +353,10 @@ export function registerIntakeRoutes(app: FastifyInstance, env: Env): void {
     handler: async (request, reply) => {
       const { id } = idParam.parse(request.params);
       // Con lo corregido, igual que aprobar (9-03): antes la corrección se descartaba sin aviso.
-      const { memberId, corrections } = z.object({ memberId: z.string().uuid(), corrections: correctionsBody.optional() }).parse(request.body);
+      const { memberId, corrections, responsible, guardian } = z.object({ memberId: z.string().uuid(), ...decisionBody }).parse(request.body);
       await autorizarSede(request, id);
       const c = limpias(corrections);
-      return reply.status(201).send(await service.link(request.ctx!, id, memberId, c ? { corrections: c } : {}));
+      return reply.status(201).send(await service.link(request.ctx!, id, memberId, { responsible, guardian, ...(c ? { corrections: c } : {}) }));
     },
   });
 
@@ -360,7 +382,8 @@ export function registerIntakeRoutes(app: FastifyInstance, env: Env): void {
     method: 'GET',
     url: '/consent-documents',
     module: 'core',
-    security: { kind: 'permission', permission: 'members:consent:read' },
+    // `settings:consent:read` (3.7, D-25): la dueña lee los textos legales sin abrir expedientes.
+    security: { kind: 'permission', permission: 'members:consent:read', anyOf: ['settings:consent:read'] },
     schema: respuesta(200, ConsentDocumentList),
     handler: async (request) => {
       // Con el historial (1.10, 21-07): cuándo se retiró cada versión y cuántas firmas la guardan.
@@ -377,7 +400,7 @@ export function registerIntakeRoutes(app: FastifyInstance, env: Env): void {
     method: 'GET',
     url: '/consent-documents/:id',
     module: 'core',
-    security: { kind: 'permission', permission: 'members:consent:read' },
+    security: { kind: 'permission', permission: 'members:consent:read', anyOf: ['settings:consent:read'] },
     handler: async (request) => {
       const { id } = idParam.parse(request.params);
       const d = await new ConsentDocumentRepository(request.ctx!.tenant.organizationId).findById(id);
@@ -428,6 +451,13 @@ export function registerIntakeRoutes(app: FastifyInstance, env: Env): void {
       const ctx = request.ctx!;
       request.authorize('settings:consent:manage', { reason, branchId: null });
 
+      // D-25 (fase 3, bloque 3.7): el aviso de privacidad NO se publica sin la firma de la dueña.
+      // Quien no firma por todo el gimnasio deja la solicitud; ella lo lee y lo firma
+      // (`POST /consent-documents/:id/sign`, `members/aviso-firma.ts`). Los demás textos, como siempre.
+      if (!request.holds('approvals:grant', null) && await esAvisoPorFirmar(ctx.tenant.organizationId, id)) {
+        return { ok: true, publishedAt: null, ...(await pedirFirmaDelAviso(ctx, id, reason, checklist)) };
+      }
+
       // Solo un borrador, sin corchetes y, si es el aviso, con lo mínimo y revisado punto por punto.
       const doc = await publicarTexto(ctx.tenant.organizationId, id, ctx.tenant.actorUserId ?? null, checklist);
 
@@ -438,7 +468,7 @@ export function registerIntakeRoutes(app: FastifyInstance, env: Env): void {
         reason,
         afterState: { consentType: doc.consentType, version: doc.version, bodyHash: doc.bodyHash, ...(checklist?.length ? { checklist } : {}) },
       });
-      return { ok: true, status: doc.status, publishedAt: iso(doc.publishedAt) };
+      return { ok: true, status: doc.status, publishedAt: iso(doc.publishedAt), awaitingSignature: false };
     },
   });
 

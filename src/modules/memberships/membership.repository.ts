@@ -32,6 +32,8 @@ export type MembershipRecord = {
   cancellationReason: string | null;
   /** Precio pactado al vender (DM-05); null = precio vigente del plan en la sede de venta. */
   agreedPriceCents: bigint | null;
+  /** «Conserva su precio» (D-19, bloque 3.6): un cambio de precio del plan no la toca salvo decisión. */
+  priceProtected: boolean;
 };
 
 const SELECT = {
@@ -40,7 +42,7 @@ const SELECT = {
   billingAnchorDay: true, graceUntil: true, autoRenew: true,
   frozenDaysUsedThisYear: true, frozenDaysUsedYear: true,
   frozenSince: true, frozenUntil: true, replacesMembershipId: true,
-  cancellationReason: true, agreedPriceCents: true,
+  cancellationReason: true, agreedPriceCents: true, priceProtected: true,
 } as const;
 
 export type MembershipEventRecord = {
@@ -122,6 +124,8 @@ export class MembershipRepository extends TenantRepository {
     startDate: Date; periodStart: Date; periodEnd: Date; billingAnchorDay: number;
     autoRenew: boolean; branchIds: string[]; createdByUserId: string; saleKey?: string | null;
     agreedPriceCents?: bigint | null;
+    /** Nace conservando su precio (D-19): se pactó uno distinto al de lista. Exige `agreedPriceCents`. */
+    priceProtected?: boolean;
   }): Promise<MembershipRecord> {
     const id = uuidv7();
     const row = await this.db.$transaction(async (tx) => {
@@ -140,6 +144,8 @@ export class MembershipRepository extends TenantRepository {
           autoRenew: input.autoRenew,
           saleKey: input.saleKey ?? null,
           agreedPriceCents: input.agreedPriceCents ?? null,
+          ...(input.priceProtected && input.agreedPriceCents != null
+            ? { priceProtected: true, priceProtectedReason: 'Se pactó un precio distinto al de lista' } : {}),
           createdByUserId: input.createdByUserId,
         },
         select: SELECT,

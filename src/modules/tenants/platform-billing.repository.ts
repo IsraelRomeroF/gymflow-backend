@@ -13,7 +13,13 @@ export type Pago = {
   paidOn: Date; note: string | null; createdAt: Date; createdByUserId: string | null;
   undoneAt: Date | null; undoneByUserId: string | null; undoReason: string | null;
 };
-export type MarcaParaCobro = { id: string; tradeName: string; serviceStatus: string; activatedAt: Date | null; createdAt: Date };
+export type MarcaParaCobro = {
+  id: string; tradeName: string; serviceStatus: string; activatedAt: Date | null; createdAt: Date;
+  /** Prórroga de la suspensión automática (D-37) y si la suspensión vigente la hizo el sistema. */
+  autoSuspendHoldUntil: Date | null; suspendedAutomatically: boolean;
+  /** El plan y la versión que la marca tiene de él (D-38). */
+  platformPlanId: string | null; platformPlanSnapshot: unknown;
+};
 
 const SELECT = {
   id: true, organizationId: true, folio: true, periodStart: true, periodEnd: true, lines: true, totalCents: true, paidCents: true, status: true,
@@ -23,7 +29,10 @@ const SELECT_PAGO = {
   id: true, invoiceId: true, amountCents: true, paymentMethod: true, paymentRef: true, paidOn: true, note: true,
   createdAt: true, createdByUserId: true, undoneAt: true, undoneByUserId: true, undoReason: true,
 } as const;
-const SELECT_MARCA = { id: true, tradeName: true, serviceStatus: true, activatedAt: true, createdAt: true } as const;
+const SELECT_MARCA = {
+  id: true, tradeName: true, serviceStatus: true, activatedAt: true, createdAt: true,
+  autoSuspendHoldUntil: true, suspendedAutomatically: true, platformPlanId: true, platformPlanSnapshot: true,
+} as const;
 
 /** Un día de calendario (`AAAA-MM-DD`) como lo guarda una columna DATE. */
 const dia = (fecha: string): Date => new Date(`${fecha}T00:00:00.000Z`);
@@ -125,7 +134,7 @@ export class PlatformBillingRepository extends GlobalRepository {
       this.db.organization.findMany({ where: { deletedAt: null }, select: { id: true, platformPlanId: true } }),
       this.db.organizationEntitlement.findMany({ where: { granted: false }, select: { organizationId: true, moduleKey: true } }),
     ]);
-    const mapa = new Map(marcas.map((m) => [m.id, { planId: m.platformPlanId, noContratados: new Set<string>() }]));
+    const mapa = new Map(marcas.map((m) => [m.id, { planId: m.platformPlanId as string | null, noContratados: new Set<string>() }]));
     for (const n of negados) mapa.get(n.organizationId)?.noContratados.add(n.moduleKey);
     return mapa;
   }
@@ -231,6 +240,39 @@ export class PlatformBillingRepository extends GlobalRepository {
   /** Anula una factura que todavía debe TODO: con pagos registrados, primero se deshacen. */
   async void(id: string, reason: string): Promise<boolean> {
     const { count } = await this.db.platformInvoice.updateMany({ where: { id, status: 'PENDING', paidCents: 0n }, data: { status: 'VOID', voidReason: reason } });
+    return count > 0;
+  }
+
+  /**
+   * SUSPENSIÓN AUTOMÁTICA POR ADEUDO (D-37). Con la marca bajo candado y la
+   * factura vuelta a leer: si entre la decisión y este instante se registró el
+   * pago, se reanudó, se dio una prórroga o alguien ya la suspendió, no pasa
+   * nada. Solo cambia el estado del servicio: no toca facturas, pagos ni datos
+   * del gimnasio.
+   */
+  async suspenderPorAdeudo(organizationId: string, invoiceId: string, hoy: string, reason: string, ahora: Date): Promise<boolean> {
+    return this.db.$transaction(async (tx) => {
+      const marcas = await tx.$queryRaw<Array<{ serviceStatus: string; hold: Date | null }>>`
+        SELECT "serviceStatus", "autoSuspendHoldUntil" AS hold FROM organizations WHERE id = ${organizationId}::uuid AND "deletedAt" IS NULL FOR UPDATE`;
+      const marca = marcas[0];
+      if (!marca || marca.serviceStatus !== 'ACTIVE') return false;
+      if (marca.hold && marca.hold.toISOString().slice(0, 10) >= hoy) return false;
+      const facturas = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM "platform_invoices"
+         WHERE id = ${invoiceId}::uuid AND "organizationId" = ${organizationId}::uuid AND status = 'PENDING' AND "paidCents" < "totalCents" AND "dueDate" < ${hoy}::date
+           FOR UPDATE`;
+      if (facturas.length === 0) return false;
+      await tx.organization.update({
+        where: { id: organizationId },
+        data: { serviceStatus: 'SUSPENDED', suspendedAt: ahora, suspendedReason: reason, suspendedAutomatically: true },
+      });
+      return true;
+    });
+  }
+
+  /** La prórroga de la suspensión automática: hasta ese día, incluido; null la quita. */
+  async setHold(organizationId: string, until: string | null): Promise<boolean> {
+    const { count } = await this.db.organization.updateMany({ where: { id: organizationId, deletedAt: null }, data: { autoSuspendHoldUntil: until ? dia(until) : null } });
     return count > 0;
   }
 

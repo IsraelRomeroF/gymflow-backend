@@ -23,6 +23,11 @@ describe('firmas · bloque 0.9', () => {
     [owner, gerente, gerencia] = await Promise.all(['owner@demo.mx', 'gerente@demo.mx', 'gerencia@demo.mx'].map((e) => loginAs(app, e))) as [string, string, string];
     orgId = (await orgFixtures()).demo.id;
     centro = (await db().roleAssignment.findFirstOrThrow({ where: { user: { email: 'recepcion@demo.mx' }, revokedAt: null } })).branchId!;
+    // D-03 (bloque 3.2): la condonación de aquí se pide siempre sobre la misma membresía y el mismo cargo de la
+    // siembra, y una corrida anterior les dejó un «no» pegado y solicitudes de esta hora. Para esta corrida, eso ya pasó.
+    const antier = new Date(Date.now() - 48 * 3_600_000);
+    await db().approvalRequest.updateMany({ where: { organizationId: orgId, permission: 'billing:waiver:apply', createdAt: { gt: antier } }, data: { createdAt: antier } });
+    await db().approvalRequest.updateMany({ where: { organizationId: orgId, permission: 'billing:waiver:apply', decidedAt: { gt: antier } }, data: { decidedAt: antier } });
   });
   afterAll(async () => { await app.close(); await closeDb(); });
 

@@ -2,6 +2,8 @@ import type { JobResult, PlatformJobHandler } from '../../platform/jobs/types.js
 import type { PlatformJob } from '../../platform/modules/types.js';
 import { DIAS_DE_GRACIA, hoyDeCobro } from './cobro-reglas.js';
 import { PlatformBillingService } from './platform-billing.service.js';
+import { PlatformCollectionsService } from './cobranza.service.js';
+import { PlatformPricingService } from './platform-pricing.service.js';
 
 /**
  * Factura del mes a las marcas (DP-03). Idempotente: la que ya tiene factura
@@ -32,6 +34,39 @@ export async function emitirElMes(ahora: Date = new Date()): Promise<JobResult> 
 
 const issueMonthly: PlatformJobHandler = () => emitirElMes();
 
+/**
+ * Cambios de precio y de plan anunciados (D-38, bloque 3.11): aplica los que
+ * ya llegaron a su fecha y pone al día los avisos de los que siguen
+ * anunciados. Va ANTES de emitir: la factura del mes sale con lo vigente.
+ * Idempotente: un cambio se aplica una sola vez (lo marca la base).
+ */
+export async function aplicarCambiosDePrecio(ahora: Date = new Date()): Promise<JobResult> {
+  const r = await new PlatformPricingService().correr(ahora);
+  return {
+    job: 'platform.prices.apply', processed: r.applied + r.notices, skipped: 0, batches: 1, truncated: false,
+    errors: r.errors.map((e) => ({ entityId: e.id, error: e.error })),
+  };
+}
+
+/**
+ * Escalera de cobranza (D-37, bloque 3.11; ADR-046): los avisos al dueño que
+ * falten (factura emitida, factura vencida) y la SUSPENSIÓN AUTOMÁTICA de la
+ * marca que lleva 15 días de atraso avisado. Va DESPUÉS de emitir. Repetirlo
+ * el mismo día no duplica avisos ni vuelve a suspender. Una marca con adeudo
+ * vencido a la que no se le suspende porque su aviso no tiene constancia de
+ * entrega NO es un error de la corrida (cuenta como saltada): la consola la
+ * muestra en Cobranza → «Avisos por mandar» para que alguien se lo mande.
+ */
+export async function cobrarALasMarcas(ahora: Date = new Date()): Promise<JobResult> {
+  const r = await new PlatformCollectionsService().correr(ahora);
+  return {
+    job: 'platform.collections', processed: r.noticesIssued + r.noticesOverdue + r.suspended.length, skipped: r.onHold.length + r.withoutDelivery.length, batches: 1, truncated: false,
+    errors: r.failed.map((f) => ({ entityId: f.organizationId, error: `${f.tradeName}: ${f.error}` })),
+  };
+}
+
 export const TENANT_JOBS: ReadonlyArray<PlatformJob> = [
+  { name: 'platform.prices.apply', scope: 'platform', handler: () => aplicarCambiosDePrecio() },
   { name: 'platform.invoices.issue', scope: 'platform', handler: issueMonthly },
+  { name: 'platform.collections', scope: 'platform', handler: () => cobrarALasMarcas() },
 ];

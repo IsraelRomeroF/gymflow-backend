@@ -59,6 +59,12 @@ export class ApprovalGrantRepository extends TenantRepository {
   state(id: string): Promise<{ usedAt: Date | null; expiresAt: Date } | null> {
     return this.db.approvalGrant.findFirst({ where: this.scope({ id }), select: { usedAt: true, expiresAt: true } });
   }
+
+  /** ¿Alguien firmó ESTA operación después de `desde`? Un «sí» posterior deja sin efecto el «no» (D-03). */
+  async signedSince(permission: string, resourceId: string, desde: Date): Promise<boolean> {
+    const f = await this.db.approvalGrant.findFirst({ where: this.scope({ permission, resourceId, createdAt: { gt: desde } }), select: { id: true } });
+    return f !== null;
+  }
 }
 
 export type Solicitud = {
@@ -71,12 +77,22 @@ export type Solicitud = {
   notifiedCount: number;
   /** La primera vez que la bandeja de alguien que puede firmarla la mostró (29-05). */
   seenAt: Date | null;
+  /** D-03: la solicitud rechazada de la misma operación a la que esta responde, y la respuesta. */
+  previousRequestId: string | null;
+  reply: string | null;
+  /** D-03: quien firma preguntó en vez de rechazar; la solicitud sigue pendiente. */
+  question: string | null; questionAt: Date | null; questionByUserId: string | null;
+  answer: string | null; answeredAt: Date | null;
 };
+
+/** El «no» de una operación: quién, cuándo y por qué. */
+export type RechazoPrevio = { id: string; decidedAt: Date; approverUserId: string | null; rejectReason: string | null };
 
 const SELECT = {
   id: true, permission: true, branchId: true, resourceType: true, resourceId: true, amountCents: true, summary: true, reason: true,
   status: true, requestedByUserId: true, approverUserId: true, decidedAt: true, rejectReason: true, expiresAt: true, createdAt: true,
   grantId: true, notifiedCount: true, seenAt: true,
+  previousRequestId: true, reply: true, question: true, questionAt: true, questionByUserId: true, answer: true, answeredAt: true,
 } as const;
 
 /** La base solo admite los cinco estados (CHECK); aquí se dice con el tipo cerrado del núcleo. */
@@ -92,6 +108,7 @@ export class ApprovalRequestRepository extends TenantRepository {
   async create(input: {
     requestedByUserId: string; permission: string; branchId: string | null; resourceType: string | null; resourceId: string | null;
     amountCents: bigint | null; summary: string; reason: string | null; expiresAt: Date;
+    previousRequestId?: string | null; reply?: string | null;
   }): Promise<Solicitud> {
     return fila(await this.db.approvalRequest.create({
       data: { id: uuidv7(), organizationId: this.organizationId, ...input },
@@ -130,6 +147,72 @@ export class ApprovalRequestRepository extends TenantRepository {
       select: SELECT, orderBy: { createdAt: 'desc' }, take: opts.limit ?? 100,
     });
     return rows.map(fila);
+  }
+
+  /**
+   * EL «NO» VIGENTE DE UNA OPERACIÓN (D-03): el último rechazo del mismo
+   * permiso sobre el mismo registro desde `desde`, lo haya pedido quien lo
+   * haya pedido. Si después de ese «no» la operación se autorizó a distancia,
+   * ya no está vigente (la firma en el mostrador la mira quien llama).
+   */
+  async lastRejection(permission: string, resourceId: string, desde: Date): Promise<RechazoPrevio | null> {
+    const r = await this.db.approvalRequest.findFirst({
+      where: this.scope({ permission, resourceId, status: 'REJECTED', decidedAt: { gte: desde } }),
+      select: { id: true, decidedAt: true, approverUserId: true, rejectReason: true }, orderBy: { decidedAt: 'desc' },
+    });
+    if (!r?.decidedAt) return null;
+    const despues = await this.db.approvalRequest.findFirst({
+      where: this.scope({ permission, resourceId, status: 'APPROVED', decidedAt: { gt: r.decidedAt } }), select: { id: true },
+    });
+    return despues ? null : { id: r.id, decidedAt: r.decidedAt, approverUserId: r.approverUserId, rejectReason: r.rejectReason };
+  }
+
+  /**
+   * Cuántas veces se pidió la operación desde `desde` (D-03: 3 por hora) y
+   * cuándo fue la más antigua de esas, para decir a qué hora se puede volver
+   * a pedir. Las autorizadas no cuentan: esa operación ya se hizo o se pudo
+   * hacer, y la siguiente del mismo registro es otra. `hasta`: solo las
+   * creadas hasta ese instante (para decir «2.ª vez» de una ya existente).
+   */
+  async requestedSince(permission: string, resourceId: string, desde: Date, hasta?: Date): Promise<{ n: number; primera: Date | null }> {
+    const filas = await this.db.approvalRequest.findMany({
+      where: this.scope({ permission, resourceId, status: { not: 'APPROVED' }, createdAt: { gt: desde, ...(hasta ? { lte: hasta } : {}) } }),
+      select: { createdAt: true }, orderBy: { createdAt: 'asc' }, take: 50,
+    });
+    return { n: filas.length, primera: filas[0]?.createdAt ?? null };
+  }
+
+  /** Los rechazos a los que responden estas solicitudes, por id. */
+  async rejectionsById(ids: readonly string[]): Promise<Map<string, RechazoPrevio>> {
+    const unicos = [...new Set(ids)];
+    if (unicos.length === 0) return new Map();
+    const filas = await this.db.approvalRequest.findMany({
+      where: this.scope({ id: { in: unicos }, status: 'REJECTED' }), select: { id: true, decidedAt: true, approverUserId: true, rejectReason: true },
+    });
+    return new Map(filas.flatMap((f) => (f.decidedAt ? [[f.id, { id: f.id, decidedAt: f.decidedAt, approverUserId: f.approverUserId, rejectReason: f.rejectReason }] as const] : [])));
+  }
+
+  /**
+   * «PREGUNTAR» en vez de rechazar (D-03): la solicitud sigue pendiente, con
+   * la pregunta puesta y su reloj de nuevo completo. Solo si sigue pendiente y
+   * no tiene otra pregunta sin contestar. Preguntar es haberla visto.
+   */
+  async ask(id: string, data: { question: string; byUserId: string; expiresAt: Date }, ahora = new Date()): Promise<boolean> {
+    const { count } = await this.db.approvalRequest.updateMany({
+      where: this.scope({ id, status: 'PENDING', expiresAt: { gt: ahora }, OR: [{ question: null }, { answer: { not: null } }] }),
+      data: { question: data.question, questionAt: ahora, questionByUserId: data.byUserId, answer: null, answeredAt: null, expiresAt: data.expiresAt },
+    });
+    if (count > 0) await this.markSeen([id], ahora);
+    return count > 0;
+  }
+
+  /** Quien pidió contesta la pregunta: el reloj vuelve a empezar para que quien firma alcance a leerla. */
+  async answer(id: string, data: { answer: string; expiresAt: Date }, ahora = new Date()): Promise<boolean> {
+    const { count } = await this.db.approvalRequest.updateMany({
+      where: this.scope({ id, status: 'PENDING', expiresAt: { gt: ahora }, question: { not: null }, answer: null }),
+      data: { answer: data.answer, answeredAt: ahora, expiresAt: data.expiresAt },
+    });
+    return count > 0;
   }
 
   /** El aviso salió a `n` teléfonos (29-05). Con 0 no se escribe nada: «no salió» es el valor de origen. */

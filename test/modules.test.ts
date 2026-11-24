@@ -53,7 +53,7 @@ describe('toda ruta y todo trabajo pertenecen a un módulo', () => {
     expect(todos.size).toBeGreaterThan(10);
     // Los de plataforma no son de ningún gimnasio: corren una vez por corrida (23-12).
     const jobs = new Map([...todos].filter((e): e is [string, PlannedGymJob] => !esDePlataforma(e[1])));
-    expect([...todos.values()].filter(esDePlataforma).map((j) => j.name)).toEqual(['audit.verify-platform-chain', 'platform.invoices.issue']);
+    expect([...todos.values()].filter(esDePlataforma).map((j) => j.name)).toEqual(['audit.verify-platform-chain', 'platform.prices.apply', 'platform.invoices.issue', 'platform.collections']);
     for (const j of jobs.values()) expect(MODULE_BY_KEY.has(j.module), j.name).toBe(true);
     // Todo job declarado tiene su lugar en el orden que le toca (si no, el runner no arranca).
     const planes = armarPlanes(BACKEND_MODULES);

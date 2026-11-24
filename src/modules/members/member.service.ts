@@ -1,5 +1,5 @@
 import {
-  AUTO_MERGE_THRESHOLD, conflict, rankMatches, validation,
+  AUTO_MERGE_THRESHOLD, conflict, normalizePhoneMx, rankMatches, validation,
   type MatchResult, notFound } from '@gymflow/core';
 import { ZodError } from 'zod';
 import { BranchRepository } from '../organization/index.js';
@@ -10,6 +10,7 @@ import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 import { MemberRepository, type CreateMemberInput, type MemberRecord } from './member.repository.js';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import type { RequestContext } from '../../platform/context.js';
+import { asentarResponsable, prepararResponsable, type GuardianInput, type ResponsibleInput } from './responsible.js';
 
 /** Lo más viejo que se acepta como antigüedad: un año mal tecleado ("0024", "1924") no pasa. */
 const ANTIGUEDAD_MINIMA = '1950-01-01';
@@ -87,6 +88,10 @@ export class MemberService {
       consents: ConsentAtSignup[];
       force?: boolean;
       consentEvidence?: ExternalConsentEvidence | undefined;
+      /** Con quién comparte celular y quién responde por el número (D-09). */
+      responsible?: ResponsibleInput | null | undefined;
+      /** El tutor que firma en el mostrador por un menor (D-10): los consentimientos quedan a su nombre. */
+      guardian?: GuardianInput | null | undefined;
     },
   ): Promise<CreateMemberResult> {
     const orgId = ctx.tenant.organizationId;
@@ -106,11 +111,17 @@ export class MemberService {
         { id: 'nuevo', firstName: input.firstName, lastName: input.lastName,
           phoneE164: input.phoneE164 ?? null, email: input.email ?? null, curp: input.curp ?? null },
         candidates,
-      );
+      )
+        // «Comparte celular» ya está dicho y con responsable (D-09): mismo celular y OTRO nombre (aunque se parezca:
+        // mamá e hija con los mismos apellidos) no detiene el alta. Mismo celular y MISMO nombre sí.
+        .filter((m) => !((input.responsible || input.guardian) && m.method === 'PHONE' && m.score < AUTO_MERGE_THRESHOLD));
       if (matches.length > 0) {
         return { status: 'DUPLICATES_FOUND', candidates: matches };
       }
     }
+
+    // D-09: si otro socio ya tiene ese celular, se comparte anotando al responsable (`PHONE_IN_USE` si falta).
+    const responsibleColumns = await prepararResponsable(orgId, { phoneE164: input.phoneE164, responsible: input.responsible, guardian: input.guardian });
 
     // El código legible se numera por la sucursal habitual.
     let branchCode = 'GEN';
@@ -124,7 +135,8 @@ export class MemberService {
     // juntos. Un socio sin su aviso de privacidad firmado no debe existir ni
     // un instante (OPT3-05).
     return enUnaTransaccion(async () => {
-    const member = await members.create(input, branchCode);
+    const member = await members.create({ ...input, responsibleColumns }, branchCode);
+    await asentarResponsable(orgId, member.id, member.phoneE164, responsibleColumns);
 
     const consents = new ConsentRepository(orgId);
     const textos = new ConsentDocumentRepository(orgId);
@@ -143,6 +155,7 @@ export class MemberService {
         channel: input.consentEvidence?.channel ?? 'ASSISTED',
         grantedAt: input.consentEvidence?.signedAt ?? null,
         assistedByUserId: ctx.tenant.actorUserId ?? null,
+        ...(input.guardian ? { signedByName: input.guardian.name.trim(), signedByPhoneE164: normalizePhoneMx(input.guardian.phoneE164) } : {}),
       });
     }
 
@@ -157,6 +170,8 @@ export class MemberService {
         memberCode: member.memberCode,
         consents: input.consents.map((c) => `${c.consentType}@${c.documentVersion}`),
         forcedDespiteDuplicates: input.force === true,
+        // Sin nombres: solo que comparte y de qué clase es el responsable.
+        ...(responsibleColumns ? { responsable: responsibleColumns.responsibleKind, ...(input.guardian ? { firmoSuTutor: true } : {}) } : {}),
       },
     });
 

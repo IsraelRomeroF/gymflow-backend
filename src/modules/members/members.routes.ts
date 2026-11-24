@@ -5,6 +5,7 @@ import { registerHealthRoutes } from './health.routes.js';
 import { registerProfileRoutes } from './profile.routes.js';
 import { registerConsentRoutes } from './consents.routes.js';
 import { registerHistoryRoutes } from './history.routes.js';
+import { registerResponsibleRoutes } from './responsible.routes.js';
 
 /**
  * Las rutas del socio, en cinco archivos por lo que hacen (auditoría 8,
@@ -21,4 +22,6 @@ export function registerMemberRoutes(app: FastifyInstance): void {
   registerConsentRoutes(app);
   // La historia del socio, para su ficha (bloque 2.2; 3-11).
   registerHistoryRoutes(app);
+  // Celular compartido, responsable y completar lo vacío (fase 3, bloque 3.4; D-09, D-11).
+  registerResponsibleRoutes(app);
 }

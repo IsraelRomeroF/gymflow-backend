@@ -152,6 +152,11 @@ export class PulseService {
         overdueCents: tablero.overdueCents,
         outstandingCents: tablero.outstandingCents,
         membersBehind: contar(mora, sedes),
+        // La deuda por sucursal, en cifras y sin nombres (D-25): la cartera del
+        // Tablero (sede de casa del socio) y los atrasados de cada sede.
+        byBranch: tablero.branches
+          .map((b) => ({ branchId: b.branchId, outstandingCents: b.outstandingCents, membersBehind: contar(mora.filter((m) => m.branchId === b.branchId), null) }))
+          .filter((b) => b.outstandingCents > 0n || b.membersBehind > 0),
       },
       // `base` = los vivos más los suspendidos: la misma base que el Tablero para "N de M atrasados".
       members: { active: tablero.activeMembers, base: tablero.membersBase },

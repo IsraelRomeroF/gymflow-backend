@@ -26,6 +26,9 @@ export type DatosDelMensaje = {
   /** El primer día que YA NO cubre el plan (`currentPeriodEnd`): el último día es el anterior. */
   periodEnd: Date | null;
   engagementState: string | null;
+  /** Solo PRICE_CHANGE: lo que pagaba y lo que pagará por periodo. */
+  priceFromCents: bigint | null;
+  priceToCents: bigint | null;
   /** Con cobro en línea no se manda al socio solo al mostrador. */
   enLinea: boolean;
 };
@@ -61,13 +64,19 @@ export function textoDelMensaje(d: DatosDelMensaje): string {
       return `${saludo} Tu plan${d.planName ? ` ${d.planName}` : ''} termina el ${d.periodEnd ? dia(ultimoDia(d.periodEnd)) : 'en unos días'}. Si quieres seguir sin interrupciones, puedes renovarlo en recepción.`;
     case 'WE_MISS_YOU':
       return `${saludo} ${TE_EXTRANAMOS[d.engagementState ?? ''] ?? TE_EXTRANAMOS.DORMANT!}`;
+    case 'PRICE_CHANGE': {
+      // D-19: se avisa antes de su siguiente pago, con el antes y el después. Sin promesas ni disculpas.
+      const plan = d.planName ? `tu plan ${d.planName}` : 'tu plan';
+      const baja = d.priceFromCents !== null && d.priceToCents !== null && d.priceToCents < d.priceFromCents;
+      return `${saludo} Te avisamos que a partir de tu siguiente pago ${plan} ${baja ? 'baja a' : 'cuesta'} ${importe(d.priceToCents)}${d.priceFromCents !== null ? ` (antes ${importe(d.priceFromCents)})` : ''}. Cualquier duda, con gusto te atendemos en recepción.`;
+    }
   }
 }
 
 const corta = (d: Date) => d.toLocaleDateString('es-MX', { timeZone: 'UTC', day: 'numeric', month: 'long' });
 
 /** De qué es, en una línea, para la fila de la lista. */
-export function detalleDelMensaje(d: Pick<DatosDelMensaje, 'kind' | 'concept' | 'dueCents' | 'dueDate' | 'planName' | 'periodEnd' | 'engagementState'>): string {
+export function detalleDelMensaje(d: Pick<DatosDelMensaje, 'kind' | 'concept' | 'dueCents' | 'dueDate' | 'planName' | 'periodEnd' | 'engagementState' | 'priceFromCents' | 'priceToCents'>): string {
   switch (d.kind) {
     case 'PAYMENT_DUE_SOON':
       if (d.dueDate === null) return [d.planName, d.periodEnd ? `su siguiente pago es el ${corta(d.periodEnd)}` : null].filter(Boolean).join(' · ');
@@ -80,5 +89,7 @@ export function detalleDelMensaje(d: Pick<DatosDelMensaje, 'kind' | 'concept' | 
       return [d.planName, d.periodEnd ? `termina el ${corta(ultimoDia(d.periodEnd))}` : null, 'no se renueva solo'].filter(Boolean).join(' · ');
     case 'WE_MISS_YOU':
       return ESTADO_DE_HABITO[d.engagementState ?? '']?.label ?? 'En riesgo';
+    case 'PRICE_CHANGE':
+      return [d.planName, d.priceFromCents !== null && d.priceToCents !== null ? `de ${importe(d.priceFromCents)} a ${importe(d.priceToCents)}` : null, 'desde su siguiente pago'].filter(Boolean).join(' · ');
   }
 }

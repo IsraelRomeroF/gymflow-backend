@@ -36,6 +36,12 @@ export type ConsentInput = {
    * tiempo de la evidencia es el de la firma, no el del visto bueno.
    */
   grantedAt?: Date | null;
+  /**
+   * Quién firmó POR el socio (bloque 3.4, D-10): el tutor de un menor. La
+   * aceptación queda a su nombre, con su celular.
+   */
+  signedByName?: string | null;
+  signedByPhoneE164?: string | null;
 };
 
 /**
@@ -51,6 +57,8 @@ export class ConsentRepository extends TenantRepository {
         input.memberId, input.consentType, input.documentVersion,
         input.documentText ?? '', String(input.granted),
         grantedAt.toISOString(), input.ip ?? '', input.userAgent ?? '',
+        // Solo cuando firmó un tutor: el sello de las firmas de siempre no cambia.
+        ...(input.signedByName ? [input.signedByName, input.signedByPhoneE164 ?? ''] : []),
       ].join('\u0000'))
       .digest('hex');
 
@@ -70,6 +78,8 @@ export class ConsentRepository extends TenantRepository {
         channel: input.channel ?? null,
         assistedByUserId: input.assistedByUserId ?? null,
         evidenceHash,
+        signedByName: input.signedByName ?? null,
+        signedByPhoneE164: input.signedByPhoneE164 ?? null,
       },
       select: {
         id: true, consentType: true, documentVersion: true, granted: true,

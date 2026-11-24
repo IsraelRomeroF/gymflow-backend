@@ -122,7 +122,8 @@ export async function aplicarFila(
       // Precio pactado (16-04, DM-05): como en una venta, el vigente del plan
       // en su sucursal al importar. Sin él, la renovación cobraría el precio
       // de lista de ese día y fallaría si la sede deja de vender el plan.
-      // Cómo lo toca un aumento lo decide D-19; aquí solo queda el dato.
+      // Con D-19 (bloque 3.6) un cambio de precio del plan también le toca: entra
+      // al precio de lista y, como cualquier venta a precio de lista, sigue al plan.
       const pactado = precioPactadoCents ?? plan.priceCents;
       const m = await memberships.create({
         memberId, planId: plan.id, soldAtBranchId: branchId, startDate: inicio, periodStart: inicio, periodEnd: fin,

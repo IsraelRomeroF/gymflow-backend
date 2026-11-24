@@ -7,13 +7,19 @@ import type { PosSaleLineRecord, PosSaleRecord } from './pos-sale.repository.js'
 export const idParam = z.object({ id: z.string().uuid() });
 export const cents = (v: bigint): string => v.toString();
 
-export function serializeProduct(p: ProductRecord) {
+/**
+ * `conCosto`: el costo solo viaja a quien administra el catálogo
+ * (`pos:product:manage`). El mostrador vende sin saber cuánto deja cada cosa.
+ */
+export function serializeProduct(p: ProductRecord, conCosto = false) {
   return {
     id: p.id,
     sku: p.sku,
     name: p.name,
     priceCents: cents(p.priceCents),
     priceLabel: formatMoney(money(p.priceCents)),
+    memberPriceCents: p.memberPriceCents === null ? null : cents(p.memberPriceCents),
+    ...(conCosto ? { costCents: p.costCents === null ? null : cents(p.costCents) } : {}),
     tracksInventory: p.tracksInventory,
     isActive: p.isActive,
   };
@@ -38,6 +44,7 @@ export function serializeSale(s: PosSaleRecord, lines: PosSaleLineRecord[]) {
       quantity: l.quantity,
       unitPriceCents: cents(l.unitPriceCents),
       lineTotalCents: cents(l.lineTotalCents),
+      priceKind: (l.priceKind === 'MEMBER' ? 'MEMBER' : 'PUBLIC') as 'PUBLIC' | 'MEMBER',
     })),
   };
 }

@@ -608,9 +608,9 @@ describe('captación (2.4)', () => {
       expect(r.statusCode).toBe(409);
       expect(r.json().reason).toBe('PHONE_IN_USE');
       expect(r.json().message).toContain(`${mama.firstName} ${mama.lastName}`);
-      expect(r.json().message).toMatch(/Corregir o completar/);
-      // Con la salida que el mensaje propone, pasa: sin celular y con su correo.
-      const ok = await post(`/intakes/${hija.id}/approve`, gerencia, { force: true, corrections: { phoneE164: null, email: `${nombreUnico('hija').toLowerCase()}@prueba.mx` } });
+      // Desde D-09 (fase 3, bloque 3.4) el celular se puede compartir: lo que se pide es anotar al responsable.
+      expect(r.json().message).toMatch(/responsable del número/);
+      const ok = await post(`/intakes/${hija.id}/approve`, gerencia, { responsible: { kind: 'MEMBER', memberId: mama.id } });
       expect(ok.statusCode, ok.body).toBe(201);
     });
 

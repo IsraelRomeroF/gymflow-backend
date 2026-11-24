@@ -6,7 +6,9 @@ import { closeDb, getDb } from '../src/platform/db/client.js';
 import {
   estadoDeCobro, estadoDeFactura, hoyDeCobro, mesDeCobro, motivoDeNoEmitir, venceEl, type FacturaDeMarca,
 } from '../src/modules/tenants/cobro-reglas.js';
+import { primeraVigencia } from '../src/modules/tenants/cobranza-reglas.js';
 import { emitirElMes } from '../src/modules/tenants/platform-billing.jobs.js';
+import { ponerPrecios } from './precios-de-prueba.js';
 import { PlatformBillingRepository } from '../src/modules/tenants/platform-billing.repository.js';
 import { PlatformBillingService } from '../src/modules/tenants/platform-billing.service.js';
 
@@ -110,8 +112,8 @@ describe('cobro de plataforma · API', () => {
     plataforma = await loginPlataforma(app);
     // `platform_prices` es global (23-19): se guardan los que había y se devuelven al terminar.
     preciosDeAntes = await getDb().platformPrice.findMany({ select: { moduleKey: true, monthlyCents: true } });
-    const r = await put('/platform/prices', { prices: [{ key: 'core', monthlyCents: '150000' }, { key: 'cash', monthlyCents: '30000' }, { key: 'classes', monthlyCents: '50000' }] });
-    expect(r.statusCode, r.body).toBe(200);
+    // Directo en la base (bloque 3.11): por la API, un precio que ya existe se ANUNCIA con un mes de aviso (D-38).
+    await ponerPrecios({ core: 150000n, cash: 30000n, classes: 50000n });
   });
   afterAll(async () => {
     const antes = new Map(preciosDeAntes.map((p) => [p.moduleKey, p.monthlyCents]));
@@ -121,31 +123,53 @@ describe('cobro de plataforma · API', () => {
     await app.close(); await closeDb();
   });
 
-  it('precios en lote: una transacción y UN asiento con el antes y el después (23-09)', async () => {
-    const antes = await asientos('platform.catalog.price.update');
+  it('precios en lote: una transacción y UN asiento con el antes y el después (23-09); lo que le cambia a alguna marca se ANUNCIA (D-38)', async () => {
+    // Hace falta al menos una marca con contrato corriendo a la que el cambio le mueva la mensualidad.
+    await marca('Lote');
+    const alMomento = await asientos('platform.catalog.price.update');
+    const anunciados = await asientos('platform.catalog.change.schedule');
     const r = await put('/platform/prices', { prices: [{ key: 'core', monthlyCents: '150100' }, { key: 'cash', monthlyCents: '30000' }, { key: 'classes', monthlyCents: '50100' }] });
     expect(r.statusCode, r.body).toBe(200);
-    // Caja no cambió: no cuenta.
-    expect(r.json().changed).toBe(2);
-    expect(await asientos('platform.catalog.price.update')).toBe(antes + 1);
-    const asiento = await getDb().platformAuditLog.findFirstOrThrow({ where: { action: 'platform.catalog.price.update' }, orderBy: [{ at: 'desc' }, { id: 'desc' }] });
+    // Caja no cambió: no cuenta. Los otros dos no se guardan en el acto: quedan anunciados para la misma factura.
+    expect(r.json().changed).toBe(0);
+    expect(r.json().affected).toBeGreaterThan(0);
+    const lote = r.json().scheduled as Array<{ id: string; moduleKey: string; beforeCents: string; afterCents: string; effectiveFrom: string; status: string }>;
+    expect(lote.map((c) => [c.moduleKey, c.beforeCents, c.afterCents, c.status]).sort()).toEqual([['classes', '50000', '50100', 'PENDING'], ['core', '150000', '150100', 'PENDING']]);
+    expect(lote[0]!.effectiveFrom).toBe(primeraVigencia(hoy));
+    // Un solo asiento para el lote, con el antes, el después, desde cuándo y a cuántas marcas les cambia.
+    expect(await asientos('platform.catalog.price.update')).toBe(alMomento);
+    expect(await asientos('platform.catalog.change.schedule')).toBe(anunciados + 1);
+    const asiento = await getDb().platformAuditLog.findFirstOrThrow({ where: { action: 'platform.catalog.change.schedule' }, orderBy: [{ at: 'desc' }, { id: 'desc' }] });
     expect(asiento.beforeState).toEqual({ prices: { core: '150000', classes: '50000' } });
-    expect((asiento.afterState as { prices: unknown }).prices).toEqual({ core: '150100', classes: '50100' });
+    expect(asiento.afterState).toMatchObject({ prices: { core: '150100', classes: '50100' }, effectiveFrom: primeraVigencia(hoy) });
     expect(asiento.actorUserId).toBeTruthy();
-    // Lo mismo otra vez no cambia nada y no asienta.
-    expect((await put('/platform/prices', { prices: [{ key: 'core', monthlyCents: '150100' }] })).json().changed).toBe(0);
-    expect(await asientos('platform.catalog.price.update')).toBe(antes + 1);
-    // Un concepto que no existe tumba el lote entero: el otro precio no se movió.
-    expect((await put('/platform/prices', { prices: [{ key: 'core', monthlyCents: '999900' }, { key: 'no_existe', monthlyCents: '100' }] })).statusCode).toBe(404);
-    expect((await get('/platform/prices')).json().prices.find((p: { key: string }) => p.key === 'core').monthlyCents).toBe('150100');
-    // El 422 dice qué campo y por qué, en español.
-    const mal = await put('/platform/prices', { prices: [{ key: 'core', monthlyCents: '15.50' }] });
+    // HOY todo cuesta lo mismo; la lista dice qué viene.
+    const core = () => get('/platform/prices').then((x) => x.json().prices.find((p: { key: string }) => p.key === 'core'));
+    expect(await core()).toMatchObject({ monthlyCents: '150000', pending: { monthlyCents: '150100', effectiveFrom: primeraVigencia(hoy) } });
+    // Lo mismo otra vez no cambia nada y no asienta; otro precio encima de uno anunciado se rechaza.
+    expect((await put('/platform/prices', { prices: [{ key: 'core', monthlyCents: '150100' }] })).json()).toMatchObject({ changed: 0, scheduled: [] });
+    expect(await asientos('platform.catalog.change.schedule')).toBe(anunciados + 1);
+    const encima = await put('/platform/prices/core', { monthlyCents: '160000' });
+    expect(encima.statusCode).toBe(409);
+    expect(encima.json().reason).toBe('PRICE_CHANGE_PENDING');
+    // Un concepto que no existe tumba el lote entero: nada se movió.
+    expect((await put('/platform/prices', { prices: [{ key: 'cash', monthlyCents: '999900' }, { key: 'no_existe', monthlyCents: '100' }] })).statusCode).toBe(404);
+    expect((await core()).monthlyCents).toBe('150000');
+    // El 422 dice qué campo y por qué, en español; y una fecha con menos de un mes de aviso no pasa.
+    const mal = await put('/platform/prices', { prices: [{ key: 'cash', monthlyCents: '15.50' }] });
     expect(mal.statusCode).toBe(422);
     expect(JSON.stringify(mal.json())).toMatch(/centavos/);
-    // De vuelta a los de la prueba (la ruta de un solo precio también asienta).
-    expect((await put('/platform/prices/core', { monthlyCents: '150000' })).statusCode).toBe(200);
-    expect((await put('/platform/prices/classes', { monthlyCents: '50000' })).statusCode).toBe(200);
-    expect(await asientos('platform.catalog.price.update')).toBe(antes + 3);
+    const pronto = await put('/platform/prices', { prices: [{ key: 'cash', monthlyCents: '31000' }], effectiveFrom: `${mes}-01` });
+    expect(pronto.statusCode).toBe(422);
+    expect(pronto.json().reason).toBe('PRICE_CHANGE_TOO_SOON');
+    // Cancelar deja todo como estaba, con motivo y asiento.
+    for (const c of lote) {
+      const cancelado = await post(`/platform/price-changes/${c.id}/cancel`, { reason: 'Era una prueba' });
+      expect(cancelado.statusCode, cancelado.body).toBe(200);
+      expect(cancelado.json()).toMatchObject({ status: 'CANCELED', cancelReason: 'Era una prueba' });
+    }
+    expect((await post(`/platform/price-changes/${lote[0]!.id}/cancel`, { reason: 'Otra vez' })).json().reason).toBe('PRICE_CHANGE_CLOSED');
+    expect(await core()).toMatchObject({ monthlyCents: '150000', pending: null });
   });
 
   it('planes de GymFlow: crear y cambiar dejan asiento con lo de antes y lo de ahora (23-09)', async () => {
@@ -442,7 +466,8 @@ describe('cobro de plataforma · API', () => {
     const r = await put(`/platform/organizations/${id}/users/${dueno.id}/sections`, { sections: pedido, reason: 'Prueba de la llave del dueño' });
     expect(r.statusCode, r.body).toBe(200);
     expect(r.json().sections).toEqual(onlyEffectiveSections(pedido, 'OWNER'));
-    expect(r.json().sections).toEqual(['bitacora', 'tablero', '-caja']);
+    // Fase 3 · 3.7 (D-25): Textos de consentimiento ya tiene efecto para la dueña (los lee y firma el aviso).
+    expect(r.json().sections).toEqual(['bitacora', 'tablero', 'consentimientos', '-caja']);
     for (const k of r.json().sections as string[]) expect(effectiveSections('OWNER')).toContain(k.replace(/^-/, ''));
     expect((await put(`/platform/organizations/${id}/users/${dueno.id}/sections`, { sections: null, reason: 'Fin de la prueba' })).json().sections).toBeNull();
   });

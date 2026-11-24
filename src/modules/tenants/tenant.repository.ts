@@ -1,6 +1,7 @@
 import { ROLES, uuidv7, type RoleKey } from '@gymflow/core';
 import { Prisma } from '@gymflow/db';
 import { GlobalRepository } from '../../platform/db/tenant-repository.js';
+import { versionDePlan } from './platform-price-change.repository.js';
 
 /**
  * ALTA DE MARCAS: lo único del sistema que escribe en varios gimnasios.
@@ -14,6 +15,8 @@ export type NuevaMarca = {
   legalName: string; tradeName: string; timezone: string;
   /** Plan de la plataforma contratado; null = a la medida (ADR-039). */
   platformPlanId: string | null;
+  /** La versión del plan con que nace (D-38): lo que el plan vale e incluye hoy. */
+  platformPlanSnapshot?: Prisma.InputJsonObject | null;
   branch: { code: string; name: string; addressLine: string | null; timezone: string | null };
   /**
    * Lo que la marca contrató: lo demás queda marcado como no contratado. En el
@@ -75,6 +78,7 @@ export class TenantRepository extends GlobalRepository {
         // software. Con «Liberar al terminar» nace en uso y ese instante es su liberación.
         data: {
           id: organizationId, legalName: marca.legalName, tradeName: marca.tradeName, timezone: marca.timezone, settings: {}, platformPlanId: marca.platformPlanId,
+          ...(marca.platformPlanSnapshot ? { platformPlanSnapshot: marca.platformPlanSnapshot } : {}),
           ...(marca.liberar ? { serviceStatus: 'ACTIVE' as const, activatedAt: new Date() } : { serviceStatus: 'PENDING' as const }),
         },
       });
@@ -203,6 +207,7 @@ export class TenantRepository extends GlobalRepository {
       where: { id: organizationId, deletedAt: null },
       select: {
         id: true, legalName: true, tradeName: true, timezone: true, billingEmail: true, createdAt: true, serviceStatus: true, activatedAt: true, suspendedAt: true, suspendedReason: true,
+        suspendedAutomatically: true, autoSuspendHoldUntil: true, platformPlanSnapshot: true,
         platformPlan: { select: { id: true, name: true, modules: true, monthlyCents: true } },
       },
     });
@@ -221,12 +226,20 @@ export class TenantRepository extends GlobalRepository {
       this.db.member.count({ where: { organizationId, status: 'ACTIVE', deletedAt: null } }),
       this.db.attendanceEvent.count({ where: { organizationId, at: { gt: new Date(Date.now() - 24 * 3_600_000) } } }),
     ]);
-    const { platformPlan, ...datos } = org;
+    const { platformPlan, platformPlanSnapshot, autoSuspendHoldUntil, ...datos } = org;
+    // La VERSIÓN que la marca tiene del plan (D-38): si el plan tiene un cambio anunciado, ella sigue con lo suyo hasta la fecha.
+    const version = versionDePlan(platformPlanSnapshot);
+    const suya = platformPlan && version?.planId === platformPlan.id ? version : null;
     return {
       ...datos, branches, activeMembers: members, entriesLast24h: today,
+      autoSuspendHoldUntil: autoSuspendHoldUntil ? autoSuspendHoldUntil.toISOString().slice(0, 10) : null,
       /** El plan contratado, ya plano: sus módulos como lista y su precio como texto. */
       plan: platformPlan
-        ? { id: platformPlan.id, name: platformPlan.name, modules: Array.isArray(platformPlan.modules) ? (platformPlan.modules as string[]) : [], monthlyCents: platformPlan.monthlyCents?.toString() ?? null }
+        ? {
+          id: platformPlan.id, name: platformPlan.name,
+          modules: suya ? suya.modules : Array.isArray(platformPlan.modules) ? (platformPlan.modules as string[]) : [],
+          monthlyCents: suya ? suya.monthlyCents : platformPlan.monthlyCents?.toString() ?? null,
+        }
         : null,
       users: users.map(({ roleAssignments, ...u }) => ({
         ...u,
@@ -247,8 +260,12 @@ export class TenantRepository extends GlobalRepository {
     return org?.platformPlanId ?? null;
   }
 
-  async setPlan(organizationId: string, platformPlanId: string | null): Promise<boolean> {
-    const { count } = await this.db.organization.updateMany({ where: { id: organizationId, deletedAt: null }, data: { platformPlanId } });
+  /** El plan y la VERSIÓN que la marca tiene de él (D-38): al asignarlo se guarda lo que vale e incluye ese día. */
+  async setPlan(organizationId: string, platformPlanId: string | null, version: Prisma.InputJsonObject | null = null): Promise<boolean> {
+    const { count } = await this.db.organization.updateMany({
+      where: { id: organizationId, deletedAt: null },
+      data: { platformPlanId, platformPlanSnapshot: platformPlanId && version ? version : Prisma.DbNull },
+    });
     return count > 0;
   }
 
@@ -287,8 +304,9 @@ export class TenantRepository extends GlobalRepository {
       await tx.organization.update({
         where: { id: organizationId },
         data: status === 'ACTIVE'
-          ? { serviceStatus: 'ACTIVE', ...(antes.activatedAt ? {} : { activatedAt: new Date() }), suspendedAt: null, suspendedReason: null }
-          : { serviceStatus: 'SUSPENDED', suspendedAt: new Date(), suspendedReason: reason },
+          ? { serviceStatus: 'ACTIVE', ...(antes.activatedAt ? {} : { activatedAt: new Date() }), suspendedAt: null, suspendedReason: null, suspendedAutomatically: false }
+          // Suspender a mano: ya no es «la suspendió el sistema» aunque antes lo fuera.
+          : { serviceStatus: 'SUSPENDED', suspendedAt: new Date(), suspendedReason: reason, suspendedAutomatically: false },
       });
       return antes.serviceStatus;
     });

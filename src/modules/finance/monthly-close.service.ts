@@ -1,11 +1,11 @@
 import { conflict, isoDate, mesTerminado, validation, type DateRange } from '@gymflow/core';
-import type { MonthlyClose, MonthlyClosePreview, TotalesDelCierre } from '@gymflow/core/contracts';
+import type { CajaDelCierre, MonthlyClose, MonthlyClosePreview, TotalesDelCierre } from '@gymflow/core/contracts';
 import type { RequestContext } from '../../platform/context.js';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { enUnaTransaccion } from '../../platform/db/unit-of-work.js';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 import { ExpensesRepository } from './expenses.repository.js';
-import { monthFigures, type MonthFigures } from './month-figures.js';
+import { monthFigures, type CifrasDeCaja, type CifrasDelMes, type MonthFigures } from './month-figures.js';
 import { MonthlyCloseRepository, type MonthlyCloseRecord } from './monthly-close.repository.js';
 
 /** Hoy en el gimnasio y en cada sede, según el servidor (A3 T9). */
@@ -18,6 +18,15 @@ const MESES_ATRAS = 12;
 
 const NOMBRE_DE_MES = new Intl.DateTimeFormat('es-MX', { month: 'long', timeZone: 'UTC' });
 const nombreDeMes = (mes: string) => NOMBRE_DE_MES.format(new Date(`${mes}-15T12:00:00.000Z`));
+/** «octubre de 2026» (o «Octubre de 2026» para empezar una frase). */
+export const mesLargo = (mes: string, mayuscula = false): string => {
+  const n = nombreDeMes(mes);
+  return `${mayuscula ? n.charAt(0).toUpperCase() + n.slice(1) : n} de ${mes.slice(0, 4)}`;
+};
+/** El texto del bloqueo por cajas abiertas con fecha de ese mes (D-22). */
+const cajasAbiertas = (n: number): string => (n === 1
+  ? 'Hay una caja abierta con fecha de ese mes: haz su corte antes de cerrar, para que entre en la foto.'
+  : `Hay ${n} cajas abiertas con fecha de ese mes: haz sus cortes antes de cerrar, para que entren en la foto.`);
 const diaLargo = (fecha: string) => new Intl.DateTimeFormat('es-MX', { day: 'numeric', month: 'long', timeZone: 'UTC' }).format(new Date(`${fecha}T12:00:00.000Z`));
 
 /**
@@ -49,8 +58,14 @@ export function mesTerminadoEnTodasLasSedes(month: string, fechas: FechasDeNegoc
  * 3. El cierre mismo: la foto y su asiento en la bitácora se confirman JUNTOS
  *    (13-19). Antes, si fallaba el asiento quedaba un mes cerrado sin rastro.
  *
- * No cambia quién cierra ni quién firma (D-22, D-23): eso sigue en la ruta,
- * con `verifyApprover` y `authorize`.
+ * Fase 3, bloque 3.7:
+ *  - D-22 · Las cifras quedan FIJAS. No se cierra con una caja abierta de ese
+ *    mes (bloqueo, antes aviso); la foto es completa (Tablero y Movimientos,
+ *    total y por sucursal, `version: 2`) y el Tablero y Movimientos de un mes
+ *    cerrado se sirven de ella; lo que llega tarde se anota en el mes en
+ *    curso como «ajuste de ‹mes›» (`expenses.routes.ts`, `assertOpen`).
+ *  - D-23 · Sin un gerente que administre, la dueña cierra el mes con su
+ *    contraseña (la ruta la comprueba); queda en la bitácora que cerró sola.
  */
 export class MonthlyCloseService {
   private readonly audit = new AuditService();
@@ -79,11 +94,27 @@ export class MonthlyCloseService {
     const { from } = this.rangoDelMes(month);
     const fin = mesTerminadoEnTodasLasSedes(month, await this.fechasDeNegocio(ctx));
     if (!fin.ok) throw validation(fin.message);
-    if (await new MonthlyCloseRepository(ctx.tenant.organizationId).find(from)) throw conflict('Ese mes ya está cerrado', 'MONTH_ALREADY_CLOSED');
+    const repo = new MonthlyCloseRepository(ctx.tenant.organizationId);
+    if (await repo.find(from)) throw conflict('Ese mes ya está cerrado', 'MONTH_ALREADY_CLOSED');
+    // D-22: con una caja de ese mes abierta, su corte quedaría fuera de la foto.
+    const cajas = await repo.cajasAbiertasDelMes(from, this.rangoDelMes(month).to);
+    if (cajas.length > 0) throw conflict(cajasAbiertas(cajas.length), 'MONTH_HAS_OPEN_CASH');
+  }
+
+  /**
+   * ¿Está abierto el mes de esa fecha de negocio? Revienta con 409
+   * `MONTH_CLOSED` si ya se cerró (D-22). Para lo que otros módulos quieran
+   * impedir con fecha en un mes cerrado; lo tardío se anota en el mes en curso.
+   */
+  async assertOpen(organizationId: string, fecha: Date): Promise<void> {
+    const cierre = await new MonthlyCloseRepository(organizationId).cierreDe(fecha);
+    if (!cierre) return;
+    const mes = cierre.month.toISOString().slice(0, 7);
+    throw conflict(`${mesLargo(mes, true)} ya está cerrado y sus cifras no cambian. Anótalo en el mes en curso como «ajuste de ${mesLargo(mes)}».`, 'MONTH_CLOSED');
   }
 
   /** Lo que va a pasar al cerrar ese mes: bloqueos, avisos y la foto que quedaría. */
-  async vistaPrevia(ctx: RequestContext, month: string): Promise<MonthlyClosePreview> {
+  async vistaPrevia(ctx: RequestContext, month: string, signature: MonthlyClosePreview['signature'] = 'approver'): Promise<MonthlyClosePreview> {
     const orgId = ctx.tenant.organizationId;
     const { from, to } = this.rangoDelMes(month);
     const repo = new MonthlyCloseRepository(orgId);
@@ -101,14 +132,9 @@ export class MonthlyCloseService {
     const fin = mesTerminadoEnTodasLasSedes(month, fechas);
     if (!fin.ok) blockers.push({ code: 'MONTH_NOT_ENDED', message: fin.message });
     if (cerrado) blockers.push({ code: 'ALREADY_CLOSED', message: 'Ese mes ya está cerrado' });
-    if (cajas.length > 0) {
-      warnings.push({
-        code: 'OPEN_CASH_SESSIONS',
-        message: cajas.length === 1
-          ? 'Hay una caja de ese mes todavía abierta: su corte no entra en la foto.'
-          : `Hay ${cajas.length} cajas de ese mes todavía abiertas: sus cortes no entran en la foto.`,
-      });
-    }
+    // D-22: una caja de ese mes abierta IMPIDE cerrar (hasta la fase 2 solo avisaba). Con el mes
+    // todavía en curso no se dice: tener cajas abiertas es lo normal y el bloqueo que cuenta es el otro.
+    if (fin.ok && cajas.length > 0) blockers.push({ code: 'OPEN_CASH_SESSIONS', message: cajasAbiertas(cajas.length) });
     if (fijos.length === 0) warnings.push({ code: 'NO_FIXED_EXPENSES', message: 'No hay gastos fijos registrados en ese mes (renta, nómina): la utilidad sale sin ellos.' });
 
     const { nombres: _n, ...businessDates } = fechas;
@@ -123,6 +149,7 @@ export class MonthlyCloseService {
       businessDates,
       openCashSessions: cajas.map((c) => ({ id: c.id, branchId: c.branchId, registerCode: c.registerCode, openedAt: c.openedAt.toISOString() })),
       fixedExpensesCount: fijos.length,
+      signature,
     };
   }
 
@@ -132,7 +159,7 @@ export class MonthlyCloseService {
    * transacción. `aprobador` es quien firmó (ya verificado por la ruta), o
    * null cuando cierra el dueño con su contraseña (D-23).
    */
-  async cerrar(ctx: RequestContext, input: { month: string; reason: string; note: string | null; aprobador: string | null }): Promise<MonthlyClose> {
+  async cerrar(ctx: RequestContext, input: { month: string; reason: string; note: string | null; aprobador: string | null; conContrasenaPropia?: boolean }): Promise<MonthlyClose> {
     const orgId = ctx.tenant.organizationId;
     const { from, to } = this.rangoDelMes(input.month);
     const repo = new MonthlyCloseRepository(orgId);
@@ -147,7 +174,8 @@ export class MonthlyCloseService {
       const c = await repo.create({ month: from, totals, byBranch, closedByUserId: ctx.tenant.actorUserId!, approvedByUserId: input.aprobador, note: input.note });
       await this.audit.record(ctx, {
         action: 'report.month.close', resourceType: 'MonthlyClose', resourceId: c.id, reason: input.reason, approvedByUserId: input.aprobador,
-        afterState: { month: input.month, ...totals },
+        // La foto completa no cabe en un asiento: van las cifras de siempre.
+        afterState: { month: input.month, ...cifrasDelAsiento(totals), ...(input.conContrasenaPropia ? { ownerClosedAlone: true } : {}) },
       });
       return c;
     });
@@ -195,18 +223,43 @@ export class MonthlyCloseService {
   }
 }
 
-/** La foto de toda la organización, en centavos como texto (ADR-005). */
-function totales(d: MonthFigures): TotalesDelCierre {
+const texto = (v: bigint): string => v.toString();
+
+function caja(c: CifrasDeCaja): CajaDelCierre {
   return {
-    collectedCents: d.collectedCents.toString(), accruedCents: d.accruedCents.toString(), deferredCents: d.deferredCents.toString(),
-    mrrCents: d.mrrCents.toString(), outstandingCents: d.outstandingCents.toString(), overdueCents: d.overdueCents.toString(), activeMembers: d.activeMembers,
-    cashExpensesCents: d.cashExpensesCents.toString(), fixedExpensesCents: d.fixedExpensesCents.toString(), profitCents: d.profitCents.toString(),
+    incomeCents: texto(c.incomeCents), refundsCents: texto(c.refundsCents), expensesCents: texto(c.expensesCents),
+    shortageCents: texto(c.shortageCents), overageCents: texto(c.overageCents), netCents: texto(c.netCents), toBankCents: texto(c.toBankCents),
+    creditNotesCents: texto(c.creditNotesCents), fixedExpensesCents: texto(c.fixedExpensesCents), profitCents: texto(c.profitCents),
+    byMethod: Object.fromEntries(Object.entries(c.byMethod).map(([k, v]) => [k, texto(v)])),
   };
+}
+
+/** Todo lo de un alcance (el gimnasio o una sucursal), en centavos como texto (ADR-005). */
+function completa(d: CifrasDelMes) {
+  return {
+    collectedCents: texto(d.collectedCents), accruedCents: texto(d.accruedCents), deferredCents: texto(d.deferredCents),
+    mrrCents: texto(d.mrrCents), outstandingCents: texto(d.outstandingCents), overdueCents: texto(d.overdueCents), activeMembers: d.activeMembers,
+    cashExpensesCents: texto(d.cashExpensesCents), fixedExpensesCents: texto(d.fixedExpensesCents), profitCents: texto(d.profitCents),
+    cashOverageCents: texto(d.cashOverageCents), ownerDrawsCents: texto(d.ownerDrawsCents), costOfGoodsCents: texto(d.costOfGoodsCents),
+    membersBehind: d.membersBehind, membersBase: d.membersBase, cash: caja(d.cash),
+  };
+}
+
+/** La foto de toda la organización. `version: 2` = completa (3.7): Tablero y Movimientos. */
+function totales(d: MonthFigures): TotalesDelCierre {
+  return { ...completa(d), version: 2 };
 }
 
 function porSede(d: MonthFigures): MonthlyClose['byBranch'] {
   return d.branches.map((b) => ({
-    branchId: b.branchId, collectedCents: b.collectedCents.toString(), accruedCents: b.accruedCents.toString(),
-    outstandingCents: b.outstandingCents.toString(), activeMembers: b.activeMembers,
+    branchId: b.branchId, collectedCents: texto(b.collectedCents), accruedCents: texto(b.accruedCents),
+    outstandingCents: texto(b.outstandingCents), activeMembers: b.activeMembers,
+    ...(b.completa ? completa(b.completa) : {}),
   }));
+}
+
+/** Las cifras del total que van al asiento de bitácora (sin el detalle de caja). */
+function cifrasDelAsiento(t: TotalesDelCierre) {
+  const { cash: _caja, version: _v, ...resto } = t;
+  return resto;
 }

@@ -209,10 +209,14 @@ for (const [tipo, t] of Object.entries(TEXTOS)) {
       .replaceAll('[FECHA]', hoy.toLocaleDateString('es-MX', { dateStyle: 'long' }))
     : t.body;
   const creado = await call<{ id: string }>('POST', '/consent-documents', { consentType: tipo, version: VERSION, title: modelo?.titulo ?? t.title, bodyText: cuerpo });
-  await call('POST', `/consent-documents/${creado.id}/publish`, {
+  const publicado = await call<{ awaitingSignature?: boolean }>('POST', `/consent-documents/${creado.id}/publish`, {
     reason: 'Textos iniciales del gimnasio de pruebas',
     ...(tipo === 'PRIVACY_NOTICE' ? { checklist: LISTA_DEL_AVISO_DE_PRIVACIDAD.map((x) => x.clave) } : {}),
   });
+  // El aviso de privacidad no se publica sin la firma de la dueña (D-25).
+  if (publicado.awaitingSignature) {
+    await call('POST', `/consent-documents/${creado.id}/sign`, { password: 'GymFlow.dev.2026' }, await login('owner@demo.mx'));
+  }
 }
 const vigente = async (tipo: string) =>
   (await call<{ documents: Doc[] }>('GET', '/consent-documents')).documents.find((d) => d.consentType === tipo && d.status === 'PUBLISHED')!.version;

@@ -401,7 +401,8 @@ describe('control de acceso', () => {
     it('es una excepción: sin motivo no se registra; con motivo queda quién, por qué y en la bitácora', async () => {
       const socio = await conMembresiaActiva();
       const pol = (await app.inject({ method: 'GET', url: `/access/manual-policy?branchId=${branchId}&memberId=${socio}`, headers: { cookie: reception } })).json();
-      expect(pol).toEqual({ requiresReason: true, hasBiometric: false });
+      // `faceRequired` (D-06, bloque 3.3): la regla del rostro nace apagada.
+      expect(pol).toEqual({ requiresReason: true, hasBiometric: false, faceRequired: false });
 
       const sin = await intentar(socio, { credentialKind: 'MANUAL', reason: undefined });
       expect(sin.statusCode).toBe(422);

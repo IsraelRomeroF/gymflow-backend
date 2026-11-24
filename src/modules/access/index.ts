@@ -31,6 +31,10 @@ export { EnrollmentRepository } from './enrollment.repository.js';
 // script (`scripts/limpiar-rostros-huerfanos.ts`).
 export { EnrollmentService, type ResumenLimpiezaRostros } from './enrollment.service.js';
 
+// Consumida por: privacy (bloque 3.9, D-32). El cierre diario pregunta qué
+// rostros de exsocios siguen guardados para borrarlos a los 30 días de la baja.
+export { FaceTemplateRepository } from './face-template.repository.js';
+
 // Consumida por: classes. Al entrar, la clase reservada queda con su llegada.
 export { registerEntryHook, type EntryEvent } from './entry-hooks.js';
 

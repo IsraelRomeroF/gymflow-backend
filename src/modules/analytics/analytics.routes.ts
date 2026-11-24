@@ -3,6 +3,7 @@ import { registerDashboardRoutes } from './dashboard.routes.js';
 import { registerMovementsRoutes } from './movements.routes.js';
 import { registerPulseRoutes } from './pulse.routes.js';
 import { registerHomeRoutes } from './home.routes.js';
+import { registerConsultaRoutes } from './consulta.routes.js';
 
 /**
  * Las rutas de la analítica, en tres archivos por lo que muestran (auditoría
@@ -16,4 +17,6 @@ export function registerAnalyticsRoutes(app: FastifyInstance): void {
   registerPulseRoutes(app);
   // «Hoy te toca»: la bandeja del inicio de quien opera (bloque 2.1).
   registerHomeRoutes(app);
+  // Lo que la dueña consulta sin operar: la tienda en cifras y el resumen al firmar (3.7, D-25).
+  registerConsultaRoutes(app);
 }

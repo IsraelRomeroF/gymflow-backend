@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { ApprovalApprovers, ApprovalHistory, ApprovalInbox, ApprovalRequestState, diferenciasConElContrato } from '@gymflow/core/contracts';
 import { approvalExpiryCause, auditPhrase, uuidv7 } from '@gymflow/core';
@@ -35,6 +35,21 @@ describe('firma a distancia · bloque 2.10', () => {
     method: 'POST', url: '/approvals/requests', headers: { cookie: s.gerente },
     payload: { permission: 'cash:withdraw', branchId: sede().id, resourceType: 'CashSession', resourceId: turno, amountCents: importe, summary: 'Retiro a caja fuerte', ...extra },
   });
+  /**
+   * D-03 (bloque 3.2): la misma operación se pide 3 veces por hora y un «no»
+   * se le queda pegado un día. Estas pruebas piden muchas veces el mismo turno
+   * y miran otra cosa: antes de cada una, lo que ya se pidió pasa a ser de
+   * hace dos horas (sigue siendo «de hoy») y los rechazos, de antier.
+   */
+  const pasaElTiempo = async () => {
+    for (const f of await db().approvalRequest.findMany({ where: { organizationId: g.organizationId, createdAt: { gt: new Date(Date.now() - 3_600_000) } } })) {
+      await db().approvalRequest.update({ where: { id: f.id }, data: { createdAt: new Date(f.createdAt.getTime() - 2 * 3_600_000) } });
+    }
+  };
+  const olvidarRechazos = () => db().approvalRequest.updateMany({
+    where: { organizationId: g.organizationId, status: 'REJECTED', decidedAt: { gt: new Date(Date.now() - 24 * 3_600_000) } }, data: { decidedAt: new Date(Date.now() - 48 * 3_600_000) },
+  });
+  beforeEach(async () => { await pasaElTiempo(); await olvidarRechazos(); });
   const estado = (id: string, cookie = s.gerente) => app.inject({ method: 'GET', url: `/approvals/requests/${id}`, headers: { cookie } });
   const firmantes = async () => {
     const r = await app.inject({ method: 'GET', url: `/approvals/approvers?permission=cash:withdraw&branchId=${sede().id}&amountCents=15000`, headers: { cookie: s.gerente } });
@@ -161,6 +176,8 @@ describe('firma a distancia · bloque 2.10', () => {
     const aprobada = (await retiro('20000', { reason: 'Corte de la tarde' })).json().id as string;
     const rechazada = (await retiro('21000')).json().id as string;
     const cancelada = (await retiro('22000')).json().id as string;
+    // Tres del mismo turno en una hora es el tope (D-03): las que siguen se piden «más tarde».
+    await pasaElTiempo();
     const vencida = (await retiro('23000')).json().id as string;
     const pendiente = (await retiro('24000')).json().id as string;
     // Una de otro gerente, sobre un socio: la dueña la ve; el primer gerente no.

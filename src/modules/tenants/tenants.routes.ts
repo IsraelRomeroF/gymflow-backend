@@ -2,7 +2,8 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { ASSIGNABLE_ROLES, onlyEffectiveSections, MODULES, MODULE_BY_KEY, MODULE_GROUPS, MODULE_TEMPLATES, auditLabel, esFechaDeCalendario, isRoleKey, normalizePhoneMx, notFound, validation } from '@gymflow/core';
 import {
-  PlatformOrganizationCreated, PlatformOrganizationDetail, PlatformOrganizationList, PlatformServiceChanged, PlatformUserCreated,
+  PlatformCollectionsBoard, PlatformCollectionsHold, PlatformNotice, PlatformOrganizationCreated, PlatformOrganizationDetail, PlatformOrganizationList,
+  PlatformPriceChange, PlatformPriceChangeList, PlatformPriceChangePreview, PlatformServiceChanged, PlatformUserCreated,
 } from '@gymflow/core/contracts';
 import { readFileSync } from 'node:fs';
 import { AuditService } from '../../platform/audit/audit.service.js';
@@ -17,6 +18,9 @@ import { TenantRepository } from './tenant.repository.js';
 import { TenantService } from './tenant.service.js';
 import { FORMAS_DE_PAGO, PIDE_REFERENCIA, PlatformBillingService } from './platform-billing.service.js';
 import { diaDeCobroDe, esMes } from './cobro-reglas.js';
+import { PlatformCollectionsService } from './cobranza.service.js';
+import { PlatformPricingService } from './platform-pricing.service.js';
+import { registerGymAccountRoutes } from './cuenta-con-gymflow.routes.js';
 import { PlatformPlanRepository } from './platform-plan.repository.js';
 import type { Env } from '../../platform/env.js';
 
@@ -89,6 +93,12 @@ export function registerTenantRoutes(app: FastifyInstance, env: Env): void {
   const service = new TenantService();
   const repo = new TenantRepository();
   const cobro = new PlatformBillingService();
+  /** La escalera de cobranza (D-37) y los cambios con un mes de aviso (D-38): bloque 3.11. */
+  const cobranza = new PlatformCollectionsService();
+  const vigencias = new PlatformPricingService();
+  /** Día 1 de un mes, `AAAA-MM-01`: desde qué factura aplica un cambio anunciado. */
+  const desdeFactura = z.string().regex(/^\d{4}-(0[1-9]|1[0-2])-01$/, 'Escribe el día 1 del mes desde el que aplica, como AAAA-MM-01');
+  registerGymAccountRoutes(app);
   const planes = new PlatformPlanRepository();
   /** La cadena de plataforma: lo que solo pasa en la consola se asienta aquí (24-19, 23-09). */
   const cadena = new PlatformAuditService();
@@ -251,24 +261,41 @@ export function registerTenantRoutes(app: FastifyInstance, env: Env): void {
     security: { kind: 'platform' },
     handler: async (request) => {
       const { id } = idParam.parse(request.params);
-      const body = planBody.partial().extend({ isActive: z.boolean().optional() }).parse(request.body);
-      const antes = await planes.find(id);
-      if (!antes) throw notFound('Plan no encontrado');
-      const plan = await planes.update(id, {
+      const body = planBody.partial().extend({ isActive: z.boolean().optional(), effectiveFrom: desdeFactura.optional() }).parse(request.body);
+      // D-38: el precio y los módulos de un plan que alguna marca tiene NO cambian en el acto;
+      // se anuncian para una fecha y hasta entonces cada marca conserva su versión.
+      const { plan, antes, scheduled, affected } = await vigencias.actualizarPlan(id, {
         ...(body.name !== undefined ? { name: body.name } : {}),
         ...(body.description !== undefined ? { description: body.description } : {}),
         ...(body.modules !== undefined ? { modules: modulosValidos(body.modules) } : {}),
         ...(body.monthlyCents !== undefined ? { monthlyCents: body.monthlyCents ? BigInt(body.monthlyCents) : null } : {}),
         ...(body.isActive !== undefined ? { isActive: body.isActive } : {}),
         ...(body.sortOrder !== undefined ? { sortOrder: body.sortOrder } : {}),
-      });
-      if (!plan) throw notFound('Plan no encontrado');
-      // Qué costaba y qué incluía antes, y cómo quedó (23-09): un plan cambia lo que pagan sus marcas.
-      await cadena.record(platformActor(request), {
-        action: 'platform.catalog.plan.update', resourceType: 'PlatformPlan', resourceId: plan.id,
-        beforeState: estadoDePlan(antes), afterState: estadoDePlan(plan),
-      });
-      return planPlano(plan);
+      }, platformActor(request), { effectiveFrom: body.effectiveFrom });
+      // Lo que cambió EN EL ACTO, con lo que costaba y lo que incluía antes (23-09). Lo anunciado tiene su propio asiento.
+      if (JSON.stringify(estadoDePlan(antes)) !== JSON.stringify(estadoDePlan(plan)) || antes.description !== plan.description || antes.sortOrder !== plan.sortOrder) {
+        await cadena.record(platformActor(request), {
+          action: 'platform.catalog.plan.update', resourceType: 'PlatformPlan', resourceId: plan.id,
+          beforeState: estadoDePlan(antes), afterState: estadoDePlan(plan),
+        });
+      }
+      return { ...planPlano(plan), scheduled, affected };
+    },
+  });
+
+  /** Qué pasaría al cambiar el precio o los módulos de un plan (D-38): desde cuándo y a qué marcas les mueve la mensualidad. No guarda nada. */
+  route(app, {
+    method: 'POST',
+    url: '/platform/plans/:id/change-preview',
+    security: { kind: 'platform' },
+    schema: respuesta(200, PlatformPriceChangePreview),
+    handler: async (request) => {
+      const { id } = idParam.parse(request.params);
+      const body = z.object({ modules: z.array(z.string().min(2).max(40)).max(20).optional(), monthlyCents: centavos.nullable().optional(), effectiveFrom: desdeFactura.optional() }).parse(request.body);
+      return vigencias.vistaPreviaDePlan(id, {
+        ...(body.modules !== undefined ? { modules: modulosValidos(body.modules) } : {}),
+        ...(body.monthlyCents !== undefined ? { monthlyCents: body.monthlyCents ? BigInt(body.monthlyCents) : null } : {}),
+      }, body.effectiveFrom);
     },
   });
 
@@ -406,7 +433,9 @@ export function registerTenantRoutes(app: FastifyInstance, env: Env): void {
       const { id } = idParam.parse(request.params);
       const { status, reason } = z.object({ status: z.enum(['ACTIVE', 'SUSPENDED']), reason: z.string().trim().min(3, 'Escribe el motivo: queda en la bitácora').max(300) }).parse(request.body);
       const action = await service.cambiarServicio(id, status, request.platform!.userId, reason);
-      return { ok: true as const, serviceStatus: status, action };
+      // D-37: reanudar a quien todavía debe algo vencido le da una prórroga; sin ella, el cierre de mañana la volvería a suspender.
+      const reanudada = action === 'platform.service.resume' ? await cobranza.alReanudar(id, request.platform!.userId) : null;
+      return { ok: true as const, serviceStatus: status, action, ...(reanudada?.holdUntil ? { holdUntil: reanudada.holdUntil } : {}) };
     },
   });
 
@@ -582,11 +611,50 @@ export function registerTenantRoutes(app: FastifyInstance, env: Env): void {
     url: '/platform/prices',
     security: { kind: 'platform' },
     handler: async (request) => {
-      const { prices } = z.object({
+      const { prices, effectiveFrom } = z.object({
         prices: z.array(z.object({ key: z.string().min(2).max(40), monthlyCents: centavos })).min(1, 'No hay ningún precio que guardar').max(40),
+        effectiveFrom: desdeFactura.optional(),
       }).parse(request.body);
-      const { changed } = await cobro.setPrices(prices.map((x) => ({ key: x.key, monthlyCents: BigInt(x.monthlyCents) })), platformActor(request));
-      return { changed, prices: await cobro.prices() };
+      // D-38: lo que le mueve la mensualidad a alguna marca se ANUNCIA (`scheduled`); lo demás queda en el acto (`changed`).
+      const r = await vigencias.setPrices(prices.map((x) => ({ key: x.key, monthlyCents: BigInt(x.monthlyCents) })), platformActor(request), { effectiveFrom });
+      return { ...r, prices: await cobro.prices() };
+    },
+  });
+
+  /** Qué pasaría al guardar esos precios (D-38): desde cuándo aplican y a qué marcas les mueven la mensualidad. No guarda nada. */
+  route(app, {
+    method: 'POST',
+    url: '/platform/prices/preview',
+    security: { kind: 'platform' },
+    schema: respuesta(200, PlatformPriceChangePreview),
+    handler: async (request) => {
+      const { prices, effectiveFrom } = z.object({
+        prices: z.array(z.object({ key: z.string().min(2).max(40), monthlyCents: centavos })).min(1).max(40),
+        effectiveFrom: desdeFactura.optional(),
+      }).parse(request.body);
+      return vigencias.vistaPreviaDePrecios(prices.map((x) => ({ key: x.key, monthlyCents: BigInt(x.monthlyCents) })), effectiveFrom);
+    },
+  });
+
+  /** Los cambios de precio y de plan anunciados, y los últimos aplicados o cancelados (D-38). */
+  route(app, {
+    method: 'GET',
+    url: '/platform/price-changes',
+    security: { kind: 'platform' },
+    schema: respuesta(200, PlatformPriceChangeList),
+    handler: async () => vigencias.lista(),
+  });
+
+  /** Cancelar un cambio anunciado que todavía no aplica: todo sigue como estaba, y a quien ya se le avisó se le avisa que ya no aplica. */
+  route(app, {
+    method: 'POST',
+    url: '/platform/price-changes/:id/cancel',
+    security: { kind: 'platform' },
+    schema: respuesta(200, PlatformPriceChange),
+    handler: async (request) => {
+      const { id } = idParam.parse(request.params);
+      const { reason } = motivo.parse(request.body);
+      return vigencias.cancelar(id, reason, platformActor(request));
     },
   });
 
@@ -596,9 +664,9 @@ export function registerTenantRoutes(app: FastifyInstance, env: Env): void {
     security: { kind: 'platform' },
     handler: async (request) => {
       const { key } = z.object({ key: z.string().min(2).max(40) }).parse(request.params);
-      const { monthlyCents } = z.object({ monthlyCents: centavos }).parse(request.body);
-      await cobro.setPrices([{ key, monthlyCents: BigInt(monthlyCents) }], platformActor(request));
-      return { prices: await cobro.prices() };
+      const { monthlyCents, effectiveFrom } = z.object({ monthlyCents: centavos, effectiveFrom: desdeFactura.optional() }).parse(request.body);
+      const r = await vigencias.setPrices([{ key, monthlyCents: BigInt(monthlyCents) }], platformActor(request), { effectiveFrom });
+      return { ...r, prices: await cobro.prices() };
     },
   });
 
@@ -609,7 +677,45 @@ export function registerTenantRoutes(app: FastifyInstance, env: Env): void {
     security: { kind: 'platform' },
     handler: async (request) => {
       const { id } = idParam.parse(request.params);
-      return cobro.resumen(id);
+      // Con su cobranza (D-37): cuándo se suspendería, por qué no, su prórroga y los avisos que se le han dado.
+      const [resumen, suya] = await Promise.all([cobro.resumen(id), cobranza.deMarca(id)]);
+      return { ...resumen, ...suya };
+    },
+  });
+
+  // ── Escalera de cobranza (D-37, bloque 3.11; ADR-046) ──────────────────────
+
+  /** Quién se suspende y cuándo, a quién no se le puede suspender porque el aviso no le ha llegado, y los avisos por mandar. */
+  route(app, {
+    method: 'GET',
+    url: '/platform/collections',
+    security: { kind: 'platform' },
+    schema: respuesta(200, PlatformCollectionsBoard),
+    handler: async () => cobranza.tablero(),
+  });
+
+  /** «Ya se lo mandé»: una persona de GymFlow le mandó el aviso al dueño (WhatsApp, llamada). Desde hoy hay constancia de entrega. */
+  route(app, {
+    method: 'POST',
+    url: '/platform/notices/:id/sent',
+    security: { kind: 'platform' },
+    schema: respuesta(200, PlatformNotice),
+    handler: async (request) => {
+      const { id } = idParam.parse(request.params);
+      return cobranza.marcarMandado(id, request.platform!.userId);
+    },
+  });
+
+  /** Prórroga: hasta ese día, incluido, la suspensión automática no toca a la marca. `until: null` la quita. */
+  route(app, {
+    method: 'PUT',
+    url: '/platform/organizations/:id/collections-hold',
+    security: { kind: 'platform' },
+    schema: respuesta(200, PlatformCollectionsHold),
+    handler: async (request) => {
+      const { id } = idParam.parse(request.params);
+      const { until, reason } = motivo.extend({ until: z.string().refine(esFechaDeCalendario, 'Escribe la fecha como AAAA-MM-DD').nullable() }).parse(request.body);
+      return cobranza.prorroga(id, until, reason, platformActor(request));
     },
   });
 
@@ -643,7 +749,8 @@ export function registerTenantRoutes(app: FastifyInstance, env: Env): void {
       const f = await cobro.factura(id);
       if (!f) throw notFound('Factura no encontrada');
       const marca = await repo.marca(f.organizationId);
-      return { ...f, organization: marca ? { tradeName: marca.tradeName, legalName: marca.legalName } : null };
+      // El estado del servicio, para ofrecer «Reanudar» al registrar el pago (D-37).
+      return { ...f, organization: marca ? { tradeName: marca.tradeName, legalName: marca.legalName, serviceStatus: marca.serviceStatus, suspendedAutomatically: marca.suspendedAutomatically } : null };
     },
   });
 
@@ -666,6 +773,8 @@ export function registerTenantRoutes(app: FastifyInstance, env: Env): void {
         paidOn: z.string().refine(esFechaDeCalendario, 'Escribe la fecha como AAAA-MM-DD').optional(),
         paidAt: z.coerce.date().optional(),
         note: z.string().trim().max(300).optional(),
+        /** D-37: reanudar el servicio en el mismo paso, si la marca está suspendida. */
+        resume: z.boolean().optional(),
       }).superRefine((b, ctx) => {
         if (PIDE_REFERENCIA.has(b.paymentMethod) && !b.paymentRef) {
           ctx.addIssue({ code: 'custom', path: ['paymentRef'], message: b.paymentMethod === 'CARD' ? 'Escribe la referencia: la autorización o los últimos dígitos de la tarjeta' : 'Escribe la referencia: la clave de rastreo del SPEI' });
@@ -675,7 +784,7 @@ export function registerTenantRoutes(app: FastifyInstance, env: Env): void {
       return cobro.pagar(id, request.platform!.userId, {
         amountCents: body.amountCents !== undefined ? BigInt(body.amountCents) : undefined,
         paidOn: body.paidOn ?? (body.paidAt ? diaDeCobroDe(body.paidAt) : undefined),
-        paymentMethod: body.paymentMethod, paymentRef: body.paymentRef, note: body.note,
+        paymentMethod: body.paymentMethod, paymentRef: body.paymentRef, note: body.note, resume: body.resume,
       });
     },
   });

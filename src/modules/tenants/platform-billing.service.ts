@@ -7,9 +7,11 @@ import {
   DIAS_PARA_DESHACER, diaDeCobroDe, diasDeAtraso, esMes, estadoDeCobro, estadoDeFactura, hoyDeCobro, motivoDeNoEmitir, periodoDe, saldoDe, tieneLaDelMes, venceEl,
   type EstadoDeCobro, type FacturaDeMarca, type MotivoDeNoEmitir,
 } from './cobro-reglas.js';
+import { PlatformCollectionsService } from './cobranza.service.js';
 import { PlatformBillingRepository, type Factura, type LineaFactura, type MarcaParaCobro, type Pago } from './platform-billing.repository.js';
 import { PlatformPlanRepository, type PlanDePlataforma } from './platform-plan.repository.js';
-import { TenantRepository } from './tenant.repository.js';
+import { TenantService } from './tenant.service.js';
+import { cargarVigencias, type PlanVigente, type Vigencias } from './vigencias.js';
 
 export type { EstadoDeCobro } from './cobro-reglas.js';
 
@@ -58,36 +60,22 @@ export type ResultadoDeEmitirMes = {
 export class PlatformBillingService {
   private readonly repo = new PlatformBillingRepository();
   private readonly planes = new PlatformPlanRepository();
-  private readonly marcas = new TenantRepository();
   private readonly audit = new AuditService();
   private readonly cadena = new PlatformAuditService();
+  private readonly cobranza = new PlatformCollectionsService();
 
+  /** Los precios de HOY y, si alguno tiene un cambio anunciado, desde cuándo y a cuánto (D-38). */
   async prices() {
-    const precios = await this.repo.prices();
-    return MODULES.filter((m) => m.kind === 'optional' || m.key === 'core').map((m) => ({
-      key: m.key, name: m.key === 'core' ? 'Lo básico (software)' : m.name, monthlyCents: precios.get(m.key)?.toString() ?? null,
-    }));
-  }
-
-  /**
-   * Fija uno o varios precios de una vez: una transacción y UN asiento en la
-   * cadena de plataforma con lo que costaba antes y lo que cuesta ahora (23-09).
-   */
-  async setPrices(cambios: ReadonlyArray<{ key: string; monthlyCents: bigint }>, actor: PlatformActor): Promise<{ changed: number }> {
-    for (const c of cambios) {
-      const def = MODULE_BY_KEY.get(c.key);
-      if (!def || (def.kind !== 'optional' && def.key !== 'core')) throw notFound('Módulo no encontrado');
-      if (c.monthlyCents < 0n) throw validation('El precio no puede ser negativo');
-    }
-    const hechos = await this.repo.setPrices(cambios.map((c) => ({ moduleKey: c.key, monthlyCents: c.monthlyCents })), actor.userId);
-    if (hechos.length > 0) {
-      await this.cadena.record(actor, {
-        action: 'platform.catalog.price.update', resourceType: 'PlatformPrice', resourceId: hechos.length === 1 ? hechos[0]!.moduleKey : null,
-        beforeState: { prices: Object.fromEntries(hechos.map((h) => [h.moduleKey, h.beforeCents?.toString() ?? null])) },
-        afterState: { prices: Object.fromEntries(hechos.map((h) => [h.moduleKey, h.afterCents.toString()])), changed: hechos.length, concepts: hechos.map((h) => (h.moduleKey === 'core' ? 'Lo básico' : MODULE_BY_KEY.get(h.moduleKey)?.name ?? h.moduleKey)) },
-      });
-    }
-    return { changed: hechos.length };
+    const vigencias = await cargarVigencias();
+    const precios = vigencias.preciosEn(hoyDeCobro());
+    const anunciados = new Map(vigencias.pendientes().filter((c) => c.kind === 'PRICE').map((c) => [c.moduleKey!, c]));
+    return MODULES.filter((m) => m.kind === 'optional' || m.key === 'core').map((m) => {
+      const cambio = anunciados.get(m.key);
+      return {
+        key: m.key as string, name: m.key === 'core' ? 'Lo básico (software)' : m.name, monthlyCents: precios.get(m.key)?.toString() ?? null,
+        pending: cambio ? { id: cambio.id, monthlyCents: cambio.after.monthlyCents, effectiveFrom: iso(cambio.effectiveFrom) } : null,
+      };
+    });
   }
 
   /**
@@ -96,15 +84,37 @@ export class PlatformBillingService {
    * Sin plan, o con un plan sin precio: lo básico más lo contratado, módulo
    * por módulo.
    */
-  async mensualidad(organizationId: string, preciosCargados?: Map<string, bigint>): Promise<Cuota> {
-    const [precios, vista, planId] = await Promise.all([preciosCargados ?? this.repo.prices(), moduleViewOf(organizationId), this.marcas.planIdOf(organizationId)]);
-    const plan = planId ? await this.planes.find(planId) : null;
+  async mensualidad(organizationId: string, opciones: { dia?: string | undefined; vigencias?: Vigencias | undefined } = {}): Promise<Cuota> {
+    const dia = opciones.dia ?? hoyDeCobro();
+    const [vigencias, vista, marca] = await Promise.all([opciones.vigencias ?? cargarVigencias(), moduleViewOf(organizationId), this.repo.organization(organizationId)]);
+    if (!marca) throw notFound('Marca no encontrada');
+    const catalogo = new Map<string, PlanDePlataforma>();
+    if (marca.platformPlanId) { const vivo = await this.planes.find(marca.platformPlanId); if (vivo) catalogo.set(vivo.id, vivo); }
     const contratados = MODULES.filter((m) => m.kind === 'optional' && vista.contracted(m.key)).map((m) => m.key as string);
-    return this.cuota(precios, contratados, plan);
+    // Lo que vale ESE día (D-38): el precio y el plan de un mes pasado o de uno ya anunciado, no los de hoy a secas.
+    return this.cuota(vigencias.preciosEn(dia), vigencias.agregadosEn(marca, contratados, dia), vigencias.planEn(marca, catalogo, dia));
+  }
+
+  /**
+   * La mensualidad de TODAS las marcas un día dado, con lo ya cargado: la usan
+   * el panorama y la vista previa de un cambio de precio (cuánto paga cada
+   * marca hoy y cuánto pagará desde la fecha avisada).
+   */
+  async mensualidades(dia: string, vigencias: Vigencias): Promise<Map<string, Cuota & { marca: MarcaParaCobro }>> {
+    const [marcas, contratacion, planes] = await Promise.all([this.repo.organizations(), this.repo.contratacion(), this.planes.list()]);
+    const catalogo = new Map<string, PlanDePlataforma>(planes.map((p) => [p.id, p]));
+    const opcionales = MODULES.filter((m) => m.kind === 'optional').map((m) => m.key as string);
+    const precios = vigencias.preciosEn(dia);
+    const salida = new Map<string, Cuota & { marca: MarcaParaCobro }>();
+    for (const m of marcas) {
+      const suya = contratacion.get(m.id);
+      salida.set(m.id, { ...this.cuota(precios, vigencias.agregadosEn(m, opcionales.filter((k) => !suya?.noContratados.has(k)), dia), vigencias.planEn(m, catalogo, dia)), marca: m });
+    }
+    return salida;
   }
 
   /** La cuenta de la mensualidad, sin consultar nada: precios, lo contratado y el plan ya vienen cargados. */
-  private cuota(precios: Map<string, bigint>, contratados: readonly string[], plan: Pick<PlanDePlataforma, 'id' | 'name' | 'modules' | 'monthlyCents'> | null): Cuota {
+  private cuota(precios: Map<string, bigint>, contratados: readonly string[], plan: PlanVigente | null): Cuota {
     const nombre = (k: string) => (k === 'core' ? 'Lo básico (software)' : MODULE_BY_KEY.get(k)!.name);
     const lines: LineaFactura[] = [];
     const sinPrecio: string[] = [];
@@ -126,13 +136,23 @@ export class PlatformBillingService {
   /** La ficha de una marca: sus facturas, su mensualidad de hoy, su estado de cobro y los meses que se le pueden facturar. */
   async resumen(organizationId: string, ahora = new Date()) {
     const hoy = hoyDeCobro(ahora);
-    const [marca, facturas, cuota] = await Promise.all([this.repo.organization(organizationId), this.repo.invoices(organizationId), this.mensualidad(organizationId)]);
+    const vigencias = await cargarVigencias();
+    const [marca, facturas, cuota] = await Promise.all([this.repo.organization(organizationId), this.repo.invoices(organizationId), this.mensualidad(organizationId, { dia: hoy, vigencias })]);
     if (!marca) throw notFound('Marca no encontrada');
+    // Lo que ya está anunciado (D-38): la primera fecha en que su mensualidad será otra.
+    let upcoming: { effectiveFrom: string; lines: LineaFactura[]; totalCents: string } | null = null;
+    for (const fecha of [...new Set(vigencias.pendientes().map((c) => iso(c.effectiveFrom)))].sort()) {
+      const futura = await this.mensualidad(organizationId, { dia: fecha, vigencias });
+      if (futura.totalCents !== cuota.totalCents || futura.lines.map((l) => l.key).join() !== cuota.lines.map((l) => l.key).join()) { upcoming = { effectiveFrom: fecha, lines: futura.lines, totalCents: futura.totalCents.toString() }; break; }
+    }
     const estado = estadoDeCobro({ facturas: facturas.map(paraEstado), serviceStatus: marca.serviceStatus, sinPrecio: cuota.sinPrecio.length > 0, liberadaEl: liberadaEl(marca), hoy });
     return {
       month: hoy.slice(0, 7),
       invoices: facturas.map((f) => serializar(f, hoy)),
       monthly: { lines: cuota.lines, totalCents: cuota.totalCents.toString(), missingPrices: cuota.sinPrecio },
+      /** La mensualidad que ya se le anunció para una fecha próxima, si cambia. */
+      upcoming,
+      serviceStatus: marca.serviceStatus,
       status: { code: estado.code, overdueDays: estado.overdueDays, pendingCents: estado.pendingCents.toString() },
       /** Los meses que el diálogo de emitir ofrece: del más reciente al de la liberación, a lo más doce. */
       billableMonths: mesesFacturables(liberadaEl(marca), hoy).map((mes) => ({ month: mes, invoiced: facturas.some((f) => f.status !== 'VOID' && iso(f.periodStart).slice(0, 7) === mes) })),
@@ -155,11 +175,8 @@ export class PlatformBillingService {
     const hoy = hoyDeCobro(ahora);
     const { inicio } = periodoDe(hoy.slice(0, 7));
     // Todo se carga una vez para todas las marcas (22-15): la lista ya no consulta marca por marca.
-    const [marcas, precios, facturas, contratacion, planes] = await Promise.all([
-      this.repo.organizations(), this.repo.prices(), this.repo.forStatus(inicio), this.repo.contratacion(), this.planes.list(),
-    ]);
-    const planPorId = new Map(planes.map((p) => [p.id, p]));
-    const opcionales = MODULES.filter((m) => m.kind === 'optional').map((m) => m.key as string);
+    const [facturas, cuotas] = await Promise.all([this.repo.forStatus(inicio), this.mensualidades(hoy, await cargarVigencias())]);
+    const marcas = [...cuotas.values()].map((c) => c.marca);
     const porMarca = new Map<string, FacturaDeMarca[]>();
     for (const f of facturas) porMarca.set(f.organizationId, [...(porMarca.get(f.organizationId) ?? []), paraEstado(f)]);
     let total = 0n; let enUso = 0; let sinDelMes = 0;
@@ -170,8 +187,7 @@ export class PlatformBillingService {
       let sinPrecio = false;
       if (m.serviceStatus === 'ACTIVE') {
         // La misma cuenta que `mensualidad`, con lo ya cargado: contratado = no marcado como «no contratado».
-        const suya = contratacion.get(m.id);
-        const cuota = this.cuota(precios, opcionales.filter((k) => !suya?.noContratados.has(k)), suya?.planId ? planPorId.get(suya.planId) ?? null : null);
+        const cuota = cuotas.get(m.id)!;
         enUso += 1; total += cuota.totalCents;
         sinPrecio = cuota.sinPrecio.length > 0;
         if (sinPrecio) missing.push({ organizationId: m.id, tradeName: m.tradeName, modules: cuota.sinPrecio });
@@ -206,14 +222,15 @@ export class PlatformBillingService {
       // El lote es de las marcas en uso; la suspendida sale «se salta» para que se vea a quién no se le cobra.
       marcas = (await this.repo.organizations()).filter((m) => m.serviceStatus === 'ACTIVE' || m.serviceStatus === 'SUSPENDED');
     }
-    const [precios, conFactura] = await Promise.all([this.repo.prices(), this.repo.organizationsWithInvoiceFor(inicio)]);
+    // Los precios y el plan del MES que se factura (D-38): su día 1.
+    const [vigencias, conFactura] = await Promise.all([cargarVigencias(), this.repo.organizationsWithInvoiceFor(inicio)]);
     const toIssue: PorEmitir[] = [];
     const skipped: Saltada[] = [];
     for (const m of marcas) {
       const de = { organizationId: m.id, tradeName: m.tradeName };
       try {
         // A la que no está en uso no se le calcula nada: no se le factura.
-        const cuota: Cuota = m.serviceStatus === 'ACTIVE' ? await this.mensualidad(m.id, precios) : { lines: [], totalCents: 0n, sinPrecio: [] };
+        const cuota: Cuota = m.serviceStatus === 'ACTIVE' ? await this.mensualidad(m.id, { dia: inicio, vigencias }) : { lines: [], totalCents: 0n, sinPrecio: [] };
         const no = motivoDeNoEmitir({ mes, hoy, serviceStatus: m.serviceStatus, liberadaEl: liberadaEl(m), yaTieneFactura: conFactura.has(m.id), sinPrecio: cuota.sinPrecio, totalCents: cuota.totalCents });
         if (no) skipped.push({ ...de, reason: no.texto, code: no.reason, ...(no.reason === 'MISSING_PRICES' ? { missingPrices: cuota.sinPrecio } : {}) });
         else toIssue.push({ ...de, totalCents: cuota.totalCents.toString(), lines: cuota.lines });
@@ -257,6 +274,8 @@ export class PlatformBillingService {
       action: 'platform.invoice.issue', resourceType: 'PlatformInvoice', resourceId: factura.id,
       afterState: { folio: factura.folio, periodStart: iso(factura.periodStart), totalCents: factura.totalCents.toString(), byPlatformUserId: byUserId },
     });
+    // D-37: el dueño se entera el día que se emite. Si el aviso no sale, la corrida diaria lo crea.
+    await this.cobranza.avisarEmision(factura, ahora);
     return serializar(factura, hoy);
   }
 
@@ -303,7 +322,7 @@ export class PlatformBillingService {
    * tarjeta (23-08, 23-16). Con abonos la factura sigue pendiente hasta que
    * sus pagos la cubren.
    */
-  async pagar(id: string, byUserId: string, input: { amountCents?: bigint | undefined; paidOn?: string | undefined; paymentMethod: string; paymentRef?: string | undefined; note?: string | undefined }, ahora = new Date()): Promise<FacturaConPagosJson> {
+  async pagar(id: string, byUserId: string, input: { amountCents?: bigint | undefined; paidOn?: string | undefined; paymentMethod: string; paymentRef?: string | undefined; note?: string | undefined; /** Reanudar el servicio en el mismo paso, si la marca está suspendida (D-37). */ resume?: boolean | undefined }, ahora = new Date()): Promise<FacturaConPagosJson & { service: ServicioTrasElPago }> {
     const hoy = hoyDeCobro(ahora);
     const paidOn = input.paidOn ?? hoy;
     if (paidOn > hoy) throw validation('La fecha del pago no puede ser posterior a hoy');
@@ -325,7 +344,25 @@ export class PlatformBillingService {
         paymentId: r.pago.id, paymentMethod: r.pago.paymentMethod, paymentRef: r.pago.paymentRef, paidOn, byPlatformUserId: byUserId,
       },
     });
-    return this.conPagos(f, ahora);
+    if (f.status === 'PAID') await this.cobranza.alCerrarFactura(f, 'PAID', ahora);
+    return { ...(await this.conPagos(f, ahora)), service: await this.servicioTrasElPago(f, byUserId, input.resume === true, ahora) };
+  }
+
+  /**
+   * D-37: al registrar el pago de una marca suspendida se ofrece reanudar EN
+   * EL MISMO PASO. Sin `resume`, solo dice que se puede (la consola lo
+   * pregunta); con `resume`, reanuda y lo asienta como «reanudó el servicio»,
+   * con el folio del pago como motivo. Reanudar nunca es automático: lo pide
+   * quien registra el pago.
+   */
+  private async servicioTrasElPago(f: Factura, byUserId: string, reanudar: boolean, ahora: Date): Promise<ServicioTrasElPago> {
+    const marca = await this.repo.organization(f.organizationId);
+    const suspendida = marca?.serviceStatus === 'SUSPENDED';
+    const base = { status: (marca?.serviceStatus ?? 'ACTIVE') as ServicioTrasElPago['status'], suspendedAutomatically: marca?.suspendedAutomatically ?? false };
+    if (!suspendida || !reanudar) return { ...base, canResume: suspendida, resumed: false, holdUntil: null };
+    await new TenantService().cambiarServicio(f.organizationId, 'ACTIVE', byUserId, `Pago recibido: ${f.folio}`);
+    const { holdUntil } = await this.cobranza.alReanudar(f.organizationId, byUserId, ahora);
+    return { status: 'ACTIVE', suspendedAutomatically: false, canResume: false, resumed: true, holdUntil };
   }
 
   /**
@@ -364,6 +401,7 @@ export class PlatformBillingService {
     await this.audit.record(systemContext(f.organizationId), {
       action: 'platform.invoice.void', resourceType: 'PlatformInvoice', resourceId: id, reason, afterState: { folio: f.folio, byPlatformUserId: byUserId },
     });
+    await this.cobranza.alCerrarFactura(f, 'VOIDED', ahora);
     return serializar((await this.repo.invoice(id))!, hoyDeCobro(ahora));
   }
 
@@ -406,6 +444,17 @@ function mesesFacturables(liberada: string, hoy: string): string[] {
   }
   return meses;
 }
+
+/** Cómo quedó el servicio de la marca al registrar un pago (D-37). */
+export type ServicioTrasElPago = {
+  status: 'PENDING' | 'ACTIVE' | 'SUSPENDED'; suspendedAutomatically: boolean;
+  /** La marca sigue suspendida: la consola ofrece reanudar. */
+  canResume: boolean;
+  /** Se reanudó en este mismo paso. */
+  resumed: boolean;
+  /** Si al reanudar todavía debía algo vencido, hasta cuándo no se le vuelve a suspender sola. */
+  holdUntil: string | null;
+};
 
 export type FacturaJson = ReturnType<typeof serializar>;
 export type PagoJson = ReturnType<typeof serializarPago>;

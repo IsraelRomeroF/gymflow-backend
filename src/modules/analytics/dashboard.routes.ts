@@ -1,11 +1,14 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { formatMoney, money, validation } from '@gymflow/core';
+import { Dashboard } from '@gymflow/core/contracts';
 import { route } from '../../platform/http/registry.js';
+import { respuesta } from '../../platform/http/respuesta.js';
 import { claveDeSedes, recordar } from '../../platform/cache.js';
 import { MonthlyCloseRepository } from '../finance/index.js';
 import { AnalyticsService } from './analytics.service.js';
 import { MS_DIA, VIGENCIA_TABLERO_MS } from './report-scope.js';
+import { fotoPara, morosidadDeLaFoto } from './foto.js';
 
 const cents = (v: bigint): string => v.toString();
 
@@ -21,7 +24,8 @@ export function registerDashboardRoutes(app: FastifyInstance): void {
     method: 'GET',
     url: '/dashboard',
     security: { kind: 'permission', permission: 'reports:financial:read' },
-    handler: async (request) => {
+    schema: respuesta(200, Dashboard),
+    handler: async (request): Promise<Dashboard> => {
       const ctx = request.ctx!;
       const q = z.object({
         from: z.string().date().optional(),
@@ -50,22 +54,32 @@ export function registerDashboardRoutes(app: FastifyInstance): void {
       const clave = `dashboard:${ctx.tenant.organizationId}:${claveDeSedes(sedes)}:${range.from.toISOString()}:${range.to.toISOString()}:${q.compare}`;
       return recordar(clave, q.fresh ? 0 : VIGENCIA_TABLERO_MS, async () => {
       const d = await service.dashboard(ctx, range, sedes, q.compare);
-      // Cierre de mes (fase 4): si el rango es un mes cerrado, se dice; y lo que
-      // entró en el rango pero pertenece a meses cerrados se etiqueta aparte.
+      // Cierre de mes (D-22): si el rango es un mes cerrado, sus cifras salen
+      // de la FOTO y ya no cambian. Lo que llegó tarde a un mes cerrado y se
+      // anotó en este periodo va aparte, etiquetado («ajuste de octubre»).
       const cierres = new MonthlyCloseRepository(ctx.tenant.organizationId);
       const esMes = range.from.getUTCDate() === 1 && range.to.getTime() === Date.UTC(range.from.getUTCFullYear(), range.from.getUTCMonth() + 1, 1);
       const cerrado = esMes ? await cierres.find(range.from) : null;
-      const ajustes = await cierres.priorAdjustmentsCents(range.from, range.to);
+      const foto = cerrado ? fotoPara(cerrado, sedes) : null;
+      const f = foto?.cifras;
+      const pesos = (v: string) => formatMoney(money(BigInt(v)));
 
       return {
         range: d.range,
-        closed: cerrado ? { closedAt: cerrado.closedAt.toISOString(), closedByUserId: cerrado.closedByUserId, note: cerrado.note } : null,
-        priorAdjustmentsCents: ajustes.toString(),
+        closed: cerrado ? { closedAt: cerrado.closedAt.toISOString(), closedByUserId: cerrado.closedByUserId, note: cerrado.note, fromSnapshot: !!foto } : null,
+        adjustments: d.adjustments.map((a) => ({ month: a.month, cents: cents(a.cents), count: a.count })),
         /**
          * Las tres cifras, juntas y con su explicación: el dueño tiene que
          * poder ver de un vistazo que cobrar y ganar no son lo mismo.
          */
-        money: {
+        money: f ? {
+          collectedCents: f.collectedCents, collectedLabel: pesos(f.collectedCents),
+          accruedCents: f.accruedCents, accruedLabel: pesos(f.accruedCents),
+          deferredCents: f.deferredCents, deferredLabel: pesos(f.deferredCents),
+          mrrCents: f.mrrCents, mrrLabel: pesos(f.mrrCents),
+          cashExpensesCents: f.cashExpensesCents, cashOverageCents: f.cashOverageCents,
+          fixedExpensesCents: f.fixedExpensesCents, profitCents: f.profitCents, ownerDrawsCents: f.ownerDrawsCents, costOfGoodsCents: f.costOfGoodsCents,
+        } : {
           collectedCents: cents(d.collectedCents),
           collectedLabel: formatMoney(money(d.collectedCents)),
           accruedCents: cents(d.accruedCents),
@@ -79,12 +93,19 @@ export function registerDashboardRoutes(app: FastifyInstance): void {
           cashOverageCents: cents(d.cashOverageCents),
           fixedExpensesCents: cents(d.fixedExpensesCents),
           profitCents: cents(d.profitCents),
+          /** Retiros del dueño: se informan, no restan (D-23). */
+          ownerDrawsCents: cents(d.ownerDrawsCents),
+          /** Costo de lo vendido en la tienda: la utilidad ya lo resta (D-21). */
+          costOfGoodsCents: cents(d.costOfGoodsCents),
         },
         previous: {
           from: d.previous.from, to: d.previous.to,
           collectedCents: cents(d.previous.collectedCents), accruedCents: cents(d.previous.accruedCents), profitCents: cents(d.previous.profitCents),
         },
-        portfolio: {
+        portfolio: f ? {
+          outstandingCents: f.outstandingCents, overdueCents: f.overdueCents, delinquencyRate: morosidadDeLaFoto(f),
+          membersBehind: f.membersBehind, membersBase: f.membersBase,
+        } : {
           outstandingCents: cents(d.outstandingCents),
           overdueCents: cents(d.overdueCents),
           delinquencyRate: d.delinquencyRate,
@@ -92,7 +113,7 @@ export function registerDashboardRoutes(app: FastifyInstance): void {
           membersBehind: d.membersBehind,
           membersBase: d.membersBase,
         },
-        activeMembers: d.activeMembers,
+        activeMembers: f ? f.activeMembers : d.activeMembers,
         openCashSessions: d.openCashSessions.map((s) => ({
           id: s.id,
           branchId: s.branchId,
@@ -101,7 +122,9 @@ export function registerDashboardRoutes(app: FastifyInstance): void {
           openingFloatCents: cents(s.openingFloatCents),
         })),
         /** Ordenadas por DEVENGADO, no por cobrado. Ver `rankBranches`. */
-        branches: d.branches.map((b) => ({
+        branches: foto ? foto.branches.map((b) => ({
+          branchId: b.branchId, collectedCents: b.collectedCents, accruedCents: b.accruedCents, activeMembers: b.activeMembers, outstandingCents: b.outstandingCents,
+        })) : d.branches.map((b) => ({
           branchId: b.branchId,
           collectedCents: cents(b.collectedCents),
           accruedCents: cents(b.accruedCents),
@@ -110,6 +133,7 @@ export function registerDashboardRoutes(app: FastifyInstance): void {
         })),
         notes: {
           packsValuedByListPrice: d.packsValuedByListPrice,
+          soldWithoutCost: d.soldWithoutCost,
           ...(d.packsValuedByListPrice > 0
             ? {
               warning:

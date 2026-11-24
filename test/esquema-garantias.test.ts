@@ -39,6 +39,9 @@ const TRIGGERS = [
   'pos_sale_lines · pos_sale_lines_append_only · UD',
   'pos_sales · pos_sales_cash_session_open · IU',
   'pos_sales · pos_sales_no_delete · D',
+  // Bloque 3.9 (D-32): nadie se anonimiza sin la firma de su lista, y lo firmado no cambia.
+  'privacy_batch_items · privacy_batch_items_firma_trg · IU',
+  'privacy_batches · privacy_batches_firma_trg · U',
   'refunds · refund_within_payment_trg · IU',
   'visit_ledger_entries · visit_ledger_no_delete · D',
   'visit_ledger_entries · visit_ledger_no_update · U',
@@ -48,13 +51,18 @@ const TRIGGERS = [
 /** Lo que el rol de la aplicación (`gymflow_app`) NO puede hacer. Toda tabla que no está aquí: leer, insertar, actualizar y borrar. */
 const SOLO_AGREGAR = [
   'access_decisions', 'attendance_events', 'audit_logs', 'cash_movements', 'charge_adjustments', 'class_booking_blocks', 'follow_ups',
-  'inventory_movements', 'member_consents', 'membership_events', 'payment_allocations', 'platform_audit_logs', 'pos_sale_lines', 'visit_ledger_entries',
+  // `membership_price_changes` y `plan_price_changes` (bloque 3.6, D-19): la historia de un cambio de precio no se corrige.
+  'inventory_movements', 'member_consents', 'membership_events', 'membership_price_changes', 'payment_allocations', 'plan_price_changes', 'platform_audit_logs', 'pos_sale_lines', 'privacy_conservation_starts',
+  // `trial_passes` (bloque 3.3, D-08): un pase de prueba ya dado no se borra ni se corrige; si no, «uno por persona» no valdría.
+  'trial_passes', 'visit_ledger_entries',
 ];
 const SIN_BORRAR = [
   'approval_grants', 'approval_requests', 'approval_signer_locks', 'billing_cycles', 'biometric_enrollments', 'branch_module_overrides', 'cash_sessions',
   'chargebacks', 'charges', 'member_credentials', 'member_imports', 'member_intakes', 'member_legacy_codes', 'operating_expenses',
-  'organization_entitlements', 'organization_modules', 'payment_attempts', 'payments', 'platform_invoices', 'platform_payments', 'platform_plans',
-  'pos_sales', 'refunds',
+  'organization_entitlements', 'organization_modules', 'payment_attempts', 'payments', 'platform_invoices',
+  // `platform_notices` y `platform_price_changes` (bloque 3.11, D-37 y D-38): el aviso es la constancia de que se avisó antes de suspender, y de los cambios sale lo que valía un mes pasado.
+  'platform_notices', 'platform_payments', 'platform_plans', 'platform_price_changes',
+  'pos_sales', 'privacy_batch_items', 'privacy_batches', 'refunds',
 ];
 const SIN_ACTUALIZAR = ['face_templates'];
 

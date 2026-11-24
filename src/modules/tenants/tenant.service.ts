@@ -10,6 +10,14 @@ import { ModuleStateRepository } from '../../platform/modules/module-state.repos
 import { TenantRepository, type Cuenta } from './tenant.repository.js';
 import { validarPuesto } from '../../platform/roles/puestos.js';
 import { PlatformPlanRepository, type PlanDePlataforma } from './platform-plan.repository.js';
+import { hoyDeCobro } from './cobro-reglas.js';
+
+/**
+ * La VERSIÓN del plan que una marca recibe al contratarlo (D-38, bloque 3.11):
+ * lo que el plan cuesta e incluye ese día. El cobro lee esta, no el catálogo;
+ * un cambio anunciado del plan se la actualiza a todas en su fecha.
+ */
+const versionDe = (plan: PlanDePlataforma, desde: string) => ({ planId: plan.id, name: plan.name, monthlyCents: plan.monthlyCents?.toString() ?? null, modules: plan.modules, since: desde });
 
 const ARGON = { memoryCost: 19456, timeCost: 2, parallelism: 1 };
 /**
@@ -119,6 +127,7 @@ export class TenantService {
     const origen = plan ? `plan «${plan.name}»` : plantilla ? `plantilla «${plantilla.name}»` : 'a la medida';
     const creado = await this.repo.crear({
       legalName: input.legalName, tradeName: input.tradeName, timezone: input.timezone, platformPlanId: plan?.id ?? null,
+      platformPlanSnapshot: plan ? versionDe(plan, hoyDeCobro()) : null,
       branch: input.branch,
       contracted: { notGranted, reason: `Alta de la marca: ${origen}` },
       conCaja: contratados.has('cash'),
@@ -174,7 +183,7 @@ export class TenantService {
    */
   async asignarPlan(organizationId: string, planId: string | null, byUserId: string, reason: string): Promise<void> {
     const plan = planId ? await this.planActivo(planId) : null;
-    const ok = await this.repo.setPlan(organizationId, plan?.id ?? null);
+    const ok = await this.repo.setPlan(organizationId, plan?.id ?? null, plan ? versionDe(plan, hoyDeCobro()) : null);
     if (!ok) throw notFound('Marca no encontrada');
     if (plan) {
       const estado = new ModuleStateRepository(organizationId);

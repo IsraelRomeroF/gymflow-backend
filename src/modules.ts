@@ -13,7 +13,7 @@ import { registerPosRoutes, registerPosShiftContributor } from './modules/pos/in
 import { registerAnalyticsRoutes, registerAnalyticsMonthFigures } from './modules/analytics/index.js';
 import { registerFinanceRoutes } from './modules/finance/index.js';
 import { registerRetentionRoutes } from './modules/retention/index.js';
-import { registerOutboundRoutes, OUTBOUND_JOBS } from './modules/outbound/index.js';
+import { registerOutboundRoutes, registerOutboundHooks, OUTBOUND_JOBS } from './modules/outbound/index.js';
 import { registerPrivacyRoutes, PRIVACY_JOBS } from './modules/privacy/index.js';
 import { registerAccessRoutes } from './modules/access/index.js';
 import { registerPortalRoutes, PORTAL_JOBS } from './modules/portal/index.js';
@@ -101,7 +101,7 @@ export const BACKEND_MODULES: readonly BackendModule[] = [
   { name: 'finance', module: 'core', register: (app) => registerFinanceRoutes(app) },
   { name: 'retention', module: 'retention', register: (app) => registerRetentionRoutes(app) },
   // Bandeja de salida (fase 2, bloque 2.9): los mensajes que recepción manda por WhatsApp con un toque.
-  { name: 'outbound', module: 'core', register: (app) => registerOutboundRoutes(app), jobs: OUTBOUND_JOBS },
+  { name: 'outbound', module: 'core', register: (app) => { registerOutboundHooks(); registerOutboundRoutes(app); }, jobs: OUTBOUND_JOBS },
   { name: 'privacy', module: 'core', register: (app) => registerPrivacyRoutes(app), jobs: PRIVACY_JOBS },
   { name: 'imports', module: 'core', register: (app) => registerImportRoutes(app) },
 ];

@@ -457,6 +457,14 @@ describe('privacidad: ciclo ARCO, firmas y textos (1.10)', () => {
       expect(aMedias.json().message).toContain('falta 1');
       const ok = await publicar(id, { reason: 'Primer aviso', checklist: TODOS });
       expect(ok.statusCode, ok.body).toBe(200);
+      // D-25 (fase 3, 3.7): el aviso NO queda publicado al pedirlo la gerencia: espera la firma de la dueña
+      // (el flujo completo, con su contraseña, está en `direccion-fase3.test.ts`). Aquí firma ella por el servicio.
+      expect(ok.json()).toMatchObject({ status: 'DRAFT', awaitingSignature: true });
+      {
+        const { firmarAviso } = await import('../src/modules/members/aviso-firma.js');
+        const duena = await getDb().user.findFirstOrThrow({ where: { organizationId: otroId, roleAssignments: { some: { role: { key: 'OWNER' } } } }, select: { id: true } });
+        await firmarAviso({ ...systemContext(otroId), tenant: { ...systemContext(otroId).tenant, actorUserId: duena.id } }, id);
+      }
       const asiento = await getDb().auditLog.findFirstOrThrow({ where: { action: 'consent.document.publish', resourceId: id } });
       expect((asiento.afterState as { checklist: string[] }).checklist).toEqual(TODOS);
 

@@ -1,6 +1,6 @@
 import { descuadreQueCuenta } from '@gymflow/core';
 import { MovementsRepository, type FilaDia, type Movimiento } from './movements.repository.js';
-import { ExpensesRepository, prorrateoDiario } from '../finance/index.js';
+import { ExpensesRepository, ajustesPorMes, prorrateoDiario, restaDeLaGanancia, retirosDelDueno } from '../finance/index.js';
 
 const MS_DIA = 86_400_000;
 const dia = (d: Date) => d.toISOString().slice(0, 10);
@@ -50,7 +50,9 @@ export class MovementsService {
     const filas = filtrar(todas, sedes);
     // Un gasto de todo el gimnasio (branchId null) cuenta en la vista de toda
     // la organización; en la de una sede, solo los de esa sede.
-    const fijos = prorrateoDiario(sedes === null ? gastos : gastos.filter((g) => g.branchId !== null && sedes.includes(g.branchId)), from, to);
+    // El retiro del dueño no es gasto (D-23): no entra al reparto por día.
+    const queRestan = gastos.filter(restaDeLaGanancia);
+    const fijos = prorrateoDiario(sedes === null ? queRestan : queRestan.filter((g) => g.branchId !== null && sedes.includes(g.branchId)), from, to);
     const dias = new Map<string, ResumenDia>();
     for (let t = from.getTime(); t < to.getTime(); t += MS_DIA) {
       const d = dia(new Date(t));
@@ -101,6 +103,10 @@ export class MovementsService {
         netCents: sum('netCents'), toBankCents: sum('toBankCents'),
         creditNotesCents: sum('creditNotesCents'), fixedExpensesCents: sum('fixedExpensesCents'), profitCents: sum('profitCents'), byMethod,
       },
+      /** Retiros del dueño de los meses del periodo (positivo): se informan, no restan (D-23). */
+      ownerDrawsCents: retirosDelDueno(gastos, sedes),
+      /** «Ajustes de ‹mes›» anotados en los meses del periodo: ya van dentro de los gastos fijos (D-22). */
+      adjustments: ajustesPorMes(gastos, sedes),
     };
   }
 

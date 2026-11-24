@@ -107,6 +107,10 @@ export class MembershipService {
       createdByUserId: ctx.tenant.actorUserId!,
       saleKey: input.saleKey ?? null,
       agreedPriceCents: input.agreedPriceCents ?? null,
+      // D-19 (bloque 3.6): un precio pactado distinto al de lista de su sede nace
+      // marcado «conserva su precio»; el que es igual al de lista sigue al plan.
+      priceProtected: input.agreedPriceCents != null
+        && input.agreedPriceCents !== await new PlanRepository(orgId).listPriceAt(input.planId, input.soldAtBranchId),
     });
 
     await this.audit.record(ctx, {
@@ -308,7 +312,8 @@ export class MembershipService {
     const updated = await this.apply(ctx, m, 'PLAN_CHANGED', {
       reason,
       // El pactado anterior era del plan anterior: el nuevo queda pactado a su precio vigente de hoy.
-      data: { planId: newPlanId, currentPeriodStart: period.start, currentPeriodEnd: period.end, agreedPriceCents: pactado, autoRenew },
+      // La marca «conserva su precio» era del plan anterior: el nuevo queda al de lista y sigue al plan (D-19).
+      data: { planId: newPlanId, currentPeriodStart: period.start, currentPeriodEnd: period.end, agreedPriceCents: pactado, autoRenew, priceProtected: false, priceProtectedReason: null },
       payload: {
         from: oldPlan?.code ?? m.planId,
         to: newPlan.code,

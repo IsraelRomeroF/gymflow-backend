@@ -12,6 +12,7 @@ import { AuditService } from '../../platform/audit/audit.service.js';
 import { MemberRepository } from './member.repository.js';
 import { MemberService, antiguedadDeclarada, diaDeNegocio, type CreateMemberResult } from './member.service.js';
 import { consentSchema, idParam, serializeMember, vista } from './members.serializers.js';
+import { asentarResponsable, guardianSchema, prepararResponsable, responsibleSchema, ResponsibleRepository } from './responsible.js';
 
 /** Lo que `serializeMember` oculta a quien no tiene alcance sobre la sede del socio (`vista().contacto`). */
 const CONTACTO = ['phoneE164', 'email', 'emergencyContactName', 'emergencyContactPhone'] as const;
@@ -36,6 +37,13 @@ const createMemberSchema = z.object({
   consents: z.array(consentSchema).min(1),
   /** Continuar pese a los posibles duplicados. Queda auditado. */
   force: z.boolean().optional(),
+  /** D-09: su celular ya es el de otro socio; quién responde por el número. */
+  responsible: responsibleSchema.optional(),
+  /** D-10: es menor y su tutor firma aquí, en el mostrador; la aceptación queda a nombre del tutor. */
+  guardian: guardianSchema.optional(),
+  // (D-29, bloque 3.8: aquí irá `coachUserId`, el coach que recepción elige al alta.)
+  // D-11: «celular o correo» lo exige la pantalla («Nuevo socio» no deja dar de alta sin uno). La API no lo
+  // rechaza todavía: la importación y varias pruebas de otros módulos crean socios sin contacto (pendientes/3.4.md).
 });
 
 /**
@@ -68,6 +76,7 @@ export async function altaEnMostrador(ctx: RequestContext, body: CuerpoDeAlta, s
     createdByUserId: ctx.tenant.actorUserId!,
     consents: body.consents,
     ...(body.force === undefined ? {} : { force: body.force }),
+    responsible: body.responsible, guardian: body.guardian,
   });
 }
 
@@ -160,8 +169,10 @@ export function registerProfileRoutes(app: FastifyInstance): void {
         joinedAt: z.string().date('Escribe la fecha como año-mes-día').optional(),
         /** Obligatorio si cambia la antigüedad: queda en la bitácora. */
         reason: z.string().trim().max(300).optional(),
+        /** D-09: el celular nuevo ya es el de otro socio; quién responde por el número. */
+        responsible: responsibleSchema.optional(),
       }).parse(request.body);
-      const { birthDate, joinedAt: diaDeAlta, reason, ...resto } = body;
+      const { birthDate, joinedAt: diaDeAlta, reason, responsible, ...resto } = body;
 
       const repo = new MemberRepository(ctx.tenant.organizationId);
       const before = await repo.findById(id);
@@ -201,12 +212,22 @@ export function registerProfileRoutes(app: FastifyInstance): void {
       }
       const joinedAt = cambiaAntiguedad ? await antiguedadDeclarada(orgId, diaDeAlta, sede) : undefined;
 
+      // D-09: un celular que ya es de otro socio se comparte anotando al responsable (`PHONE_IN_USE` si falta).
+      const celularNuevo = typeof resto.phoneE164 === 'string' && resto.phoneE164 !== before.phoneE164 ? resto.phoneE164 : null;
+      const responsableNuevo = celularNuevo
+        ? await prepararResponsable(orgId, { phoneE164: celularNuevo, responsible, memberId: id, yaTiene: !!(await new ResponsibleRepository(orgId).de(id))?.responsibleKind })
+        : undefined;
+
       const updated = await repo.update(id, {
         ...resto,
         ...(birthDate !== undefined ? { birthDate: birthDate ? new Date(`${birthDate}T00:00:00.000Z`) : null } : {}),
         ...(joinedAt ? { joinedAt } : {}),
       } as Parameters<MemberRepository['update']>[1]);
       if (!updated) throw notFound('Socio no encontrado');
+      if (responsableNuevo) {
+        await new ResponsibleRepository(orgId).escribir(id, responsableNuevo);
+        await asentarResponsable(orgId, id, updated.phoneE164, responsableNuevo);
+      }
 
       await audit.record(ctx, {
         action: 'member.update',
@@ -217,7 +238,8 @@ export function registerProfileRoutes(app: FastifyInstance): void {
         // sí va con su valor: no es dato personal y explica un cambio de alcance.
         beforeState: { homeBranchId: before.homeBranchId, ...(cambiaAntiguedad ? { joinedAt: antiguedadAntes } : {}) },
         afterState: {
-          changedFields: Object.keys(body).filter((k) => k !== 'reason' && !ocultos.has(k) && (k !== 'joinedAt' || cambiaAntiguedad)),
+          changedFields: Object.keys(body).filter((k) => k !== 'reason' && k !== 'responsible' && !ocultos.has(k) && (k !== 'joinedAt' || cambiaAntiguedad)),
+          ...(responsableNuevo ? { responsable: responsableNuevo.responsibleKind } : {}),
           homeBranchId: updated.homeBranchId,
           ...(cambiaAntiguedad ? { joinedAt: diaDeAlta } : {}),
         },

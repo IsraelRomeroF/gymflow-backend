@@ -107,6 +107,20 @@ export class PlanRepository extends TenantRepository {
     }));
   }
 
+  /**
+   * El precio de lista del plan en una sucursal, se venda hoy ahí o no: el
+   * propio de la sede si lo tiene, si no el del plan. `null` si el plan no existe.
+   */
+  async listPriceAt(planId: string, branchId: string | null): Promise<bigint | null> {
+    const plan = await this.findById(planId);
+    if (!plan) return null;
+    if (!branchId) return plan.priceCents;
+    const a = await this.db.planBranchAvailability.findFirst({
+      where: { planId, branchId, organizationId: this.organizationId }, select: { priceOverrideCents: true },
+    });
+    return a?.priceOverrideCents ?? plan.priceCents;
+  }
+
   async availabilityFor(planId: string) {
     return this.db.planBranchAvailability.findMany({
       where: { planId, organizationId: this.organizationId },
@@ -116,7 +130,7 @@ export class PlanRepository extends TenantRepository {
 
   /** Disponibilidad y socios vivos de MUCHOS planes en dos consultas (OPT2-01). */
   async detailsFor(planIds: readonly string[]) {
-    const [disp, vivos, paquetes] = await Promise.all([
+    const [disp, vivos, protegidas, paquetes] = await Promise.all([
       this.db.planBranchAvailability.findMany({
         where: { organizationId: this.organizationId, planId: { in: [...planIds] } },
         select: { planId: true, branchId: true, isAvailable: true, priceOverrideCents: true },
@@ -124,6 +138,12 @@ export class PlanRepository extends TenantRepository {
       this.db.membership.groupBy({
         by: ['planId'],
         where: this.scope({ planId: { in: [...planIds] }, status: { notIn: [MS.CANCELED, MS.EXPIRED] } }),
+        _count: { _all: true },
+      }),
+      // De esas, las que conservan su precio ante un cambio de precio del plan (D-19, bloque 3.6).
+      this.db.membership.groupBy({
+        by: ['planId'],
+        where: this.scope({ planId: { in: [...planIds] }, status: { notIn: [MS.CANCELED, MS.EXPIRED] }, priceProtected: true }),
         _count: { _all: true },
       }),
       // Los paquetes de visitas no son membresías: sin esto el catálogo decía «0 socios» de un paquete que se vende a diario (16-05).
@@ -135,9 +155,11 @@ export class PlanRepository extends TenantRepository {
     ]);
     const conteo = new Map(vivos.map((v) => [v.planId, v._count._all]));
     const vivosDe = new Map(paquetes.map((v) => [v.planId, v._count._all]));
+    const conMarca = new Map(protegidas.map((v) => [v.planId, v._count._all]));
     return new Map(planIds.map((id) => [id, {
       availability: disp.filter((d) => d.planId === id).map(({ planId: _p, ...d }) => d),
       liveMemberships: conteo.get(id) ?? 0,
+      protectedPrices: conMarca.get(id) ?? 0,
       livePacks: vivosDe.get(id) ?? 0,
     }]));
   }

@@ -24,6 +24,8 @@ export function serializeDecision(d: DecisionRecord, resueltos?: Map<string, Dec
     decidedOffline: d.decidedOffline,
     overrideReason: d.overrideReason,
     resolvesDecisionId: d.resolvesDecisionId,
+    /** Reentrada (D-07): pasó, pero no contó otra asistencia ni descontó visita. */
+    reentry: d.reentry,
     resolvedByDecisionId: resueltos?.get(d.id)?.id ?? null,
     at: d.at.toISOString(),
   };

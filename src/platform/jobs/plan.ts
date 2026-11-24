@@ -58,6 +58,9 @@ export const ORDEN_DIARIO: readonly string[] = [
   'payments.expire-cards',
   'billing.reconcile-balances',
   'privacy.retention',
+  // Conservación (D-32, bloque 3.9): después de cerrar las membresías de quien
+  // se dio de baja, y antes de verificar la bitácora (escribe en ella).
+  'privacy.conservation',
   'audit.verify-hash-chain',
 ];
 
@@ -75,7 +78,11 @@ export const ORDEN_FRECUENTE: readonly string[] = [
 
 /** Los de PLATAFORMA: una vez por corrida, fuera del bucle por gimnasio (23-12). */
 export const ORDEN_PLATAFORMA: readonly string[] = [
+  // Los cambios de precio anunciados que ya llegaron a su fecha (D-38, 3.11): ANTES de emitir.
+  'platform.prices.apply',
   'platform.invoices.issue',
+  // Avisos de cobranza y suspensión automática a los 15 días (D-37, 3.11): DESPUÉS de emitir.
+  'platform.collections',
   // La cadena de plataforma se verifica después de lo que la corrida asienta en ella.
   'audit.verify-platform-chain',
 ];

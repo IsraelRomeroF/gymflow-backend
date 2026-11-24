@@ -19,8 +19,14 @@ export { registerMonthFiguresSource, type MonthFigures } from './month-figures.j
 
 // Consumida por: analytics. El Tablero, Movimientos y el pulso restan los
 // gastos fijos prorrateados por día.
-export { ExpensesRepository, prorrateoDiario } from './expenses.repository.js';
+export { ExpensesRepository, prorrateoDiario, retirosDelDueno, ajustesPorMes, restaDeLaGanancia } from './expenses.repository.js';
+export type { CifrasDeCaja, CifrasDelMes } from './month-figures.js';
 
-// Consumida por: analytics. El Tablero dice si el mes ya está cerrado y separa
-// lo que llegó tarde a un mes cerrado («ajuste de meses anteriores»).
+// Para quien necesite impedir algo con fecha en un mes CERRADO (D-22):
+// `new MonthlyCloseService().assertOpen(organizationId, fechaDeNegocio)`
+// responde 409 `MONTH_CLOSED`. Lo tardío se anota en el mes en curso.
+export { MonthlyCloseService } from './monthly-close.service.js';
+
+// Consumida por: analytics. El Tablero y Movimientos dicen si el mes ya está
+// cerrado y, si lo está, sirven sus cifras desde la foto (D-22).
 export { MonthlyCloseRepository } from './monthly-close.repository.js';

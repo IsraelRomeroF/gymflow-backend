@@ -5,13 +5,18 @@ export type ProductRecord = {
   id: string;
   sku: string;
   name: string;
+  /** El precio de público. */
   priceCents: bigint;
+  /** Precio para socios con membresía vigente (D-21); nulo = todos pagan el de público. */
+  memberPriceCents: bigint | null;
+  /** Lo que le cuesta al gimnasio (D-21); nulo = sin capturar. */
+  costCents: bigint | null;
   tracksInventory: boolean;
   isActive: boolean;
 };
 
 const SELECT = {
-  id: true, sku: true, name: true, priceCents: true,
+  id: true, sku: true, name: true, priceCents: true, memberPriceCents: true, costCents: true,
   tracksInventory: true, isActive: true,
 } as const;
 
@@ -47,6 +52,7 @@ export class ProductRepository extends TenantRepository {
 
   async create(input: {
     sku: string; name: string; priceCents: bigint; tracksInventory?: boolean;
+    memberPriceCents?: bigint | null; costCents?: bigint | null;
   }): Promise<ProductRecord> {
     const row = await this.db.product.create({
       data: {
@@ -55,6 +61,8 @@ export class ProductRepository extends TenantRepository {
         sku: input.sku.toUpperCase(),
         name: input.name,
         priceCents: input.priceCents,
+        memberPriceCents: input.memberPriceCents ?? null,
+        costCents: input.costCents ?? null,
         tracksInventory: input.tracksInventory ?? true,
       },
       select: SELECT,
@@ -64,6 +72,8 @@ export class ProductRepository extends TenantRepository {
 
   async update(id: string, patch: {
     name?: string; priceCents?: bigint; isActive?: boolean;
+    /** `null` lo quita. */
+    memberPriceCents?: bigint | null; costCents?: bigint | null;
   }): Promise<ProductRecord | null> {
     const res = await this.db.product.updateMany({
       where: this.scope({ id, deletedAt: null }), data: patch,

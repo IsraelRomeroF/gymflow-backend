@@ -355,7 +355,13 @@ describe('autorización a distancia', () => {
     const sol3 = (await pedir(otro)).json().id;
     expect((await app.inject({ method: 'POST', url: `/approvals/requests/${sol3}/reject`, headers: { cookie: owner }, payload: { reason: 'Primero confirma su identificación' } })).statusCode).toBe(200);
     expect((await app.inject({ method: 'GET', url: `/approvals/requests/${sol3}`, headers: { cookie: gerente } })).json()).toMatchObject({ status: 'REJECTED', rejectReason: 'Primero confirma su identificación' });
-    const sol4 = (await pedir(otro)).json().id;
+    // D-03 (bloque 3.2): es volver a pedir lo rechazado, así que lleva su respuesta a ese «no».
+    const otraVez = await app.inject({
+      method: 'POST', url: '/approvals/requests', headers: { cookie: gerente },
+      payload: { permission: 'members:anonymize', branchId: centro, resourceType: 'Member', resourceId: otro, summary: 'Anonimizar a un socio que pidió ARCO', reply: 'Ya confirmé su identificación con su credencial' },
+    });
+    expect(otraVez.statusCode, otraVez.body).toBe(201);
+    const sol4 = otraVez.json().id;
     await getDb().approvalRequest.update({ where: { id: sol4 }, data: { expiresAt: new Date(Date.now() - 1000) } });
     expect((await app.inject({ method: 'POST', url: `/approvals/requests/${sol4}/approve`, headers: { cookie: owner }, payload: { password: PASSWORD } })).statusCode).toBe(409);
     expect((await app.inject({ method: 'GET', url: `/approvals/requests/${sol4}`, headers: { cookie: gerente } })).json().status).toBe('EXPIRED');
@@ -389,13 +395,17 @@ describe('la dueña consulta lo administrativo y no opera (ADR-039)', () => {
       ['POST', `/members/${socio.id}/payments`, { method: 'CASH', amountCents: '100', branchId: f.demoBranches[0]!.id }],
       ['POST', '/plans', { code: 'X', name: 'X', reason: 'x' }],
       ['POST', '/users', { email: 'x@demo.mx', fullName: 'Equis Ye', roleKey: 'COACH', branchIds: [], reason: 'xxx' }],
-      ['POST', '/expenses', { category: 'RENT', description: 'Renta', amountCents: '100', month: '2026-09', branchId: null }],
       ['POST', '/classes/types', { name: 'Nueva' }],
+      // Con gerente, el mes lo cierra la gerencia y ella firma (D-23).
+      ['POST', '/reports/monthly-close', { month: '2024-01', reason: 'Cierre contable', password: 'x' }],
     ];
     for (const [method, url, payload] of intentos) {
       const r = await app.inject({ method: method as 'POST', url, headers: { cookie: duena }, payload });
       expect(r.statusCode, `${method} ${url}: ${r.body.slice(0, 120)}`).toBe(403);
     }
+    // Lo único de dinero que anota, haya o no gerente: gastos, nómina y sus retiros (D-23, fase 3 · 3.7). Con un importe inválido no llega a escribir nada: 422 y no 403.
+    const gasto = await app.inject({ method: 'POST', url: '/expenses', headers: { cookie: duena }, payload: { category: 'RENT', description: 'Renta', amountCents: '0', month: '2026-09', branchId: null } });
+    expect(gasto.statusCode, gasto.body).toBe(422);
     // Y es quien firma: su bandeja de autorizaciones responde (2026-10-05).
     expect((await app.inject({ method: 'GET', url: '/approvals/inbox', headers: { cookie: duena } })).statusCode).toBe(200);
     await app.close();

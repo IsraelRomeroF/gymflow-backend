@@ -5,7 +5,7 @@ import { respuesta } from '../../platform/http/respuesta.js';
 import { ChargeRepository } from './charge.repository.js';
 import { MemberRepository } from '../members/index.js';
 import { MembershipRepository } from '../memberships/index.js';
-import { PlanRepository } from '../catalog/index.js';
+import { PlanRepository, avisoDePrecioEnRecibo } from '../catalog/index.js';
 import { PaymentRepository } from './payment.repository.js';
 import { BillingService } from './billing.service.js';
 import { idParam, cents, iso, serializePayment, serializeEstadoParaCobro } from './billing.serializers.js';
@@ -115,18 +115,27 @@ export function registerPaymentsRoutes(app: FastifyInstance): void {
       const membresiaId = tocados.find((c) => c?.membershipId && c.chargeType === 'MEMBERSHIP_PERIOD')?.membershipId
         ?? tocados.find((c) => c?.membershipId)?.membershipId ?? null;
       let coverage: { planName: string | null; paidThrough: string | null } | null = null;
+      let priceNotice: PaymentReceipt['priceNotice'] = null;
       if (membresiaId && BigInt(pago.amountCents) > 0n) {
         const momento = new Date(Math.max(pago.createdAt.getTime(), ...asignaciones.map((a) => a.createdAt.getTime())));
         const m = await new MembershipRepository(orgId).findById(membresiaId);
         const plan = m ? await new PlanRepository(orgId).findById(m.planId) : null;
         const hasta = paidThrough(await cargos.cuotasAlMomento(membresiaId, momento));
         coverage = { planName: plan?.name ?? null, paidThrough: hasta ? iso(hasta) : null };
+        // El aviso del cambio de precio de su plan (D-19, bloque 3.6): la regla es de `catalog`.
+        const pagadas = new Set(tocados.filter((c) => c?.membershipId === membresiaId && c.chargeType === 'MEMBERSHIP_PERIOD').map((c) => c!.id));
+        const cuotas = (await cargos.listForMember(pago.memberId))
+          .filter((c) => c.membershipId === membresiaId && c.chargeType === 'MEMBERSHIP_PERIOD')
+          .map((c) => ({ createdAt: c.createdAt, cubierta: pagadas.has(c.id) }));
+        const aviso = await avisoDePrecioEnRecibo(orgId, { membershipId: membresiaId, pagadoEn: pago.createdAt, cuotas });
+        priceNotice = aviso ? { kind: aviso.kind, planName: plan?.name ?? null, fromPriceCents: cents(aviso.fromPriceCents), toPriceCents: cents(aviso.toPriceCents) } : null;
       }
       return {
         payment: serializePayment(pago),
         member: socio ? { id: socio.id, memberCode: socio.memberCode, fullName: `${socio.firstName} ${socio.lastName}` } : null,
         lines: lineas,
         coverage,
+        priceNotice,
         // Quién lo cobró (3-05; bloque 2.2): el comprobante ya lo dice, como el estado de cuenta.
         collectedByName: await new StatementRepository(orgId).collectorOf(id),
       };

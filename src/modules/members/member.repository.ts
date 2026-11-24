@@ -42,6 +42,14 @@ export type CreateMemberInput = {
    * por `antiguedadDeclarada` (2-01): un día de calendario a las 18:00Z.
    */
   joinedAt?: Date | null;
+  /**
+   * El responsable del celular que comparte o su tutor (bloque 3.4, D-09 y
+   * D-10), ya validado por `prepararResponsable` (`responsible.ts`).
+   */
+  responsibleColumns?: {
+    responsibleKind: string | null; responsibleMemberId: string | null; responsibleName: string | null;
+    responsiblePhoneE164: string | null; guardianSignedAt?: Date | null;
+  } | undefined;
 };
 
 const SELECT = {
@@ -361,6 +369,7 @@ export class MemberRepository extends TenantRepository {
           healthNotes: cifrarSensible(input.healthNotes),
           joinedAt: input.joinedAt && input.joinedAt.getTime() < Date.now() ? input.joinedAt : new Date(),
           createdByUserId: input.createdByUserId,
+          ...(input.responsibleColumns ?? {}),
         },
         select: SELECT,
       });
@@ -429,7 +438,11 @@ export class MemberRepository extends TenantRepository {
     return Object.keys(data);
   }
 
-  /** ¿Otro socio vivo ya tiene este celular? Es único por gimnasio. */
+  /**
+   * ¿Otro socio vivo ya tiene este celular? Desde D-09 (bloque 3.4) dos socios
+   * pueden compartirlo anotando al responsable (`responsible.ts`); la
+   * importación sigue usando esta pregunta para no compartir a ciegas.
+   */
   async isPhoneTaken(phoneE164: string): Promise<boolean> {
     return (await this.db.member.count({ where: this.scope({ phoneE164, deletedAt: null }) })) > 0;
   }
@@ -528,6 +541,8 @@ export class MemberRepository extends TenantRepository {
         firstName: 'Socio', lastName: 'anonimizado', nameKey: '',
         phoneE164: null, email: null, birthDate: null, curp: null, photoObjectKey: null, notes: null,
         emergencyContactName: null, emergencyContactPhone: null, healthNotes: null,
+        // El responsable o tutor es una persona con nombre y teléfono (bloque 3.4).
+        responsibleKind: null, responsibleMemberId: null, responsibleName: null, responsiblePhoneE164: null, guardianSignedAt: null,
         anonymizedAt: new Date(), updatedAt: new Date(),
       },
     });

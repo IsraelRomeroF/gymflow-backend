@@ -51,6 +51,11 @@ export {
 // Los textos: revisar antes de publicar, historial y retirar. Consumida por:
 // intake (las rutas `/consent-documents` de listar, publicar y retirar viven allí).
 export { listarTextos, publicarTexto, retirarTexto, revisionDeTexto } from './consent-document.service.js';
+// D-25 (3.7): el aviso de privacidad no se publica sin la firma de la dueña. Consumida por: intake (la ruta de publicar).
+export { esAvisoPorFirmar, pedirFirmaDelAviso } from './aviso-firma.js';
 
 // Consumida por: portal (lista y job de avisos) e intake (alta aprobada). Los avisos son del socio (PS-03).
 export { MemberNoticeRepository, type NoticeKind } from './notice.repository.js';
+
+// Consumida por: intake (bloque 3.4). El responsable del celular compartido (D-09) y el tutor de un menor (D-10).
+export { guardianSchema, responsibleSchema, prepararResponsable, asentarResponsable, ResponsibleRepository, type GuardianInput, type ResponsibleInput } from './responsible.js';

@@ -4,6 +4,7 @@ import { PortalAuthRepository } from '../portal/index.js';
 import { ConsentRepository, MemberNoticeRepository, retirarBiometricoSinRegistro } from '../members/index.js';
 import { SessionRepository } from '../identity/index.js';
 import { WebhookRepository } from '../payments/index.js';
+import { ConservacionService } from './conservacion.service.js';
 
 /** Plazos de conservación. Cortos a propósito: lo que no se guarda no se filtra. */
 export const RETENCION = {
@@ -61,6 +62,23 @@ const retention: JobHandler = async (organizationId) => {
   return result;
 };
 
+/**
+ * CONSERVACIÓN (D-32; bloque 3.9). Una pasada por gimnasio y por día:
+ *  1. borra el rostro de quien lleva 30 días de baja sin regresar;
+ *  2. termina lo que una lista ya firmada dejó a medias;
+ *  3. arma la lista del mes si no existe (no borra: espera la firma del dueño).
+ * La primera pasada en un gimnasio solo fija el día de arranque. Idempotente.
+ */
+const conservation: JobHandler = async (organizationId) => {
+  const r = await new ConservacionService().pasada(organizationId);
+  return {
+    job: 'privacy.conservation',
+    processed: r.rostrosBorrados + r.anonimizados + (r.listaArmada ? 1 : 0),
+    skipped: r.rostrosEnEspera, batches: 1, truncated: false, errors: r.errores,
+  };
+};
+
 export const PRIVACY_JOBS: ReadonlyArray<{ name: string; handler: JobHandler }> = [
   { name: 'privacy.retention', handler: retention },
+  { name: 'privacy.conservation', handler: conservation },
 ];

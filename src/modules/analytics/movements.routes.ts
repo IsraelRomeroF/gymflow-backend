@@ -4,6 +4,8 @@ import { validation } from '@gymflow/core';
 import { route } from '../../platform/http/registry.js';
 import { MovementsService } from './movements.service.js';
 import { MS_DIA, PERM, sedeDeReporte } from './report-scope.js';
+import { MonthlyCloseRepository } from '../finance/index.js';
+import { fotoPara } from './foto.js';
 
 export function registerMovementsRoutes(app: FastifyInstance): void {
   // ── Movimientos y ganancia real por día ───────────────────────────────────
@@ -22,7 +24,13 @@ export function registerMovementsRoutes(app: FastifyInstance): void {
       const to = new Date(new Date(`${q.to}T00:00:00.000Z`).getTime() + MS_DIA);
       if (to <= from) throw validation('El periodo debe terminar el mismo día o después de empezar');
       if (to.getTime() - from.getTime() > 186 * MS_DIA) throw validation('Elige un periodo de hasta seis meses');
-      const r = await movimientos.resumen(request.ctx!.tenant.organizationId, from, to, sedeDeReporte(request, q.branchId));
+      const orgId = request.ctx!.tenant.organizationId;
+      const sedes = sedeDeReporte(request, q.branchId);
+      const [r, cierres] = await Promise.all([movimientos.resumen(orgId, from, to, sedes), new MonthlyCloseRepository(orgId).cerradosEntre(from, to)]);
+      // D-22: si el periodo ES un mes cerrado, sus totales salen de la foto del cierre.
+      const esMes = from.getUTCDate() === 1 && to.getTime() === Date.UTC(from.getUTCFullYear(), from.getUTCMonth() + 1, 1);
+      const cierreDelMes = esMes ? cierres.find((c) => c.month.getTime() === from.getTime()) : undefined;
+      const foto = cierreDelMes ? fotoPara(cierreDelMes, sedes)?.cifras : undefined;
       const plano = (d: typeof r.totals) => ({
         incomeCents: texto(d.incomeCents), refundsCents: texto(d.refundsCents), expensesCents: texto(d.expensesCents),
         varianceCents: texto(d.varianceCents), shortageCents: texto(d.shortageCents), overageCents: texto(d.overageCents),
@@ -30,7 +38,20 @@ export function registerMovementsRoutes(app: FastifyInstance): void {
         creditNotesCents: texto(d.creditNotesCents), fixedExpensesCents: texto(d.fixedExpensesCents), profitCents: texto(d.profitCents),
         byMethod: Object.fromEntries(Object.entries(d.byMethod).map(([k, v]) => [k, texto(v)])),
       });
-      return { from: q.from, to: q.to, totals: plano(r.totals), days: r.days.map((d) => ({ date: d.date, ...plano(d) })) };
+      const totals = foto
+        // La foto no guarda el descuadre con signo (solo informaba): faltante más sobrante.
+        ? { ...foto.cash, varianceCents: texto(BigInt(foto.cash.shortageCents) + BigInt(foto.cash.overageCents)) }
+        : plano(r.totals);
+      return {
+        from: q.from, to: q.to, totals, days: r.days.map((d) => ({ date: d.date, ...plano(d) })),
+        /** Retiros del dueño de los meses del periodo: se informan, no restan (D-23). */
+        ownerDrawsCents: foto ? foto.ownerDrawsCents : texto(r.ownerDrawsCents),
+        /** «Ajustes de ‹mes›» anotados en los meses del periodo: ya van dentro de los gastos fijos (D-22). */
+        adjustments: r.adjustments.map((a) => ({ month: a.month, cents: texto(a.cents), count: a.count })),
+        /** Meses del periodo que ya están cerrados: sus cifras no cambian. */
+        closedMonths: cierres.map((c) => c.month.toISOString().slice(0, 7)),
+        totalsFromSnapshot: !!foto,
+      };
     },
   });
 

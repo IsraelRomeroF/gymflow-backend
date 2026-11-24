@@ -11,6 +11,12 @@ import { PlanRepository, type PlanRecord } from '../catalog/index.js';
  * sede ya no VENDA el plan no cambia la cuota de quien lo compró ahí: antes
  * la renovación fallaba cada noche con 409 y el adeudo se cotizaba con el
  * precio de lista aunque la membresía tuviera otro pactado.
+ *
+ * D-19 (fase 3, bloque 3.6): la regla de aquí NO cambió. Lo que cambió es
+ * quién escribe el pactado: cada cambio de precio de un plan lo mueve, en su
+ * misma transacción, en las membresías vivas que no «conservan su precio»
+ * (`catalog/price-change.repository.ts`). Por eso la siguiente cuota de cada
+ * socio sale ya al precio nuevo sin que esta función sepa del cambio.
  */
 export async function precioDeCuotaDe(
   organizationId: string,

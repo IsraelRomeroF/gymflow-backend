@@ -48,7 +48,7 @@ const SIN_CLIENTE: Record<string, string> = {
   'POST /memberships/:id/reactivate': POR_QUE.vieja, 'POST /memberships/:id/renew': POR_QUE.vieja, 'GET /memberships/:id/events': POR_QUE.vieja,
   'POST /members/:id/charges': POR_QUE.vieja,
   'GET /visit-packs/:id': POR_QUE.paquete, 'POST /visit-packs/:id/adjust': POR_QUE.paquete, 'POST /visit-packs/:id/consume': POR_QUE.paquete,
-  'POST /auth/logout-all': POR_QUE.suelta, 'GET /platform/invoices': POR_QUE.suelta, 'PUT /platform/prices/:key': POR_QUE.suelta,
+  'POST /auth/logout-all': POR_QUE.suelta, 'GET /platform/invoices': POR_QUE.suelta,
   'GET /portfolio': POR_QUE.suelta, 'GET /discount-reasons': POR_QUE.suelta,
   'POST /member-imports/:id/decide-all': POR_QUE.suelta,
   // Bloque 2.5: `…/generate` y `…/capacity` salieron de la lista (ya tienen pantalla en Clases). El coach de un horario

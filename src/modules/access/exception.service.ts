@@ -1,5 +1,5 @@
 import {
-  exceptionOptions, formatMoney, money, notFound, validation,
+  conflict, DomainError, exceptionOptions, formatMoney, money, notFound, validation,
   type ExceptionOption, type PaymentMethodType, type DenialReason } from '@gymflow/core';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 import { enUnidadDeDinero } from '../../platform/db/unit-of-work.js';
@@ -132,12 +132,27 @@ export class ExceptionService {
     // Cobro y paso en UNA unidad (5-10): un rechazo ya resuelto no se cobra, y
     // si otra persona lo resuelve en este mismo instante, el cobro se deshace
     // en vez de quedar un pago sin entrada.
-    const r = await enUnidadDeDinero(orgId, async () => {
+    const accesos = new AccessRepository(orgId);
+    const rechazo = await accesos.findDecision(input.decisionId);
+    if (!rechazo) throw notFound('Decisión no encontrada');
+    if (!rechazo.memberId) throw validation('Ese rechazo no corresponde a un socio identificado');
+    // Un socio a la vez, como en la entrada (D-07): «¿ya entró hoy?» se lee y se
+    // escribe sin otro paso suyo en medio. El candado del socio va ANTES que el
+    // turno del dinero, en el mismo orden que la entrada (que asienta al final).
+    const r = await accesos.withMemberLock(rechazo.memberId, () => enUnidadDeDinero(orgId, async () => {
       const decision = await new AccessRepository(orgId).findDecision(input.decisionId);
       if (!decision) throw notFound('Decisión no encontrada');
       if (!decision.memberId) throw validation('Ese rechazo no corresponde a un socio identificado');
       // Antes de tocar el dinero.
       await this.access.exigirSinResolver(ctx, decision.id);
+      // D-06: sin rostro, «cobrar y abrir» no abre. Se dice antes de cobrar: el
+      // cobro se hace desde su tarjeta y la entrada la autoriza la gerencia.
+      try { await this.access.exigirRostroOAutorizacion(ctx, decision, null); } catch (e) {
+        if (e instanceof DomainError && e.reason === 'FACE_AUTHORIZATION_REQUIRED') {
+          throw conflict('No tiene su rostro registrado: aquí no se puede cobrar y abrir. Cóbrale desde su tarjeta («Cobrar») y después registra su rostro o pide la autorización de la gerencia para que entre. No se cobró nada.', 'FACE_AUTHORIZATION_REQUIRED');
+        }
+        throw e;
+      }
 
       // Cobro parcial (MC-22): al menos la cuota más vieja; lo demás se decide
       // en la ficha. Y sobre el NETO (4-18): el saldo a favor se aplica primero
@@ -172,10 +187,10 @@ export class ExceptionService {
           : `Pagó en el mostrador: ${formatMoney(money(input.amountCents))}`,
       });
       return { cobro, paso, memberId: decision.memberId, branchId: decision.branchId };
-    });
+    }));
 
-    // Los ganchos de la entrada (la clase reservada queda con su llegada), ya confirmado todo.
-    if (r.paso.attendanceId) await emitEntry({ organizationId: orgId, memberId: r.memberId, branchId: r.branchId, at: new Date() });
+    // Los ganchos de la entrada (la clase reservada queda con su llegada), ya confirmado todo. También en la reentrada (D-07).
+    if (r.paso.record.outcome === 'GRANTED') await emitEntry({ organizationId: orgId, memberId: r.memberId, branchId: r.branchId, at: new Date() });
 
     return {
       paymentId: r.cobro.payment.id,

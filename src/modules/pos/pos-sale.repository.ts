@@ -39,7 +39,12 @@ export type PosSaleLineRecord = {
   quantity: number;
   unitPriceCents: bigint;
   lineTotalCents: bigint;
+  /** PUBLIC · MEMBER: a qué precio salió (D-21). */
+  priceKind: string;
 };
+
+/** Lo que la venta deja escrito de cada línea además del precio (D-21): a qué precio salió y lo que costaba ese día. */
+export type DatosDeLinea = { priceKind: 'PUBLIC' | 'MEMBER'; unitCostCents: bigint | null };
 
 export class PosSaleRepository extends TenantRepository {
   async findById(id: string): Promise<PosSaleRecord | null> {
@@ -55,7 +60,7 @@ export class PosSaleRepository extends TenantRepository {
   async lines(posSaleId: string): Promise<PosSaleLineRecord[]> {
     const rows = await this.db.posSaleLine.findMany({
       where: this.scope({ posSaleId }),
-      select: { id: true, productId: true, quantity: true, unitPriceCents: true, lineTotalCents: true },
+      select: { id: true, productId: true, quantity: true, unitPriceCents: true, lineTotalCents: true, priceKind: true },
       orderBy: { id: 'asc' },
     });
     return rows as PosSaleLineRecord[];
@@ -98,12 +103,12 @@ export class PosSaleRepository extends TenantRepository {
     if (saleIds.length === 0) return porVenta;
     const filas = await this.db.posSaleLine.findMany({
       where: this.scope({ posSaleId: { in: [...saleIds] } }),
-      select: { id: true, posSaleId: true, productId: true, quantity: true, unitPriceCents: true, lineTotalCents: true, product: { select: { name: true } } },
+      select: { id: true, posSaleId: true, productId: true, quantity: true, unitPriceCents: true, lineTotalCents: true, priceKind: true, product: { select: { name: true } } },
       orderBy: { id: 'asc' },
     });
     for (const f of filas) {
       const lista = porVenta.get(f.posSaleId) ?? [];
-      lista.push({ id: f.id, productId: f.productId, quantity: f.quantity, unitPriceCents: f.unitPriceCents, lineTotalCents: f.lineTotalCents, name: f.product.name });
+      lista.push({ id: f.id, productId: f.productId, quantity: f.quantity, unitPriceCents: f.unitPriceCents, lineTotalCents: f.lineTotalCents, priceKind: f.priceKind, name: f.product.name });
       porVenta.set(f.posSaleId, lista);
     }
     return porVenta;
@@ -148,6 +153,8 @@ export class PosSaleRepository extends TenantRepository {
     soldByUserId: string;
     businessDate: Date;
     lines: readonly SaleLine[];
+    /** Por producto: a qué precio salió y su costo de hoy. Sin dato, precio de público y sin costo. */
+    lineData?: ReadonlyMap<string, DatosDeLinea>;
     inventoryProductIds: ReadonlySet<string>;
   }): Promise<PosSaleRecord> {
     return this.db.$transaction(async (tx) => {
@@ -181,6 +188,8 @@ export class PosSaleRepository extends TenantRepository {
             quantity: linea.quantity,
             unitPriceCents: linea.unitPrice.cents,
             lineTotalCents: linea.lineTotal.cents,
+            priceKind: input.lineData?.get(linea.productId)?.priceKind ?? 'PUBLIC',
+            unitCostCents: input.lineData?.get(linea.productId)?.unitCostCents ?? null,
           },
         });
 

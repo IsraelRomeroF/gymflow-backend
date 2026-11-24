@@ -1,5 +1,5 @@
 import {
-  consentGaps, notFound, reviewIntake, validateIntake, validation,
+  consentGaps, isMinor, notFound, reviewIntake, validateIntake, validation,
   normalizeEmail, normalizedNameKey, normalizePhoneMx, rankMatches, revisarMotivo,
   INTAKE_CORRECTABLE_FIELDS, SIGNUP_OPTIONAL_CONSENTS, SIGNUP_REQUIRED_CONSENTS,
   type AcceptedConsent, type ConsentDocument, type ConsentGap,
@@ -8,7 +8,10 @@ import type { IntakeFlag } from '@gymflow/core/contracts';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { enUnaTransaccion } from '../../platform/db/unit-of-work.js';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
-import { ConsentRepository, MemberRepository, MemberService, MemberNoticeRepository } from '../members/index.js';
+import {
+  ConsentRepository, MemberRepository, MemberService, MemberNoticeRepository,
+  asentarResponsable, prepararResponsable, ResponsibleRepository, type GuardianInput, type ResponsibleInput,
+} from '../members/index.js';
 import { BranchRepository, OrganizationRepository } from '../organization/index.js';
 import { ConsentDocumentRepository, type ConsentDocumentRecord } from '../members/index.js';
 import { MembershipRepository } from '../memberships/index.js';
@@ -47,6 +50,22 @@ export type IntakeReviewView = {
   /** El interesado abierto que es esta misma persona (10-10). */
   prospect: { id: string; branchId: string; source: string | null; status: string; followUps: number } | null;
   flags: IntakeFlag[];
+  /** D-10: es menor de edad hoy; se aprueba cuando su tutor firma en el mostrador. */
+  minor: boolean;
+};
+
+/**
+ * El tutor que firma en el mostrador por un menor (D-10). Con él delante se
+ * decide lo de la salud: solo si acepta `HEALTH_DATA` se captura la nota.
+ */
+export type FirmaDelTutor = GuardianInput & { healthConsent?: boolean | undefined; healthNotes?: string | null | undefined };
+
+/** Lo que decide quien revisa, además de las correcciones. */
+export type DecisionDeAlta = {
+  corrections?: CorreccionesAlta;
+  /** D-09: su celular ya es el de otro socio; quién responde por el número. */
+  responsible?: ResponsibleInput | undefined;
+  guardian?: FirmaDelTutor | undefined;
 };
 
 /** Mismo celular y otro nombre: comparten celular, no son la misma persona (9-02). */
@@ -123,6 +142,8 @@ function antesYDespues(intake: IntakeRecord, c: CorreccionesAlta): Record<string
 export function insignias(
   intake: IntakeRecord,
   conocidos: { socios: ReadonlyArray<{ phoneE164: string | null; email: string | null; nameKey: string }>; interesados: ReadonlyArray<{ phoneE164: string | null; email: string | null; nameKey: string }> },
+  /** El «hoy» de su sede: con él se sabe si es menor (D-10). */
+  hoy: Date,
 ): IntakeFlag[] {
   const c = correccionesVigentes(intake, intake.corrections);
   const d = conCorrecciones(intake, c);
@@ -131,9 +152,12 @@ export function insignias(
     (!!d.phoneE164 && x.phoneE164 === d.phoneE164) || (!!d.email && !!x.email && x.email.toLowerCase() === d.email);
   const socios = conocidos.socios.filter(mismoContacto);
   const flags: IntakeFlag[] = [];
+  // Lo primero que hay que saber: no se aprueba hasta que su tutor firme en el mostrador.
+  const menor = isMinor(d.birthDate, hoy);
+  if (menor) flags.push('NEEDS_GUARDIAN');
   if (!d.birthDate) flags.push('MISSING_BIRTHDATE');
   if (!d.emergencyContactName) flags.push('MISSING_EMERGENCY');
-  if (intake.healthNotes) flags.push('HEALTH_NOTE');
+  if (intake.healthNotes && !menor) flags.push('HEALTH_NOTE');
   if (socios.some((x) => x.nameKey === nombre)) flags.push('POSSIBLE_DUPLICATE');
   else if (socios.some((x) => !!d.phoneE164 && x.phoneE164 === d.phoneE164)) flags.push('SHARED_PHONE');
   if (conocidos.interesados.some((x) => mismoContacto(x) && x.nameKey === nombre)) flags.push('WAS_PROSPECT');
@@ -229,6 +253,9 @@ export class IntakeService {
     }
 
     const repo = new IntakeRepository(orgId);
+    // D-10: de 15 a 17 años. El alta queda «falta su tutor»; su nota de salud NO
+    // se captura (la autoriza el tutor en el mostrador, no el menor desde su teléfono).
+    const menor = isMinor(input.draft.birthDate, hoy);
     const datos = {
       firstName: input.draft.firstName.trim(),
       lastName: input.draft.lastName.trim(),
@@ -240,12 +267,15 @@ export class IntakeService {
       memberSince: input.draft.memberSince,
       // Sin consentimiento HEALTH_DATA la nota de salud NO se guarda: se
       // pidió permiso para ese dato y no se dio.
-      healthNotes: input.accepted.some((c) => c.consentType === 'HEALTH_DATA' && c.granted)
+      healthNotes: !menor && input.accepted.some((c) => c.consentType === 'HEALTH_DATA' && c.granted)
         ? input.draft.healthNotes : null,
+      guardianName: menor ? input.draft.guardianName?.trim() || null : null,
+      guardianPhoneE164: menor ? normalizePhoneMx(input.draft.guardianPhone) : null,
       acceptedConsents: input.accepted.map((a) => ({
         consentType: a.consentType,
         version: a.version,
-        granted: a.granted,
+        // Un menor no puede dar por sí mismo el permiso de sus datos de salud.
+        granted: menor && a.consentType === 'HEALTH_DATA' ? false : a.granted,
         documentId: byKey.get(`${a.consentType}:${a.version}`) ?? '',
       })),
       ip: input.ip,
@@ -306,7 +336,8 @@ export class IntakeService {
     } : null;
 
     const conocidos = await repo.contactosConocidos(d.phoneE164 ? [d.phoneE164] : [], d.email ? [d.email] : []);
-    return { intake, matches, suggestion: r.outcome, pendingFields, prospect, flags: insignias(intake, conocidos) };
+    const hoy = await new BusinessCalendar(orgId).today(intake.branchId);
+    return { intake, matches, suggestion: r.outcome, pendingFields, prospect, flags: insignias(intake, conocidos, hoy), minor: isMinor(d.birthDate, hoy) };
   }
 
   /** Las insignias de toda una página de la bandeja, con dos consultas (no una por alta). */
@@ -316,7 +347,10 @@ export class IntakeService {
       [...new Set(efectivos.map((d) => d.phoneE164).filter((x): x is string => !!x))],
       [...new Set(efectivos.map((d) => d.email).filter((x): x is string => !!x))],
     );
-    return new Map(intakes.map((i) => [i.id, insignias(i, conocidos)]));
+    const calendario = new BusinessCalendar(orgId);
+    const hoyPorSede = new Map<string, Date>();
+    for (const sede of new Set(intakes.map((i) => i.branchId))) hoyPorSede.set(sede, await calendario.today(sede));
+    return new Map(intakes.map((i) => [i.id, insignias(i, conocidos, hoyPorSede.get(i.branchId)!)]));
   }
 
   /**
@@ -350,9 +384,10 @@ export class IntakeService {
     if (Object.keys(c).length === 0) return;
     const d = conCorrecciones(intake, c);
     const hoy = await new BusinessCalendar(orgId).today(intake.branchId);
+    // (El tutor no se valida aquí: si recepción corrige el nacimiento y resulta menor, lo que falta es su firma, `GUARDIAN_REQUIRED`.)
     const errores = validateIntake({ ...toDraft(intake), firstName: d.firstName, lastName: d.lastName, phone: d.phoneE164, email: d.email, birthDate: d.birthDate, emergencyContactPhone: d.emergencyContactPhone, memberSince: d.memberSince }, hoy)
       // La edad mínima es del formulario en línea; en el mostrador decide recepción con la persona delante.
-      .filter((e) => !(e.field === 'birthDate' && /mayores de/.test(e.message)));
+      .filter((e) => !(e.field === 'birthDate' && /mayores de/.test(e.message)) && e.field !== 'guardianName' && e.field !== 'guardianPhone');
     if (errores.length > 0) throw validation(errores[0]!.message.replace('para contactarte', 'para contactarle'), JSON.stringify(errores));
   }
 
@@ -364,23 +399,34 @@ export class IntakeService {
   }
 
   /**
-   * Celular compartido (9-02). Dos socios activos todavía no pueden tener el
-   * mismo celular (lo decide D-09, fase 3): en vez del 409 genérico de la
-   * base, se dice de quién es y qué hacer.
+   * D-10 · Un menor de 15 a 17 años no se aprueba ni se vincula sin su tutor
+   * firmando en el mostrador. Lo que el tutor firma son los textos VIGENTES
+   * (aviso de privacidad y reglamento) y, si lo acepta, el de datos de salud:
+   * quedan como consentimientos a SU nombre. Lo que el menor marcó en su
+   * teléfono se queda en el borrador como lo que envió; no es la firma.
    */
-  private async exigirCelularLibre(orgId: string, phoneE164: string | null, salvoMemberId?: string): Promise<void> {
-    if (!phoneE164) return;
-    const socios = new MemberRepository(orgId);
-    if (!await socios.isPhoneTaken(phoneE164)) return;
-    for (const c of await socios.findDuplicateCandidates({ firstName: '', lastName: '', phoneE164 })) {
-      if (c.phoneE164 !== phoneE164 || c.id === salvoMemberId) continue;
-      const socio = await socios.findById(c.id);
-      if (!socio) continue;
+  private async firmasDelTutor(orgId: string, intake: IntakeRecord, d: { birthDate: Date | null }, tutor: FirmaDelTutor | undefined): Promise<{
+    menor: boolean; consents: Array<{ consentType: string; version: string; granted: boolean }>; healthNotes: string | null;
+  } | null> {
+    const hoy = await new BusinessCalendar(orgId).today(intake.branchId);
+    if (!isMinor(d.birthDate, hoy)) return null;
+    if (!tutor) {
       throw conflict(
-        `Ese celular ya es el de ${socio.firstName} ${socio.lastName} (${socio.memberCode}). Dos socios todavía no pueden compartir celular: en «Corregir o completar» pon otro celular o déjalo vacío y usa su correo`,
-        'PHONE_IN_USE',
+        `Tiene menos de 18 años: su alta se aprueba cuando su papá, mamá o tutor firma en el mostrador${intake.guardianName ? ` (escribió a ${intake.guardianName})` : ''}`,
+        'GUARDIAN_REQUIRED',
       );
     }
+    const vigentes = await new ConsentDocumentRepository(orgId).listPublished();
+    const consents = (SIGNUP_REQUIRED_CONSENTS as readonly string[]).map((tipo) => {
+      const doc = vigentes.find((x) => x.consentType === tipo);
+      if (!doc) throw validation('Falta publicar el aviso de privacidad o el reglamento: sin el texto vigente el tutor no tiene qué firmar');
+      return { consentType: tipo, version: doc.version, granted: true };
+    });
+    const salud = vigentes.find((x) => x.consentType === 'HEALTH_DATA');
+    const aceptaSalud = !!tutor.healthConsent && !!salud;
+    if (salud) consents.push({ consentType: 'HEALTH_DATA', version: salud.version, granted: aceptaSalud });
+    // Sin la firma del tutor para ese dato, la nota de salud no se guarda.
+    return { menor: true, consents, healthNotes: aceptaSalud ? tutor.healthNotes?.trim() || null : null };
   }
 
   /**
@@ -398,7 +444,7 @@ export class IntakeService {
   async approve(
     ctx: RequestContext,
     id: string,
-    opts: { force?: boolean; corrections?: CorreccionesAlta } = {},
+    opts: { force?: boolean } & DecisionDeAlta = {},
   ): Promise<{ memberId: string; memberCode: string; pendingReconsent: string[]; convertedProspectId: string | null }> {
     const orgId = ctx.tenant.organizationId;
     const repo = new IntakeRepository(orgId);
@@ -418,8 +464,10 @@ export class IntakeService {
       await this.validarCorregido(orgId, intake, c);
       const d = conCorrecciones(intake, c);
       const corregido = antesYDespues(intake, c);
-      // «Es otra persona»: si el celular es de otro socio activo, se explica (9-02).
-      if (opts.force) await this.exigirCelularLibre(orgId, d.phoneE164);
+      // D-10: un menor se aprueba con su tutor firmando aquí; los consentimientos quedan a nombre del tutor.
+      const tutor = await this.firmasDelTutor(orgId, intake, d, opts.guardian);
+      const firmas = tutor ? tutor.consents : intake.acceptedConsents;
+      // (Si el celular ya es de otro socio, `MemberService.create` pide al responsable: D-09, `PHONE_IN_USE`.)
 
       const result = await new MemberService().create(ctx, {
         firstName: d.firstName,
@@ -438,18 +486,21 @@ export class IntakeService {
         // en el mismo día en todas las zonas del país.
         joinedAt: d.memberSince
           ? new Date(`${d.memberSince.toISOString().slice(0, 10)}T18:00:00.000Z`) : null,
-        healthNotes: intake.acceptedConsents.some((x) => x.consentType === 'HEALTH_DATA' && x.granted)
-          ? intake.healthNotes : null,
+        healthNotes: tutor ? tutor.healthNotes
+          : intake.acceptedConsents.some((x) => x.consentType === 'HEALTH_DATA' && x.granted) ? intake.healthNotes : null,
         createdByUserId: ctx.tenant.actorUserId ?? '',
         force: opts.force ?? false,
-        consents: intake.acceptedConsents.map((x) => ({
+        responsible: opts.responsible,
+        guardian: tutor ? { name: opts.guardian!.name, phoneE164: opts.guardian!.phoneE164 ?? intake.guardianPhoneE164 } : undefined,
+        consents: firmas.map((x) => ({
           consentType: x.consentType,
           documentVersion: x.version,
           // El TEXTO exacto que vio. Sin él la evidencia es una afirmación.
-          documentText: byId.get(x.documentId)?.bodyText ?? null,
+          documentText: byId.get((x as { documentId?: string }).documentId ?? '')?.bodyText ?? null,
           granted: x.granted,
         })),
-        consentEvidence: {
+        // El tutor firma ahora y delante de recepción; el adulto firmó en su teléfono, a su hora.
+        consentEvidence: tutor ? undefined : {
           channel: 'SELF_SERVICE',
           ip: intake.ip,
           userAgent: intake.userAgent,
@@ -472,7 +523,7 @@ export class IntakeService {
 
       const pendingReconsent = consentGaps(
         docs.map(toDomainDoc),
-        intake.acceptedConsents.map((x) => ({
+        firmas.map((x) => ({
           consentType: x.consentType as AcceptedConsent['consentType'],
           version: x.version,
           granted: x.granted,
@@ -493,6 +544,7 @@ export class IntakeService {
         branchId: intake.branchId,
         afterState: {
           memberId: result.member.id, memberCode: result.member.memberCode,
+          ...(tutor ? { firmoSuTutor: true } : {}),
           ...(Object.keys(corregido).length ? { corregido } : {}), ...(convertedProspectId ? { prospectId: convertedProspectId } : {}),
         },
       });
@@ -515,7 +567,7 @@ export class IntakeService {
    * recepción corrigió y la nota de salud, si dio su consentimiento.
    */
   async link(
-    ctx: RequestContext, id: string, memberId: string, opts: { corrections?: CorreccionesAlta } = {},
+    ctx: RequestContext, id: string, memberId: string, opts: DecisionDeAlta = {},
   ): Promise<{ memberId: string; memberCode: string; pendingReconsent: string[]; convertedProspectId: string | null }> {
     const orgId = ctx.tenant.organizationId;
     const repo = new IntakeRepository(orgId);
@@ -537,8 +589,20 @@ export class IntakeService {
       await this.validarCorregido(orgId, intake, c);
       const d = conCorrecciones(intake, c);
       const corregido = antesYDespues(intake, c);
-      if (d.phoneE164 && d.phoneE164 !== socio.phoneE164) await this.exigirCelularLibre(orgId, d.phoneE164, memberId);
-      const conSalud = intake.acceptedConsents.some((x) => x.consentType === 'HEALTH_DATA' && x.granted) && !!intake.healthNotes;
+      // D-10: también al vincular, un menor necesita a su tutor firmando aquí.
+      const tutor = await this.firmasDelTutor(orgId, intake, { birthDate: d.birthDate ?? socio.birthDate }, opts.guardian);
+      const firmas = tutor ? tutor.consents : intake.acceptedConsents;
+      const firmante = tutor ? { name: opts.guardian!.name, phoneE164: opts.guardian!.phoneE164 ?? intake.guardianPhoneE164 } : null;
+      // D-09: si el celular que trae ya es el de otro socio, se comparte anotando al responsable.
+      const responsables = new ResponsibleRepository(orgId);
+      const responsable = firmante || (d.phoneE164 && d.phoneE164 !== socio.phoneE164)
+        ? await prepararResponsable(orgId, {
+          phoneE164: d.phoneE164 ?? socio.phoneE164, responsible: opts.responsible, guardian: firmante, memberId,
+          yaTiene: !!(await responsables.de(memberId))?.responsibleKind,
+        }) : undefined;
+      const notaDeSalud = tutor ? tutor.healthNotes
+        : intake.acceptedConsents.some((x) => x.consentType === 'HEALTH_DATA' && x.granted) ? intake.healthNotes : null;
+      const conSalud = !!notaDeSalud;
 
       // Lo que acaba de escribir es lo más reciente; lo que no dio, se conserva.
       // El nombre de la ficha no se cambia desde aquí: «es esta persona» ya lo dice.
@@ -549,24 +613,28 @@ export class IntakeService {
         ...(d.emergencyContactName ? { emergencyContactName: d.emergencyContactName } : {}),
         ...(d.emergencyContactPhone ? { emergencyContactPhone: d.emergencyContactPhone } : {}),
         // La nota de salud llega a la ficha con su consentimiento (antes se firmaba el permiso y la nota se perdía).
-        ...(conSalud ? { healthNotes: intake.healthNotes } : {}),
+        ...(conSalud ? { healthNotes: notaDeSalud } : {}),
       });
+      if (responsable) {
+        await responsables.escribir(memberId, responsable);
+        await asentarResponsable(orgId, memberId, d.phoneE164 ?? socio.phoneE164, responsable);
+      }
 
       const textos = new ConsentDocumentRepository(orgId);
       const consentimientos = new ConsentRepository(orgId);
-      for (const x of intake.acceptedConsents) {
+      for (const x of firmas) {
         await consentimientos.record({
           memberId,
           branchId: intake.branchId,
           consentType: x.consentType,
           documentVersion: x.version,
           // El texto lo pone el servidor, y una versión retirada solo vale si se firmó en su periodo (PS-06, 21-06).
-          documentText: await textos.textoParaFirmar(x.consentType, x.version, intake.submittedAt),
+          documentText: await textos.textoParaFirmar(x.consentType, x.version, firmante ? null : intake.submittedAt),
           granted: x.granted,
-          ip: intake.ip,
-          userAgent: intake.userAgent,
-          channel: 'SELF_SERVICE',
-          grantedAt: intake.submittedAt,
+          // El tutor firma ahora y delante de recepción, a su nombre (D-10); el adulto firmó en su teléfono, a su hora.
+          ...(firmante
+            ? { ip: ctx.ip ?? null, userAgent: ctx.userAgent ?? null, channel: 'ASSISTED', assistedByUserId: ctx.tenant.actorUserId ?? null, signedByName: firmante.name.trim(), signedByPhoneE164: normalizePhoneMx(firmante.phoneE164) }
+            : { ip: intake.ip, userAgent: intake.userAgent, channel: 'SELF_SERVICE', grantedAt: intake.submittedAt }),
         });
       }
 
@@ -579,7 +647,7 @@ export class IntakeService {
       const docs = await textos.listAll();
       const pendingReconsent = consentGaps(
         docs.map(toDomainDoc),
-        intake.acceptedConsents.map((x) => ({ consentType: x.consentType as AcceptedConsent['consentType'], version: x.version, granted: x.granted })),
+        firmas.map((x) => ({ consentType: x.consentType as AcceptedConsent['consentType'], version: x.version, granted: x.granted })),
       ).filter((g) => g.kind === 'STALE_VERSION').map((g) => g.consentType);
 
       await this.audit.record(ctx, {
@@ -588,7 +656,7 @@ export class IntakeService {
         resourceId: id,
         branchId: intake.branchId,
         afterState: {
-          memberId, memberCode: socio.memberCode, ...(conSalud ? { healthNotes: true } : {}),
+          memberId, memberCode: socio.memberCode, ...(conSalud ? { healthNotes: true } : {}), ...(tutor ? { firmoSuTutor: true } : {}),
           ...(Object.keys(corregido).length ? { corregido } : {}), ...(convertedProspectId ? { prospectId: convertedProspectId } : {}),
         },
       });
@@ -638,5 +706,7 @@ function toDraft(intake: IntakeRecord): IntakeDraft {
     emergencyContactPhone: intake.emergencyContactPhone,
     memberSince: intake.memberSince,
     healthNotes: intake.healthNotes,
+    guardianName: intake.guardianName,
+    guardianPhone: intake.guardianPhoneE164,
   };
 }

@@ -7,6 +7,7 @@ import { registerCredentialRoutes } from './credentials.routes.js';
 import { registerBiometricRoutes } from './biometrics.routes.js';
 import { registerFaceRoutes } from './face.routes.js';
 import { registerPendingRoutes } from './pending.routes.js';
+import { registerFaceRuleRoutes } from './face-rule.routes.js';
 
 /**
  * Las rutas de la entrada, en seis archivos por lo que hacen (auditoría 8,
@@ -23,4 +24,6 @@ export function registerAccessRoutes(app: FastifyInstance, env: Env): void {
   registerCredentialRoutes(app, env);
   registerBiometricRoutes(app);
   registerFaceRoutes(app, env);
+  // Entrar solo con rostro (fase 3, bloque 3.3; D-06): la regla del gimnasio y a quién le falta.
+  registerFaceRuleRoutes(app);
 }

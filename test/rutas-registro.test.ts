@@ -44,7 +44,12 @@ const clave = (r: Ruta) => `${r.method} ${r.url}`;
 const prefijo = (url: string) => url.split('/:')[0]!;
 const parametros = (url: string): string[] => url.match(/:\w+/g) ?? [];
 const permisosDe = (r: Ruta): PermissionKey[] => (r.security.kind === 'permission' ? [r.security.permission, ...(r.security.anyOf ?? [])] : []);
-const tiene = (puesto: Puesto, r: Ruta) => permisosDe(r).some((p) => ROLE_PERMISSIONS[puesto].includes(p));
+/**
+ * Lo que la SESIÓN le suma a un puesto sobre el catálogo (`identity/session.repository.ts`). D-23 (fase 3, 3.7): la
+ * dueña anota gastos, nómina y retiros aunque haya gerente. (Sin gerente suma más, pero estos gimnasios lo tienen.)
+ */
+const DE_LA_SESION: Partial<Record<Puesto, readonly string[]>> = { OWNER: ['expenses:manage'] };
+const tiene = (puesto: Puesto, r: Ruta) => permisosDe(r).some((p) => ROLE_PERMISSIONS[puesto].includes(p) || (DE_LA_SESION[puesto] ?? []).includes(p));
 const esDePersonal = (r: Ruta) => r.security.kind === 'permission' || r.security.kind === 'session';
 const sinFallos = (mal: string[]) => expect(mal.join('\n')).toBe('');
 

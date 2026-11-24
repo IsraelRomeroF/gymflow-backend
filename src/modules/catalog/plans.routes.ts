@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { notFound } from '@gymflow/core';
-import { PlanImpact } from '@gymflow/core/contracts';
+import { PlanImpact, PriceProtectionResult, ProtectedPrices } from '@gymflow/core/contracts';
 import { route } from '../../platform/http/registry.js';
 import { respuesta } from '../../platform/http/respuesta.js';
 import { PlanRepository, type PlanRecord } from './plan.repository.js';
@@ -75,6 +75,8 @@ export function registerPlanRoutes(app: FastifyInstance): void {
             ...a, priceOverrideCents: a.priceOverrideCents === null ? null : a.priceOverrideCents.toString(),
           })),
           liveMemberships: detalles.get(plan.id)!.liveMemberships,
+          // Cuántas de esas conservan su precio (D-19).
+          protectedPrices: detalles.get(plan.id)!.protectedPrices,
           livePacks: detalles.get(plan.id)!.livePacks,
         } : {}),
       }));
@@ -112,12 +114,14 @@ export function registerPlanRoutes(app: FastifyInstance): void {
   });
 
   /**
-   * Edita un plan. Cambiar el precio no toca lo ya cobrado ni las cuotas de
-   * quien ya tiene el plan: cada venta deja escrito su precio (DM-05,
-   * `agreedPriceCents`, el de lista si no se pactó otro) y renueva con él. El
-   * precio nuevo vale para las ventas nuevas y para quien quedó sin precio
-   * pactado (un cambio de plan lo borra). Aun así exige motivo y queda en la
-   * bitácora con el antes y el después.
+   * Edita un plan. Cambiar el precio le cambia a TODOS en su siguiente pago
+   * (D-19, bloque 3.6): además del precio de lista (ventas nuevas), en la
+   * misma transacción se mueve el precio pactado de las membresías vivas del
+   * plan. Lo ya cobrado y las cuotas ya emitidas no se tocan. Las que
+   * «conservan su precio» no cambian solas: si las hay, `priceChange.
+   * includeProtected` debe decir qué se decide o responde 409
+   * `PRICE_CHANGE_NEEDS_DECISION` sin haber cambiado nada. Exige motivo y
+   * queda en la bitácora con el antes, el después y a cuántos tocó.
    */
   route(app, {
     method: 'PATCH',
@@ -129,18 +133,23 @@ export function registerPlanRoutes(app: FastifyInstance): void {
       const body = z.object({
         ...Object.fromEntries(Object.entries(planFields).map(([k, v]) => [k, v.optional()])),
         branchIds: branchIdsField.optional(),
+        // Solo cuenta si cambia el precio: el precio que vio quien confirma y qué decide de quienes conservan el suyo.
+        priceChange: z.object({ includeProtected: z.boolean().optional(), fromPriceCents: centavos.optional() }).optional(),
         reason: z.string().min(3).max(300),
-      }).parse(request.body) as Record<string, unknown> & { reason: string; branchIds?: string[] };
+      }).parse(request.body) as Record<string, unknown> & { reason: string; branchIds?: string[]; priceChange?: { includeProtected?: boolean; fromPriceCents?: string } };
       // El precio y la disponibilidad de un plan valen para todo el gimnasio (SEC2-04).
       request.authorize('catalog:manage', { reason: body.reason, branchId: null });
 
-      const { reason, branchIds, ...cambios } = body;
+      const { reason, branchIds, priceChange, ...cambios } = body;
       const patch: Record<string, unknown> = { ...cambios };
       if (typeof cambios.priceCents === 'string') patch.priceCents = BigInt(cambios.priceCents);
       if (typeof cambios.signupFeeCents === 'string') patch.signupFeeCents = BigInt(cambios.signupFeeCents);
       for (const k of Object.keys(patch)) if (patch[k] === undefined) delete patch[k];
 
-      const despues = await service.editarPlan(ctx, id, patch, branchIds, reason);
+      const despues = await service.editarPlan(ctx, id, patch, branchIds, reason, {
+        includeProtected: priceChange?.includeProtected,
+        fromPriceCents: priceChange?.fromPriceCents !== undefined ? BigInt(priceChange.fromPriceCents) : undefined,
+      });
       return serializePlan(despues);
     },
   });
@@ -149,7 +158,9 @@ export function registerPlanRoutes(app: FastifyInstance): void {
    * Impacto de un cambio (16-04): cuántas membresías y paquetes vivos tiene el
    * plan en cada sucursal de venta, y cuántas renuevan a su precio pactado. Lo
    * lee el formulario antes de subir un precio, apagar una sede o desactivar
-   * el plan. Es de quien arma el catálogo, y de todo el gimnasio.
+   * el plan. Es de quien arma el catálogo, y de todo el gimnasio. Con
+   * `?newPriceCents=` trae además `priceChange`: lo que haría ese cambio de
+   * precio (D-19), sin escribir nada.
    */
   route(app, {
     method: 'GET',
@@ -158,8 +169,40 @@ export function registerPlanRoutes(app: FastifyInstance): void {
     schema: respuesta(200, PlanImpact),
     handler: async (request) => {
       const { id } = idParam.parse(request.params);
+      const q = z.object({ newPriceCents: centavos.optional() }).parse(request.query);
       request.requirePermission('catalog:manage', null);
-      return service.impacto(request.ctx!, id);
+      return service.impacto(request.ctx!, id, q.newPriceCents !== undefined ? BigInt(q.newPriceCents) : undefined);
+    },
+  });
+
+  /** Quiénes «conservan su precio» en este plan (D-19): la lista que se revisa antes de un cambio de precio. */
+  route(app, {
+    method: 'GET',
+    url: '/plans/:id/protected-prices',
+    security: { kind: 'permission', permission: 'catalog:manage' },
+    schema: respuesta(200, ProtectedPrices),
+    handler: async (request) => {
+      const { id } = idParam.parse(request.params);
+      request.requirePermission('catalog:manage', null);
+      return service.preciosProtegidos(request.ctx!, id);
+    },
+  });
+
+  /**
+   * Pone o quita «conserva su precio» a una membresía (D-19), con motivo. Es
+   * una decisión de precio de todo el gimnasio: la toma quien arma el
+   * catálogo, no el mostrador. Repetirla no hace nada.
+   */
+  route(app, {
+    method: 'PUT',
+    url: '/memberships/:id/price-protection',
+    security: { kind: 'permission', permission: 'catalog:manage' },
+    schema: respuesta(200, PriceProtectionResult),
+    handler: async (request) => {
+      const { id } = idParam.parse(request.params);
+      const body = z.object({ protected: z.boolean(), reason: z.string().trim().min(3).max(300) }).parse(request.body);
+      request.authorize('catalog:manage', { reason: body.reason, branchId: null });
+      return service.marcarPrecio(request.ctx!, id, body.protected, body.reason);
     },
   });
 

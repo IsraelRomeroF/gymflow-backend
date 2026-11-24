@@ -130,7 +130,7 @@ export function registerFaceRoutes(app: FastifyInstance, env: Env): void {
       return {
         reconocido: true, memberId: r.memberId, memberName: r.memberName,
         outcome: d.decision.outcome, reason: d.decision.reason, warning: d.decision.warning,
-        consumedVisit: d.decision.consumesVisit, decisionId: d.record.id,
+        consumedVisit: d.decision.consumesVisit, reentry: d.decision.reentry, decisionId: d.record.id,
         outstandingCents: d.outstandingCents?.toString() ?? null,
         debeVolverAFirmar,
       } satisfies FaceAccessResult;

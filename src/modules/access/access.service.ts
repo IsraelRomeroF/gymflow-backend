@@ -1,17 +1,19 @@
 import {
-  ACCESS_POLICY_VERSION, checkPolicyVersion, DomainError, evaluateAccess, isOverridable,
+  ACCESS_POLICY_VERSION, checkPolicyVersion, conflict, DomainError, evaluateAccess, isOverridable,
   notFound, validation, visitBalance,
   type AccessDecision as PolicyDecision, type AccessSubject, type CredentialKind,
   type DenialReason,
   type PolicyVersionCheck, type TimeWindow, type VisitLedgerEntry } from '@gymflow/core';
 import { codigoDeTexto } from '@gymflow/core/motivos';
+import { AVISO_PASE_DEL_DIA, AVISO_PASE_DE_PRUEBA } from '@gymflow/core/vocabulario';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { enUnaTransaccion } from '../../platform/db/unit-of-work.js';
 import { isUniqueViolation } from '../../platform/db/prisma-errors.js';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
+import { GrantRepository, PushService, UserRepository } from '../identity/index.js';
 import { MemberRepository } from '../members/index.js';
 import { OrganizationRepository } from '../organization/index.js';
-import { ChargeRepository, DayPassRepository, PaymentRepository } from '../billing/index.js';
+import { ChargeRepository, DayPassRepository, PaymentRepository, TrialPassRepository } from '../billing/index.js';
 import { emitEntry } from './entry-hooks.js';
 import { MembershipRepository, VisitPackRepository } from '../memberships/index.js';
 import { PlanRepository } from '../catalog/index.js';
@@ -42,6 +44,43 @@ export type AccessResult = {
   minimumCents: bigint | null;
   periodsOwed: number | null;
 };
+
+/** Qué pide la entrada por el mostrador en una sede (`ManualEntryPolicy` del núcleo). */
+export type ManualPolicy = { requiresReason: boolean; hasBiometric: boolean; faceRequired: boolean };
+
+/**
+ * D-06 · La autorización de la gerencia para UNA visita de quien no tiene su
+ * rostro registrado: quién autoriza, por qué y si fue con la firma de la
+ * dueña (`signature`) en la sesión de otra persona.
+ */
+export type FaceAuthorization = { byUserId: string; reason: string; signature: boolean };
+
+/** Lo que la política necesita saber del rostro: solo donde la regla está encendida y la sede usa biometría. */
+function puertaDelRostro(p: ManualPolicy, autorizada: boolean): { enrolled: boolean; authorized: boolean } | null {
+  return p.faceRequired ? { enrolled: p.hasBiometric, authorized: autorizada } : null;
+}
+
+/** Entra con algo que no es su plan ni su paquete: pase del día, de prueba o clase suelta (la política lo dice en el aviso). */
+function entraConPase(d: PolicyDecision): boolean {
+  return d.outcome === 'GRANTED' && d.warning !== null
+    && (d.warning === AVISO_PASE_DEL_DIA || d.warning === AVISO_PASE_DE_PRUEBA || d.warning.startsWith('Entra a su clase suelta'));
+}
+
+/**
+ * Con la regla del rostro encendida, quien pasa por el mostrador SIN rostro ya
+ * está resuelto por la política y no se le pide motivo: lo pone el sistema.
+ * `null` = el motivo, si hace falta, lo da una persona.
+ */
+function motivoAutomatico(p: ManualPolicy, d: PolicyDecision): string | null {
+  if (!p.faceRequired || p.hasBiometric || d.outcome !== 'GRANTED') return null;
+  if (d.reentry) return 'Reentrada del día: su entrada de hoy ya estaba registrada';
+  return entraConPase(d) ? d.warning : null;
+}
+
+/** D-06: sin rostro, el paso lo autoriza la gerencia. Nadie más. */
+export function faltaLaAutorizacion(): DomainError {
+  return conflict('No tiene su rostro registrado: esta entrada solo la autoriza la gerencia. Registra su rostro o pide la autorización.', 'FACE_AUTHORIZATION_REQUIRED');
+}
 
 /** Cuánto debe y cuánto basta para pasar hoy. La usa también la pantalla de excepción. */
 export async function deudaEnPuerta(orgId: string, memberId: string): Promise<{ outstandingCents: bigint; minimumCents: bigint; periodsOwed: number }> {
@@ -82,6 +121,13 @@ export class AccessService {
      * ligado al rechazo; la base admite una sola resolución por rechazo.
      */
     resolvesDecisionId?: string | null;
+    /**
+     * D-06 · La gerencia autoriza ESTA visita de quien no tiene su rostro
+     * registrado. `byUserId` es quien autoriza (la gerencia en su sesión, o
+     * la dueña con su firma: `signature`). La ruta ya comprobó que puede; aquí
+     * solo abre la puerta del rostro, lo demás lo sigue decidiendo la política.
+     */
+    faceAuthorization?: FaceAuthorization | null;
   }): Promise<AccessResult> {
     const repo = new AccessRepository(ctx.tenant.organizationId);
     if (input.requestKey) {
@@ -110,7 +156,7 @@ export class AccessService {
     decision: PolicyDecision;
     outstandingCents: bigint | null; minimumCents: bigint | null; periodsOwed: number | null;
     creditCents: bigint;
-    policy: { requiresReason: boolean; hasBiometric: boolean };
+    policy: ManualPolicy;
   }> {
     const orgId = ctx.tenant.organizationId;
     const repo = new AccessRepository(orgId);
@@ -119,24 +165,29 @@ export class AccessService {
     const [businessDate, tz, politica] = await Promise.all([
       calendario.today(input.branchId, ahora), calendario.timezoneFor(input.branchId), this.politicaManual(ctx, input.branchId, input.memberId),
     ]);
-    const [revocada, subject, yaUsada, settings] = await Promise.all([
+    const [revocada, subject, yaUsada, settings, entradaDeHoy] = await Promise.all([
       credencialRevocada(orgId, input.memberId, 'MANUAL'),
       this.buildSubject(orgId, input.memberId, businessDate, ahora, input.branchId),
       repo.credentialUsedSince(input.memberId, new Date(ahora.getTime() - ANTI_REPLAY_SEGUNDOS * 1000)),
       new OrganizationRepository(orgId).accessSettings(),
+      repo.entradaContadaDeHoy(input.memberId, input.branchId, businessDate),
     ]);
     const { minuteOfDay, weekday } = localClock(tz, ahora);
     const decision = evaluateAccess({
       at: ahora, localMinuteOfDay: minuteOfDay, localWeekday: weekday, branchId: input.branchId,
       credential: { kind: 'MANUAL', revoked: revocada, expiresAt: null, alreadyUsed: yaUsada },
       subject, settings,
+      entryToday: entradaDeHoy ? { visitPackId: entradaDeHoy.visitPackId } : null,
+      biometricGate: puertaDelRostro(politica, false),
     });
     const [deuda, creditCents] = await Promise.all([
       (decision.reason === 'MEMBERSHIP_PAST_DUE' || decision.reason === 'MEMBERSHIP_SUSPENDED') ? deudaEnPuerta(orgId, input.memberId) : null,
       new PaymentRepository(orgId).creditBalanceCents(input.memberId),
     ]);
     return {
-      decision, policy: politica, creditCents,
+      // Con la regla del rostro, a quien pasa sin tenerlo (reentrada, pase del día, de prueba o
+      // clase suelta) no se le pide motivo: lo pone el sistema (ver `decidir`).
+      decision, policy: { ...politica, requiresReason: politica.requiresReason && !motivoAutomatico(politica, decision) }, creditCents,
       outstandingCents: deuda?.outstandingCents ?? null, minimumCents: deuda?.minimumCents ?? null, periodsOwed: deuda?.periodsOwed ?? null,
     };
   }
@@ -155,12 +206,18 @@ export class AccessService {
       calendario.today(branchId, ahora), calendario.timezoneFor(branchId),
       new OrganizationRepository(orgId).accessSettings(), credencialRevocada(orgId, memberId, 'MANUAL'),
     ]);
-    const subject = await this.buildSubject(orgId, memberId, businessDate, ahora, branchId);
+    const [subject, entradaDeHoy] = await Promise.all([
+      this.buildSubject(orgId, memberId, businessDate, ahora, branchId),
+      new AccessRepository(orgId).entradaContadaDeHoy(memberId, branchId, businessDate),
+    ]);
     const { minuteOfDay, weekday } = localClock(tz, ahora);
     const decision = evaluateAccess({
       at: ahora, localMinuteOfDay: minuteOfDay, localWeekday: weekday, branchId,
       credential: { kind: 'MANUAL', revoked: revocada, expiresAt: null, alreadyUsed: false },
       subject, settings,
+      // D-07: si ya entró hoy, lo que el teléfono dice es lo de una reentrada (su última visita del paquete ya pagó el día).
+      entryToday: entradaDeHoy ? { visitPackId: entradaDeHoy.visitPackId } : null,
+      // La regla del rostro (D-06) no se le aplica aquí: el teléfono contesta por su plan; que le falte el rostro se lo dice recepción.
     });
     return { decision, subject };
   }
@@ -174,7 +231,7 @@ export class AccessService {
       ? await deudaEnPuerta(ctx.tenant.organizationId, r.decision.memberId) : null;
     return {
       decision: {
-        outcome: r.decision.outcome, reason, consumesVisit: r.consumedVisit, warning: null,
+        outcome: r.decision.outcome, reason, consumesVisit: r.consumedVisit, reentry: r.decision.reentry, warning: null,
         overridable: reason ? isOverridable(reason) : false,
         policyVersion: r.decision.policyVersion, evaluatedAt: r.decision.at,
       },
@@ -187,12 +244,25 @@ export class AccessService {
    * sucursal usa biometría, el acceso normal es el rostro o la huella; la
    * entrada manual solo se registra con motivo y queda en la bitácora.
    */
-  async politicaManual(ctx: RequestContext, branchId: string, memberId: string): Promise<{ requiresReason: boolean; hasBiometric: boolean }> {
+  async politicaManual(ctx: RequestContext, branchId: string, memberId: string): Promise<ManualPolicy> {
     const orgId = ctx.tenant.organizationId;
     const conBiometria = (ctx.modules ?? await moduleViewOf(orgId)).at(branchId).has('biometrics');
-    if (!conBiometria) return { requiresReason: false, hasBiometric: false };
-    const vivos = (await new EnrollmentRepository(orgId).listForMember(memberId)).filter((e) => !e.revokedAt && e.branchId === branchId);
-    return { requiresReason: true, hasBiometric: vivos.length > 0 };
+    if (!conBiometria) return { requiresReason: false, hasBiometric: false, faceRequired: false };
+    const [enrolamientos, settings] = await Promise.all([
+      new EnrollmentRepository(orgId).listForMember(memberId), new OrganizationRepository(orgId).accessSettings(),
+    ]);
+    const vivos = enrolamientos.filter((e) => !e.revokedAt && e.branchId === branchId);
+    // D-06: la regla del gimnasio solo pesa donde la sede usa biometría.
+    return { requiresReason: true, hasBiometric: vivos.length > 0, faceRequired: settings.requireFaceToEnter === true };
+  }
+
+  /**
+   * D-06 · ¿A este socio le falta el rostro para entrar por aquí? (la regla
+   * está encendida, la sede usa biometría y no tiene rostro ni huella vigente).
+   */
+  async faltaElRostro(ctx: RequestContext, branchId: string, memberId: string): Promise<boolean> {
+    const p = await this.politicaManual(ctx, branchId, memberId);
+    return p.faceRequired && !p.hasBiometric;
   }
 
   /**
@@ -261,6 +331,11 @@ export class AccessService {
     const { minuteOfDay, weekday } = localClock(tz, ahora);
     const settings = await new OrganizationRepository(orgId).accessSettings();
 
+    // D-07: la entrada que ya contó hoy en esta sede. Con ella, esto es una reentrada.
+    const entradaDeHoy = input.memberId ? await repo.entradaContadaDeHoy(input.memberId, input.branchId, businessDate) : null;
+    // D-06: la autorización de la gerencia abre la puerta del rostro, y solo esa.
+    const autorizacion = politica?.faceRequired && !politica.hasBiometric ? input.faceAuthorization ?? null : null;
+
     const decision = evaluateAccess({
       at: ahora,
       localMinuteOfDay: minuteOfDay,
@@ -282,12 +357,24 @@ export class AccessService {
       },
       subject,
       settings,
+      entryToday: entradaDeHoy ? { visitPackId: entradaDeHoy.visitPackId } : null,
+      biometricGate: politica ? puertaDelRostro(politica, autorizacion !== null) : null,
     });
+    // ¿Entró GRACIAS a la autorización? (sin rostro, no es reentrada y su plan o paquete dijeron que sí).
+    const autorizada = autorizacion !== null && decision.outcome === 'GRANTED' && !decision.reentry && !entraConPase(decision);
 
     let excepcion: { reason: string; hasBiometric: boolean } | null = null;
-    if (politica?.requiresReason) {
-      const motivo = input.manualReason?.trim() ?? '';
+    if (autorizada) {
+      // Queda como entrada autorizada (abajo), no como excepción de mostrador.
+    } else if (politica?.requiresReason) {
+      // Una autorización que no hizo falta (ya registró su rostro, o es reentrada) deja su motivo como el de la excepción.
+      const motivo = (input.manualReason ?? input.faceAuthorization?.reason)?.trim() ?? '';
+      const automatico = motivoAutomatico(politica, decision);
       if (motivo.length >= 3) excepcion = { reason: motivo, hasBiometric: politica.hasBiometric };
+      // Con la regla del rostro, quien pasa sin tenerlo ya está resuelto por la
+      // política (reentrada de una visita autorizada, pase del día, de prueba o
+      // clase suelta): el motivo lo pone el sistema y queda igual en la bitácora.
+      else if (automatico) excepcion = { reason: automatico, hasBiometric: false };
       else if (decision.outcome === 'GRANTED') {
         throw validation(politica.hasBiometric
           ? 'La entrada por el mostrador es una excepción: escribe el motivo. Lo normal es que entre con su rostro o su huella.'
@@ -321,8 +408,11 @@ export class AccessService {
       businessDate,
       requestKey: input.requestKey ?? null,
       ...(excepcion ? { overriddenByUserId: ctx.tenant.actorUserId ?? null, overrideReason: excepcion.reason } : {}),
+      // D-06: en la decisión queda QUIÉN autorizó y por qué.
+      ...(autorizada && autorizacion ? { overriddenByUserId: autorizacion.byUserId, overrideReason: autorizacion.reason } : {}),
       ...(input.evidencia ?? {}),
       resolvesDecisionId: resuelve,
+      reentry: decision.reentry,
     });
     } catch (e) {
       // Otra persona resolvió ese rechazo en este mismo instante.
@@ -334,7 +424,20 @@ export class AccessService {
       await this.audit.record(ctx, {
         action: 'access.manual_entry', resourceType: 'access_decision', resourceId: record.id, reason: excepcion.reason, branchId: input.branchId,
         // `reasonCode` del catálogo (`MOTIVOS.entradaManual`, 2.13): el chip escribe su texto y aquí se vuelve a contar; lo demás es `OTRO`.
-        afterState: { memberId: input.memberId, outcome: decision.outcome, denialReason: decision.reason, hasBiometric: excepcion.hasBiometric, reasonCode: codigoDeTexto('entradaManual', excepcion.reason) },
+        afterState: { memberId: input.memberId, outcome: decision.outcome, denialReason: decision.reason, hasBiometric: excepcion.hasBiometric, reasonCode: codigoDeTexto('entradaManual', excepcion.reason), ...(decision.reentry ? { reentry: true } : {}) },
+      });
+    }
+    if (autorizada && autorizacion) {
+      // D-06: quién autorizó, quién registró y por qué. Es la otra forma de
+      // entrar que hace válido el consentimiento biométrico: tiene que constar.
+      await this.audit.record(ctx, {
+        action: 'access.entry.authorize_without_face', resourceType: 'access_decision', resourceId: record.id, reason: autorizacion.reason, branchId: input.branchId,
+        ...(autorizacion.signature ? { approvedByUserId: autorizacion.byUserId } : {}),
+        afterState: {
+          memberId: input.memberId, authorizedByUserId: autorizacion.byUserId, registeredByUserId: ctx.tenant.actorUserId ?? null,
+          signature: autorizacion.signature, reasonCode: codigoDeTexto('entradaSinRostro', autorizacion.reason),
+          consumedVisit: decision.consumesVisit, resolvedDecisionId: resuelve,
+        },
       });
     }
 
@@ -359,7 +462,10 @@ export class AccessService {
     const deuda = (decision.reason === 'MEMBERSHIP_PAST_DUE' || decision.reason === 'MEMBERSHIP_SUSPENDED') && input.memberId
       ? await deudaEnPuerta(orgId, input.memberId) : null;
     // Entró: la clase que tenía reservada en esta sede queda con su llegada (puerta + clase en un registro).
-    if (decision.outcome === 'GRANTED' && input.memberId && attendanceId) await emitEntry({ organizationId: orgId, memberId: input.memberId, branchId: input.branchId, at: new Date() });
+    // D-06: alguien espera en la puerta la autorización de la gerencia. Se le avisa a su teléfono; si el aviso no sale, la lista «Por resolver en la puerta» lo enseña igual.
+    if (decision.reason === 'BIOMETRIC_REQUIRED' && input.memberId) void this.avisarALaGerencia(ctx, input.branchId, input.memberId).catch(() => undefined);
+    // También en la reentrada (D-07): no cuenta otra asistencia, pero sí llegó a su clase.
+    if (decision.outcome === 'GRANTED' && input.memberId) await emitEntry({ organizationId: orgId, memberId: input.memberId, branchId: input.branchId, at: new Date() });
     return { decision, record, attendanceId, outstandingCents: deuda?.outstandingCents ?? null, minimumCents: deuda?.minimumCents ?? null, periodsOwed: deuda?.periodsOwed ?? null };
   }
 
@@ -382,10 +488,87 @@ export class AccessService {
    */
   async grantManually(ctx: RequestContext, input: {
     decisionId: string; reason: string;
+    /** D-06: quién de la gerencia autoriza, cuando el socio no tiene su rostro registrado. */
+    faceAuthorization?: FaceAuthorization | null;
   }): Promise<AccessResult> {
-    const r = await this.concederSobreRechazo(ctx, { ...input, reasonCode: codigoDeTexto('dejarPasar', input.reason) });
-    if (r.record.memberId && r.attendanceId) await emitEntry({ organizationId: ctx.tenant.organizationId, memberId: r.record.memberId, branchId: r.record.branchId, at: new Date() });
-    return r;
+    const orgId = ctx.tenant.organizationId;
+    const repo = new AccessRepository(orgId);
+    const original = await repo.findDecision(input.decisionId);
+    if (!original) throw notFound('Decisión no encontrada');
+    const conceder = async (): Promise<AccessResult> => {
+      // D-06: a quien se rechazó por no tener rostro no se le «deja pasar»: se
+      // AUTORIZA su visita, y la política vuelve a decidir de verdad.
+      if (original.denialReason === 'BIOMETRIC_REQUIRED') return this.autorizarSinRostro(ctx, original, input.reason, input.faceAuthorization ?? null);
+      const r = await this.concederSobreRechazo(ctx, { ...input, reasonCode: codigoDeTexto('dejarPasar', input.reason) });
+      if (r.record.memberId) await emitEntry({ organizationId: orgId, memberId: r.record.memberId, branchId: r.record.branchId, at: new Date() });
+      return r;
+    };
+    // Un socio a la vez, como en `attempt`: «¿ya entró hoy?» (D-07) se lee y se escribe sin otro paso en medio.
+    return original.memberId ? repo.withMemberLock(original.memberId, conceder) : conceder();
+  }
+
+  /**
+   * D-06 · LA AUTORIZACIÓN DE LA GERENCIA, por visita.
+   *
+   * El rechazo `BIOMETRIC_REQUIRED` dice que su plan o su paquete estaban en
+   * orden y solo faltaba el rostro. Autorizarlo no es saltarse la política: es
+   * volver a preguntarle con la puerta del rostro abierta. Así la entrada
+   * autorizada es una entrada normal (cuenta su asistencia y descuenta su
+   * visita si entra con paquete) y, si mientras tanto dejó de poder pasar por
+   * otra cosa, la política lo dice y nada queda resuelto.
+   */
+  private async autorizarSinRostro(ctx: RequestContext, original: DecisionRecord, reason: string, autorizacion: FaceAuthorization | null): Promise<AccessResult> {
+    if (!original.memberId) throw validation('Ese rechazo no corresponde a un socio identificado');
+    // Si mientras esperaba registró su rostro, ya no hay nada que autorizar: entra
+    // como cualquiera que pasa por el mostrador teniendo rostro (excepción con motivo).
+    if (!autorizacion && await this.faltaElRostro(ctx, original.branchId, original.memberId)) throw faltaLaAutorizacion();
+    const previa = await new AccessRepository(ctx.tenant.organizationId).resolucionDe(original.id);
+    if (previa) throw await yaResuelto(ctx.tenant.organizationId, new AccessRepository(ctx.tenant.organizationId), previa);
+    return this.decidir(ctx, {
+      branchId: original.branchId, memberId: original.memberId, credentialKind: 'MANUAL',
+      gatewayId: original.gatewayId, resolvesDecisionId: original.id, faceAuthorization: autorizacion, manualReason: reason,
+    });
+  }
+
+  /**
+   * D-06 · Aviso al teléfono de quien puede autorizar la entrada sin rostro en
+   * esa sede (la gerencia), salvo a quien la está registrando. El aviso no
+   * lleva más que el nombre de pila: el resto se ve dentro del panel.
+   */
+  private async avisarALaGerencia(ctx: RequestContext, branchId: string, memberId: string): Promise<void> {
+    const orgId = ctx.tenant.organizationId;
+    const grants = new GrantRepository();
+    const quienes: string[] = [];
+    for (const u of await new UserRepository(orgId).activeExcept(ctx.tenant.actorUserId ?? '')) {
+      const suyos = await grants.grantsForUser(u.id);
+      if (suyos.some((g) => g.permission === 'access:entry:authorize' && (g.branchId === null || g.branchId === branchId))) quienes.push(u.id);
+    }
+    if (quienes.length === 0) return;
+    const socio = await new MemberRepository(orgId).findById(memberId);
+    await new PushService().sendToUsers(orgId, quienes, {
+      title: 'Autoriza una entrada sin rostro',
+      body: `${socio?.firstName ?? 'Un socio'} está en la puerta y no tiene su rostro registrado. Solo entra si lo autorizas.`,
+      url: '/panel', tag: `sin-rostro-${memberId}`,
+    });
+  }
+
+  /**
+   * D-06 · Antes de dejar pasar sobre CUALQUIER rechazo: si al socio le falta
+   * el rostro y hoy no ha entrado, el paso necesita a la gerencia. Si no,
+   * «dejar pasar con motivo» o «cobrar y abrir» serían la puerta de atrás de
+   * la regla. Se llama antes de tocar dinero.
+   */
+  async exigirRostroOAutorizacion(ctx: RequestContext, d: { branchId: string; memberId: string | null }, autorizacion: FaceAuthorization | null): Promise<{ sinRostro: boolean; reentry: boolean }> {
+    if (!d.memberId) return { sinRostro: false, reentry: false };
+    const orgId = ctx.tenant.organizationId;
+    const businessDate = await new BusinessCalendar(orgId).today(d.branchId);
+    const [falta, entradaDeHoy] = await Promise.all([
+      this.faltaElRostro(ctx, d.branchId, d.memberId), new AccessRepository(orgId).entradaContadaDeHoy(d.memberId, d.branchId, businessDate),
+    ]);
+    const reentry = entradaDeHoy !== null;
+    // La visita de hoy ya entró (autorizada): la reentrada no la vuelve a pedir.
+    if (falta && !reentry && !autorizacion) throw faltaLaAutorizacion();
+    return { sinRostro: falta && !reentry, reentry };
   }
 
   /** 409 si ese rechazo ya se resolvió, con quién y a qué hora. Va antes de cobrar nada. */
@@ -405,6 +588,8 @@ export class AccessService {
     decisionId: string; reason: string;
     /** Código del catálogo `MOTIVOS.dejarPasar` cuando el motivo lo dio una persona (2.13); el cobro en la puerta no lleva. */
     reasonCode?: string;
+    /** D-06: quién de la gerencia autoriza, si al socio le falta el rostro. */
+    faceAuthorization?: FaceAuthorization | null;
   }): Promise<AccessResult> {
     const orgId = ctx.tenant.organizationId;
     const userId = ctx.tenant.actorUserId;
@@ -424,6 +609,9 @@ export class AccessService {
     if (previa) throw await yaResuelto(orgId, repo, previa);
 
     const businessDate = await new BusinessCalendar(orgId).today(original.branchId);
+    // D-06 y D-07: sin rostro solo con la gerencia; y si hoy ya entró aquí, esto es una reentrada.
+    const { sinRostro, reentry } = await this.exigirRostroOAutorizacion(ctx, original, input.faceAuthorization ?? null);
+    const autorizacion = sinRostro ? input.faceAuthorization ?? null : null;
 
     return enUnaTransaccion(async () => {
       // Se registra una decisión NUEVA, no se edita la original: la bitácora de
@@ -443,6 +631,7 @@ export class AccessService {
           overrideReason: input.reason,
           businessDate,
           resolvesDecisionId: original.id,
+          reentry,
         });
       } catch (e) {
         // Otra concesión sobre el mismo rechazo se confirmó en este instante.
@@ -456,14 +645,19 @@ export class AccessService {
         resourceType: 'access_decision',
         resourceId: record.id,
         beforeState: { deniedFor: original.denialReason, originalDecisionId: original.id },
-        afterState: { outcome: 'GRANTED', ...(input.reasonCode ? { reasonCode: input.reasonCode } : {}) },
+        afterState: {
+          outcome: 'GRANTED', ...(input.reasonCode ? { reasonCode: input.reasonCode } : {}), ...(reentry ? { reentry: true } : {}),
+          // D-06: pasó sin rostro; quién de la gerencia lo autorizó.
+          ...(autorizacion ? { withoutFace: true, authorizedByUserId: autorizacion.byUserId, signature: autorizacion.signature } : {}),
+        },
+        ...(autorizacion?.signature ? { approvedByUserId: autorizacion.byUserId } : {}),
         reason: input.reason,
         branchId: original.branchId,
       });
 
       return {
         decision: {
-          outcome: 'GRANTED', reason: null, consumesVisit: false,
+          outcome: 'GRANTED', reason: null, consumesVisit: false, reentry,
           warning: 'Paso concedido por recepción', overridable: false,
           policyVersion: ACCESS_POLICY_VERSION, evaluatedAt: record.at,
         },
@@ -535,6 +729,11 @@ export class AccessService {
         const pases = await new DayPassRepository(orgId).pagadosDelDia(memberId, businessDate);
         const suyo = pases.find((p) => p.branchId === branchId) ?? pases[0] ?? null;
         return suyo ? { branchId: suyo.branchId } : null;
+      })(),
+      // Su pase de PRUEBA de hoy (D-08): gratis, uno por persona; la sede donde se dio.
+      trialPass: await (async () => {
+        const pase = await new TrialPassRepository(orgId).delDia(memberId, businessDate);
+        return pase ? { branchId: pase.branchId } : null;
       })(),
     };
   }

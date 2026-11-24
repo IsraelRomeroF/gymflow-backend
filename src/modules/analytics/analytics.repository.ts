@@ -80,6 +80,24 @@ export class AnalyticsRepository extends TenantRepository {
       GROUP BY "branchId"`;
   }
 
+  /**
+   * Costo de lo vendido en la tienda (D-21): el costo que cada venta guardó en
+   * su línea al cobrarse (`unitCostCents`, bloque 3.6), por sucursal. Con las
+   * mismas ventas que cuentan como ganadas (`accruedImmediate`). `sinCosto`:
+   * piezas de productos sin costo registrado, cuyo costo no se puede restar.
+   */
+  async costOfGoodsSold(from: Date, to: Date): Promise<Array<{ branchId: string | null; costCents: bigint; sinCosto: number }>> {
+    return this.db.$queryRaw`
+      SELECT s."branchId",
+             COALESCE(SUM(l."unitCostCents" * l."quantity"), 0)::bigint AS "costCents",
+             COALESCE(SUM(l."quantity") FILTER (WHERE l."unitCostCents" IS NULL), 0)::int AS "sinCosto"
+      FROM "pos_sales" s JOIN "pos_sale_lines" l ON l."posSaleId" = s."id"
+      WHERE s."organizationId" = ${this.organizationId}::uuid
+        AND s."status" = 'COMPLETED'
+        AND s."businessDate" >= ${from}::date AND s."businessDate" < ${to}::date
+      GROUP BY s."branchId"`;
+  }
+
   /** Cuotas de periodo que SOLAPAN la ventana. El prorrateo lo hace el dominio. */
   async periodCharges(from: Date, to: Date): Promise<PeriodChargeRow[]> {
     return this.db.$queryRaw<PeriodChargeRow[]>`

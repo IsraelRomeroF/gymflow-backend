@@ -59,7 +59,7 @@ describe('jobs · bloque 1.16', () => {
       // 11-09: cerrar las clases terminadas y el dinero en tránsito no esperan al cierre.
       expect(ORDEN_FRECUENTE).toEqual(['payments.process-webhooks', 'payments.resolve-unknown', 'class.close-finished', 'approvals.expire-forgotten']);
       // 23-12: la factura a las marcas es de plataforma, no de cada gimnasio.
-      expect(ORDEN_PLATAFORMA).toEqual(['platform.invoices.issue', 'audit.verify-platform-chain']);
+      expect(ORDEN_PLATAFORMA).toEqual(['platform.prices.apply', 'platform.invoices.issue', 'platform.collections', 'audit.verify-platform-chain']);
       // La verificación de la bitácora va al final de los diarios: después de todo lo que escribe en ella.
       expect(ORDEN_DIARIO.at(-1)).toBe('audit.verify-hash-chain');
       // Apagar Clases no deja clases «en curso» para siempre.
@@ -372,6 +372,8 @@ describe('jobs · bloque 1.16', () => {
 
     it('una solicitud a distancia que venció y nadie volvió a leer la cierra el job, con su asiento del sistema, una sola vez', async () => {
       const gerencia = await loginAs(app, 'gerencia@demo.mx');
+      // D-03 (bloque 3.2): la misma operación se pide 3 veces por hora. Las de corridas anteriores de esta prueba ya pasaron.
+      await db().approvalRequest.updateMany({ where: { organizationId: demo, resourceId: monthlyCloseResourceId('2022-03') }, data: { createdAt: new Date(Date.now() - 48 * 3_600_000) } });
       const pedida = await app.inject({
         method: 'POST', url: '/approvals/requests', headers: { cookie: gerencia },
         payload: { permission: 'reports:month:close', resourceType: 'MonthlyClose', resourceId: monthlyCloseResourceId('2022-03'), summary: 'El cierre de marzo' },

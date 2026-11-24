@@ -40,6 +40,8 @@ export type DecisionRecord = {
   overriddenByUserId: string | null;
   /** En una concesión: el rechazo que resuelve (5-10). Un rechazo se resuelve una sola vez. */
   resolvesDecisionId: string | null;
+  /** Reentrada (D-07): ya había entrado hoy en esa sede; no nació otra asistencia ni se descontó visita. */
+  reentry: boolean;
   at: Date;
 };
 
@@ -47,7 +49,7 @@ const DECISION_SELECT = {
   id: true, branchId: true, gatewayId: true, memberId: true, outcome: true,
   denialReason: true, credentialKind: true, policyVersion: true,
   decidedOffline: true, overrideReason: true, overriddenByUserId: true,
-  resolvesDecisionId: true, at: true,
+  resolvesDecisionId: true, reentry: true, at: true,
 } as const;
 
 export class AccessRepository extends TenantRepository {
@@ -167,6 +169,12 @@ export class AccessRepository extends TenantRepository {
      * con una violación de unicidad, aunque llegue al mismo tiempo que la primera.
      */
     resolvesDecisionId?: string | null;
+    /**
+     * REENTRADA (D-07): ya tiene hoy una entrada contada en esta sede. La
+     * decisión se registra (quién, cuándo, por dónde), pero NO nace otra
+     * asistencia: «entradas de hoy» cuenta personas, no pasos.
+     */
+    reentry?: boolean;
   }): Promise<{ decision: DecisionRecord; attendanceId: string | null }> {
     return this.db.$transaction(async (tx) => {
       const decision = await tx.accessDecision.create({
@@ -190,12 +198,13 @@ export class AccessRepository extends TenantRepository {
           businessDate: input.businessDate,
           requestKey: input.requestKey ?? null,
           resolvesDecisionId: input.resolvesDecisionId ?? null,
+          reentry: input.outcome === 'GRANTED' && (input.reentry ?? false),
         },
         select: DECISION_SELECT,
       });
 
       let attendanceId: string | null = null;
-      if (input.outcome === 'GRANTED' && input.memberId) {
+      if (input.outcome === 'GRANTED' && input.memberId && !input.reentry) {
         const asistencia = await tx.attendanceEvent.create({
           data: {
             id: uuidv7(),
@@ -282,7 +291,33 @@ export class AccessRepository extends TenantRepository {
       ORDER BY total DESC`;
   }
 
-  /** ¿Ya se usó esta credencial en la ventana anti-replay? */
+  /**
+   * D-07 · La entrada que YA CONTÓ hoy en esa sede (la primera asistencia del
+   * día de operación), y de qué paquete descontó su visita, si descontó. Con
+   * ella, lo que pase después es una reentrada. `null` = hoy no ha entrado ahí.
+   */
+  async entradaContadaDeHoy(memberId: string, branchId: string, businessDate: Date): Promise<{ attendanceId: string; visitPackId: string | null } | null> {
+    const filas = await this.db.$queryRaw<Array<{ attendanceId: string; visitPackId: string | null }>>`
+      SELECT a."id" AS "attendanceId", v."visitPackId"
+        FROM "attendance_events" a
+        LEFT JOIN "visit_ledger_entries" v
+          ON v."organizationId" = a."organizationId" AND v."attendanceEventId" = a."id" AND v."delta" < 0
+       WHERE a."organizationId" = ${this.organizationId}::uuid AND a."memberId" = ${memberId}::uuid
+         AND a."branchId" = ${branchId}::uuid AND a."businessDate" = ${businessDate}::date
+       ORDER BY a."at" ASC
+       LIMIT 1`;
+    return filas[0] ?? null;
+  }
+
+  /**
+   * El mismo candado de `withMemberLock`, tomado DENTRO de la transacción en
+   * curso (la concesión sobre un rechazo corre en su propia unidad): así «¿ya
+   * entró hoy?» se lee y se escribe sin que otro paso del mismo socio se cuele.
+   */
+  async candadoDelSocio(memberId: string): Promise<void> {
+    await this.db.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`access:${this.organizationId}:${memberId}`}, 0))`;
+  }
+
   /**
    * Serializa los intentos de UN socio: dos pasos simultáneos (dos clics, dos
    * sedes, un reintento) ya no leen el mismo saldo ni el mismo "último paso"

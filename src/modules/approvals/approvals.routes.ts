@@ -1,11 +1,11 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { APPROVAL_RESOURCE_TYPES, PERMISSIONS, type PermissionKey } from '@gymflow/core';
+import { APPROVAL_NOTE_MAX, APPROVAL_NOTE_MIN, APPROVAL_RESOURCE_TYPES, PERMISSIONS, type PermissionKey } from '@gymflow/core';
 import { ApprovalApprovers, ApprovalHistory, ApprovalInbox, ApprovalRequest, ApprovalRequestState } from '@gymflow/core/contracts';
 import { route } from '../../platform/http/registry.js';
 import { respuesta } from '../../platform/http/respuesta.js';
 import { ApprovalService } from './approval.service.js';
-import { RemoteApprovalService } from './remote-approval.service.js';
+import { RemoteApprovalService, type Pregunta, type RechazoAnterior, type SolicitudConHistoria } from './remote-approval.service.js';
 import type { Env } from '../../platform/env.js';
 
 /**
@@ -61,16 +61,30 @@ export function registerApprovalRoutes(app: FastifyInstance, env: Env): void {
         permission: z.string().refine((p) => PERMISSIONS.some((x) => x.key === p), 'Permiso desconocido'),
         branchId: z.string().uuid().optional(),
         amountCents: z.coerce.bigint().min(0n).optional(),
+        // De qué registro se trata: con él, la respuesta dice si esa operación ya se rechazó y cuántas veces se pidió (D-03).
+        resourceId: z.string().uuid().optional(),
       }).parse(request.query);
-      return new ApprovalService().whoCanApprove(request.ctx!, q.permission as PermissionKey, {
-        branchId: q.branchId, amountCents: q.amountCents,
+      const r = await new ApprovalService().whoCanApprove(request.ctx!, q.permission as PermissionKey, {
+        branchId: q.branchId, amountCents: q.amountCents, resourceId: q.resourceId,
       });
+      const o = r.operation;
+      return {
+        approvers: r.approvers, requestTtlSeconds: r.requestTtlSeconds, grantTtlSeconds: r.grantTtlSeconds,
+        operation: o && {
+          previousRejection: o.rechazo && { requestId: o.rechazo.id, at: o.rechazo.decidedAt.toISOString(), byUserId: o.rechazo.approverUserId, byName: o.rechazo.approverName, reason: o.rechazo.rejectReason },
+          localLockedUntil: o.bloqueoLocalHasta?.toISOString() ?? null,
+          requestsUsed: o.pedidas, requestsMax: o.tope, nextRequestAt: o.proximaSolicitud?.toISOString() ?? null,
+        },
+      };
     },
   });
 
   // ── Autorización a distancia ──────────────────────────────────────────────
   const remotas = new RemoteApprovalService();
-  const solicitudJson = (r: Awaited<ReturnType<RemoteApprovalService['request']>>) => ({
+  const rechazoJson = (r: RechazoAnterior | null) => r && { requestId: r.requestId, at: r.at.toISOString(), byUserId: r.byUserId, byName: r.byName, reason: r.reason };
+  const preguntaJson = (q: Pregunta | null) => q && { text: q.text, at: q.at.toISOString(), byUserId: q.byUserId, byName: q.byName, answer: q.answer, answeredAt: q.answeredAt?.toISOString() ?? null };
+  const nota = z.string().trim().min(APPROVAL_NOTE_MIN).max(APPROVAL_NOTE_MAX);
+  const solicitudJson = (r: SolicitudConHistoria) => ({
     id: r.id, permission: r.permission, branchId: r.branchId, resourceType: r.resourceType, resourceId: r.resourceId,
     amountCents: r.amountCents?.toString() ?? null, summary: r.summary, reason: r.reason, status: r.status,
     decidedAt: r.decidedAt?.toISOString() ?? null, rejectReason: r.rejectReason,
@@ -79,6 +93,8 @@ export function registerApprovalRoutes(app: FastifyInstance, env: Env): void {
     secondsLeft: r.status === 'PENDING' ? Math.max(0, Math.ceil((r.expiresAt.getTime() - Date.now()) / 1000)) : 0,
     // Si quien firma la pudo ver (29-05): a cuántos teléfonos salió el aviso y cuándo la mostró su bandeja.
     notifiedCount: r.notifiedCount, seenAt: r.seenAt?.toISOString() ?? null,
+    // D-03: el «no» al que responde, la respuesta, qué vez es en la hora y la pregunta de quien firma.
+    previousRejection: rechazoJson(r.previousRejection), reply: r.reply, attempt: r.attempt, question: preguntaJson(r.question),
   });
 
   /** Quien opera pide la firma; quien puede darla la ve en su teléfono. */
@@ -86,6 +102,8 @@ export function registerApprovalRoutes(app: FastifyInstance, env: Env): void {
     method: 'POST',
     url: '/approvals/requests',
     security: { kind: 'session' },
+    // Límite técnico por sesión, además del tope de 3 por hora por operación que aplica el servicio (D-03).
+    config: { rateLimit: { max: env.AUTH_ATTEMPTS_PER_IP, timeWindow: '5 minutes' } },
     schema: respuesta(201, ApprovalRequest),
     handler: async (request, reply) => {
       const body = z.object({
@@ -99,10 +117,12 @@ export function registerApprovalRoutes(app: FastifyInstance, env: Env): void {
         amountCents: z.coerce.bigint().min(0n).max(999_999_999_999n).optional(),
         summary: z.string().trim().min(3).max(200),
         reason: z.string().trim().max(300).optional(),
+        // La respuesta al «no» anterior de esta operación: obligatoria si lo hubo (D-03); el servicio lo exige.
+        reply: nota.optional(),
       }).parse(request.body);
       const r = await remotas.request(request.ctx!, {
         permission: body.permission as PermissionKey, branchId: body.branchId ?? null, resourceType: body.resourceType,
-        resourceId: body.resourceId, amountCents: body.amountCents, summary: body.summary, reason: body.reason,
+        resourceId: body.resourceId, amountCents: body.amountCents, summary: body.summary, reason: body.reason, reply: body.reply,
       });
       return reply.status(201).send(solicitudJson(r));
     },
@@ -171,6 +191,7 @@ export function registerApprovalRoutes(app: FastifyInstance, env: Env): void {
           status: r.status, requesterName: r.requesterName, approverName: r.approverName, mine: r.mine,
           createdAt: r.createdAt.toISOString(), resolvedAt: r.resolvedAt.toISOString(), rejectReason: r.rejectReason,
           delivery: r.delivery, seenAt: r.seenAt?.toISOString() ?? null, notifiedCount: r.notifiedCount,
+          previousRejection: rechazoJson(r.previousRejection), reply: r.reply, question: preguntaJson(r.question),
         })),
       };
     },
@@ -198,6 +219,35 @@ export function registerApprovalRoutes(app: FastifyInstance, env: Env): void {
       const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
       const { reason } = z.object({ reason: z.string().trim().min(3).max(300) }).parse(request.body);
       await remotas.reject(request.ctx!, id, reason);
+      return { ok: true };
+    },
+  });
+
+  /**
+   * «Preguntar» en vez de «No autorizar» (D-03): quien puede firmarla pregunta
+   * y la solicitud sigue pendiente, con su reloj otra vez completo.
+   */
+  route(app, {
+    method: 'POST',
+    url: '/approvals/requests/:id/ask',
+    security: { kind: 'session' },
+    handler: async (request) => {
+      const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+      const { question } = z.object({ question: nota }).parse(request.body);
+      await remotas.ask(request.ctx!, id, question);
+      return { ok: true };
+    },
+  });
+
+  /** Quien la pidió contesta la pregunta de quien firma (D-03). */
+  route(app, {
+    method: 'POST',
+    url: '/approvals/requests/:id/answer',
+    security: { kind: 'session' },
+    handler: async (request) => {
+      const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+      const { answer } = z.object({ answer: nota }).parse(request.body);
+      await remotas.answer(request.ctx!, id, answer);
       return { ok: true };
     },
   });
