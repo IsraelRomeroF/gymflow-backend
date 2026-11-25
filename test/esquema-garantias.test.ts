@@ -55,6 +55,10 @@ const SOLO_AGREGAR = [
   // `pos_sale_returns` (bloque 3.5, D-13): la devolución de una venta de tienda es un asiento; no se corrige ni se borra.
   // `owner_alert_starts` (bloque 4.2, D-05): desde cuándo avisa cada gimnasio se escribe una vez; moverlo haría sonar de golpe lo pasado.
   'inventory_movements', 'member_consents', 'membership_events', 'membership_price_changes', 'owner_alert_starts', 'payment_allocations', 'plan_price_changes', 'platform_audit_logs', 'pos_sale_lines', 'pos_sale_returns', 'privacy_conservation_starts',
+  // `privacy_calculated_baja_starts` (bloque 4.18, P-01): el arranque de la baja calculada se escribe una vez; moverlo borraría rostros antes de tiempo.
+  'privacy_calculated_baja_starts',
+  // `membership_price_applications` (bloque 4.20, P-14): con qué cuota llegó un aumento que esperó sus 15 días; no se corrige ni se borra.
+  'membership_price_applications',
   // `recurring_expense_skips` (bloque 4.5, D-26): la propuesta descartada queda con quién y cuándo; no se corrige ni se borra.
   'recurring_expense_skips',
   // `trial_passes` (bloque 3.3, D-08): un pase de prueba ya dado no se borra ni se corrige; si no, «uno por persona» no valdría.

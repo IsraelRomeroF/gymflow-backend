@@ -1,13 +1,13 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import {
-  grantsAccess, notFound, precioDeCuota, visitBalance, type MembershipStatus, type VisitLedgerEntry } from '@gymflow/core';
+  breakdownTax, grantsAccess, money, notFound, precioDeCuota, visitBalance, type MembershipStatus, type VisitLedgerEntry } from '@gymflow/core';
 import { AccessSummaryResponse, MemberMemberships, type Membership } from '@gymflow/core/contracts';
 import { enUnidadDeDinero } from '../../platform/db/unit-of-work.js';
 import { route } from '../../platform/http/registry.js';
 import { respuesta } from '../../platform/http/respuesta.js';
 import { OrganizationRepository } from '../organization/index.js';
-import { PlanRepository } from '../catalog/index.js';
+import { PlanRepository, aumentoPendiente, precioDeLaCuotaConAumentos } from '../catalog/index.js';
 import { AccessSummaryRepository } from './access-summary.repository.js';
 import { MemberRepository } from '../members/index.js';
 import { MembershipRepository } from './membership.repository.js';
@@ -376,19 +376,55 @@ export function serializeMembership(m: {
  * Lo que paga por periodo: lo pactado o, sin pactado, el precio del plan en su
  * sede (la misma regla que la cuota: `precioDeCuota` del núcleo). `null` si el
  * plan ya no existe.
+ *
+ * 4.20 (P-14): con un aumento guardado que todavía no le llega, también a
+ * cuánto pasa y desde qué pago (`pendingPrice`), y lo que costaría el periodo
+ * siguiente si se renovara hoy (`nextPeriodPriceCents`: el importe de la cuota,
+ * con su impuesto, y con el aumento solo si ya rige para ese periodo). Es lo
+ * que cotiza «Renovar».
  */
-async function precioPorPeriodo(organizationId: string, m: { planId: string; soldAtBranchId: string | null; agreedPriceCents: bigint | null }): Promise<bigint | null> {
-  if (m.agreedPriceCents !== null) return m.agreedPriceCents;
+type PrecioDeLaFicha = { precio: bigint; pendiente: { toPriceCents: bigint; firstChargeOn: Date | null; appliesFrom: Date; enElSiguiente: boolean } | null; siguiente: bigint };
+
+async function precioPorPeriodo(organizationId: string, m: {
+  id: string; planId: string; soldAtBranchId: string | null; agreedPriceCents: bigint | null; currentPeriodEnd: Date;
+}): Promise<PrecioDeLaFicha | null> {
   const planes = new PlanRepository(organizationId);
   const plan = await planes.findById(m.planId);
   if (!plan) return null;
-  const sede = m.soldAtBranchId ? (await planes.availabilityFor(plan.id)).find((a) => a.branchId === m.soldAtBranchId) : undefined;
-  return precioDeCuota({ agreedPriceCents: null, planPriceCents: plan.priceCents, branchPriceCents: sede?.priceOverrideCents ?? null });
+  let precio = m.agreedPriceCents;
+  if (precio === null) {
+    const sede = m.soldAtBranchId ? (await planes.availabilityFor(plan.id)).find((a) => a.branchId === m.soldAtBranchId) : undefined;
+    precio = precioDeCuota({ agreedPriceCents: null, planPriceCents: plan.priceCents, branchPriceCents: sede?.priceOverrideCents ?? null });
+  }
+  // El importe de la cuota (con su impuesto, como `amountsForPlan` de billing): es lo que cotiza «Renovar».
+  const importe = (p: bigint) => {
+    if (plan.taxRateBps === null) return p;
+    const b = breakdownTax(money(p), plan.taxRateBps, plan.priceIncludesTax);
+    return b.subtotal.cents + b.tax.cents;
+  };
+  const pendiente = await aumentoPendiente(organizationId, m.id);
+  if (!pendiente) return { precio, pendiente: null, siguiente: importe(precio) };
+  const hoy = await new BusinessCalendar(organizationId).today(m.soldAtBranchId);
+  const siguiente = await precioDeLaCuotaConAumentos(organizationId, m.id, precio, { inicio: m.currentPeriodEnd, emitidaEl: hoy });
+  return {
+    precio,
+    pendiente: { toPriceCents: pendiente.toPriceCents, firstChargeOn: pendiente.firstChargeOn, appliesFrom: pendiente.appliesFrom, enElSiguiente: siguiente.llegan.length > 0 },
+    siguiente: importe(siguiente.precio),
+  };
 }
 
-function precioYMarca(m: { priceProtected: boolean; priceProtectedReason?: string | null }, precio: bigint | null) {
+function precioYMarca(m: { priceProtected: boolean; priceProtectedReason?: string | null }, p: PrecioDeLaFicha | null) {
   return {
-    ...(precio === null ? {} : { periodPriceCents: precio.toString() }),
+    ...(p === null ? {} : {
+      periodPriceCents: p.precio.toString(),
+      nextPeriodPriceCents: p.siguiente.toString(),
+      pendingPrice: p.pendiente && {
+        toPriceCents: p.pendiente.toPriceCents.toString(),
+        firstChargeOn: p.pendiente.firstChargeOn ? iso(p.pendiente.firstChargeOn) : null,
+        appliesFrom: iso(p.pendiente.appliesFrom),
+        inNextPeriod: p.pendiente.enElSiguiente,
+      },
+    }),
     priceProtected: m.priceProtected,
     priceProtectedReason: m.priceProtected ? m.priceProtectedReason ?? null : null,
   };

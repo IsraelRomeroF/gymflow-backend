@@ -1,9 +1,9 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { PrivacyBatchSigned, PrivacyConservation } from '@gymflow/core/contracts';
+import { MemberConservation, PrivacyBatchSigned, PrivacyConservation } from '@gymflow/core/contracts';
 import { route } from '../../platform/http/registry.js';
 import { ConservacionService } from './conservacion.service.js';
-import { respuesta } from './privacy.serializers.js';
+import { idParam, respuesta, sedeDe } from './privacy.serializers.js';
 
 /**
  * CONSERVACIÓN (D-32; bloque 3.9): los plazos, los rostros de exsocios que
@@ -44,6 +44,24 @@ export function registerConservationRoutes(app: FastifyInstance): void {
       const { batchId, password } = z.object({ batchId: z.string().uuid(), password: z.string().min(1).max(200) }).parse(request.body);
       request.requirePermission('approvals:grant', null);
       return { batch: await service.firmar(request.ctx!, batchId, password) };
+    },
+  });
+
+  /**
+   * P-01 (4.18): qué hace la conservación con este socio (si su baja cuenta,
+   * cuándo se borra su rostro, desde cuándo entraría a la lista). Lo ve quien
+   * ve la ficha en su sede; también la del dado de baja. Solo lee.
+   */
+  route(app, {
+    method: 'GET',
+    url: '/members/:id/conservation',
+    security: { kind: 'permission', permission: 'members:read' },
+    schema: respuesta(200, MemberConservation),
+    handler: async (request) => {
+      const { id } = idParam.parse(request.params);
+      const orgId = request.ctx!.tenant.organizationId;
+      request.requirePermission('members:read', await sedeDe(orgId, id));
+      return service.deSocio(orgId, id);
     },
   });
 

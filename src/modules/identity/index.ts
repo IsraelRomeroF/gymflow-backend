@@ -34,3 +34,6 @@ export type { AuthService } from './auth.service.js';
 
 // Consumida por: members. Los coaches del gimnasio, para asignar el de un socio.
 export { StaffRepository } from './staff.repository.js';
+
+// Consumidas por: scripts/permisos-retirados-recepcion.ts (bloque 4.19). Lo que ya no se le enciende a recepción.
+export { excepcionesPorRetirar, retirarExcepciones, RETIRADOS_DE_RECEPCION, type ExcepcionRetirable } from './permisos-retirados.js';

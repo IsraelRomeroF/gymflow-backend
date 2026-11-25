@@ -249,7 +249,8 @@ describe('portal del socio (3.10)', () => {
       // El precio cambió ANTES de emitirse la cuota que este pago cubre: es su primer pago al precio nuevo.
       await cambioDePrecio(v, new Date(Date.now() - 3_600_000));
       const delPortal = await recibo(v);
-      expect(delPortal.priceNotice).toEqual({ kind: 'APPLIED', planName: 'Mensual', fromPriceCents: '60000', toPriceCents: '65000' });
+      // `startsOn` (4.20): solo lo trae un aumento que espera sus 15 días; este cambio de la prueba es anterior a 4.20.
+      expect(delPortal.priceNotice).toEqual({ kind: 'APPLIED', planName: 'Mensual', fromPriceCents: '60000', toPriceCents: '65000', startsOn: null });
       const delMostrador = await get(`/payments/${v.paymentId}/receipt`, gerente);
       expect(delMostrador.statusCode, delMostrador.body).toBe(200);
       expect(delMostrador.json().priceNotice).toEqual(delPortal.priceNotice);

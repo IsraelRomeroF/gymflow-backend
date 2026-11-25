@@ -126,9 +126,10 @@ export function registerPaymentsRoutes(app: FastifyInstance): void {
         const pagadas = new Set(tocados.filter((c) => c?.membershipId === membresiaId && c.chargeType === 'MEMBERSHIP_PERIOD').map((c) => c!.id));
         const cuotas = (await cargos.listForMember(pago.memberId))
           .filter((c) => c.membershipId === membresiaId && c.chargeType === 'MEMBERSHIP_PERIOD')
-          .map((c) => ({ createdAt: c.createdAt, cubierta: pagadas.has(c.id) }));
+          .map((c) => ({ id: c.id, createdAt: c.createdAt, cubierta: pagadas.has(c.id) }));
         const aviso = await avisoDePrecioEnRecibo(orgId, { membershipId: membresiaId, pagadoEn: pago.createdAt, cuotas });
-        priceNotice = aviso ? { kind: aviso.kind, planName: plan?.name ?? null, fromPriceCents: cents(aviso.fromPriceCents), toPriceCents: cents(aviso.toPriceCents) } : null;
+        // 4.20 (P-14): «a partir del <día>» cuando el aumento espera sus 15 días.
+        priceNotice = aviso ? { kind: aviso.kind, planName: plan?.name ?? null, fromPriceCents: cents(aviso.fromPriceCents), toPriceCents: cents(aviso.toPriceCents), startsOn: aviso.startsOn ? iso(aviso.startsOn) : null } : null;
       }
       return {
         payment: serializePayment(pago),

@@ -1,9 +1,9 @@
 import {
   CONSERVACION, DomainError, MOTIVO_ROSTRO_BIOMETRIA_APAGADA, MOTIVO_ROSTRO_TRAS_LA_BAJA, businessDateIn, conflict, corteDeAnonimizacion, forbidden, isoDate, mesesDeConservacion,
-  motivoDeAnonimizacionPorLista, notFound, periodoDeConservacion, rostroSeBorraEl, tocaBorrarRostro, validation,
-  type MotivoDeSaltoDeConservacion,
+  motivoDeAnonimizacionPorLista, notFound, periodoDeConservacion, validation,
+  arranqueDeLaBaja, rostroSeBorraEl, sumarMeses, type CausaDeBaja, type MotivoDeSaltoDeConservacion,
 } from '@gymflow/core';
-import type { PrivacyBatch, PrivacyBatchSummary, PrivacyConservation } from '@gymflow/core/contracts';
+import type { MemberConservation, PrivacyBatch, PrivacyBatchSummary, PrivacyConservation } from '@gymflow/core/contracts';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { enUnaTransaccion } from '../../platform/db/unit-of-work.js';
 import { systemContext } from '../../platform/jobs/types.js';
@@ -14,7 +14,9 @@ import { EnrollmentService, FaceTemplateRepository, rostrosQueBorraApagar } from
 import { ApprovalService } from '../approvals/index.js';
 import { AuthUserRepository, PushService, UserRepository } from '../identity/index.js';
 import { OrganizationRepository } from '../organization/index.js';
+import { MemberRepository } from '../members/index.js';
 import { ConservacionRepository, type ExsocioRecord, type ListaRecord, type RenglonRecord } from './conservacion.repository.js';
+import { BajaParaConservarRepository, BajasParaConservar } from './baja-para-conservar.js';
 import { PrivacyService } from './privacy.service.js';
 
 const DIA_MS = 86_400_000;
@@ -24,7 +26,15 @@ const NADIE = '00000000-0000-0000-0000-000000000000';
 /** Cuántos exsocios se anonimizan dentro de la petición de la firma; el resto lo termina el cierre de esa noche. */
 export const ANONIMIZAR_AL_FIRMAR = 100;
 
+/** Cuántos rostros por borrar enseña la tarjeta, del más próximo al más lejano (la cifra total va aparte). */
+const ROSTROS_EN_PANTALLA = 200;
+
 export type ErrorDePasada = { entityId: string; error: string };
+
+/** Quién entra a la lista del mes: el dado de baja en su ficha (3.9) o el de la baja calculada (P-01, 4.18). */
+type Candidato = { memberId: string; memberCode: string; archivedAt: Date; archivedOn: Date; cause: CausaDeBaja };
+
+const medianoche = (dia: string) => new Date(`${dia}T00:00:00.000Z`);
 
 /** Lo que hizo una pasada del cierre diario. */
 export type PasadaDeConservacion = {
@@ -46,13 +56,19 @@ export type VistaPreviaDeConservacion = {
   hoy: string;
   /** El día de arranque ya fijado, o null si la primera pasada todavía no corre (lo fijaría en `hoy`). */
   arranque: string | null;
+  /** P-01 (4.18): el arranque de la baja calculada, o null si la primera pasada con 4.18 todavía no corre (lo fijaría en `hoy`). */
+  arranqueCalculada: string | null;
+  /** El plazo de baja del gimnasio (D-18), con el que también se mide la visita «reciente». */
+  churnDays: number;
   meses: number;
   /** Entra a la lista quien se dio de baja este día o antes. */
   corte: string;
   /** Rostros de exsocios guardados: cuándo se borra cada uno y si la pasada de hoy ya lo borraría. */
-  rostros: Array<{ memberCode: string; bajaEl: string; seBorraEl: string; hoy: boolean }>;
+  rostros: Array<{ memberCode: string; causa: CausaDeBaja; bajaEl: string; seBorraEl: string; hoy: boolean }>;
+  /** Con rostro guardado, baja para D-18 pero exceptuados (siguen viniendo o tienen paquete): NO se tocan. */
+  exceptuados: Array<{ memberCode: string; causa: CausaDeBaja; porque: string; contaraDesde: string | null }>;
   /** La lista del mes: si ya existe no se arma otra; si no, quién entraría. Ninguno se anonimiza sin firma. */
-  lista: { periodo: string; yaExiste: boolean; enEspera: string | null; exsocios: Array<{ memberCode: string; bajaEl: string }> };
+  lista: { periodo: string; yaExiste: boolean; enEspera: string | null; exsocios: Array<{ memberCode: string; causa: CausaDeBaja; bajaEl: string }> };
 };
 
 const texto = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -74,6 +90,16 @@ const texto = (e: unknown) => (e instanceof Error ? e.message : String(e));
  * LA PRIMERA PASADA en un gimnasio no borra nada: fija el día de arranque.
  * A quien ya llevaba más de 30 días de baja, los 30 días le cuentan desde
  * ese día (`rostroSeBorraEl`), y la lista del mes se arma pero espera firma.
+ *
+ * P-01 (Israel 2026-11-25; fase 4, bloque 4.18): «baja» ya no es solo el acto
+ * de la ficha. Cuenta también la baja calculada de D-18 (canceló, o terminó
+ * hace el plazo del gimnasio sin renovar), salvo quien sigue viniendo sin
+ * membresía (`bajaParaConservar`, `baja-para-conservar.ts`). Esa regla tiene
+ * su propio arranque (`privacy_calculated_baja_starts`): a quien ya era baja
+ * calculada el día en que se activa, los 30 días le cuentan desde ahí. Su
+ * rostro se sigue reconociendo hasta borrarse (no se tocó el padrón de la
+ * cámara: la puerta le niega la entrada por no tener plan, como antes); al
+ * firmarse la lista se le da de baja en su ficha y se anonimiza en el acto.
  */
 export class ConservacionService {
   private readonly audit = new AuditService();
@@ -91,6 +117,21 @@ export class ConservacionService {
       await this.audit.record(systemContext(organizationId), {
         action: 'privacy.conservation.start', resourceType: 'Organization', resourceId: organizationId,
         afterState: { startedOn: isoDate(hoy), facesWaiting: enEspera.length, faceDaysAfterArchive: CONSERVACION.rostroDiasTrasLaBaja },
+      });
+    }
+
+    // P-01 (4.18): la baja calculada empieza a contar el día en que corre por primera vez este código (arranque suave).
+    const bajas = new BajaParaConservarRepository(organizationId);
+    if (await bajas.fijarArranqueCalculada(hoy)) {
+      salida.arranco = true;
+      const calculadas = await new BajasParaConservar(organizationId, ahora).calculadas();
+      const rostros = (await new BajasParaConservar(organizationId, ahora).rostros({ ficha: await repo.arranque(), calculada: hoy })).filter((r) => r.cause !== 'ARCHIVED');
+      await this.audit.record(systemContext(organizationId), {
+        action: 'privacy.conservation.calculated.start', resourceType: 'Organization', resourceId: organizationId,
+        afterState: {
+          startedOn: isoDate(hoy), calculatedBajas: calculadas.length, facesWaiting: rostros.length,
+          faceDaysAfterArchive: CONSERVACION.rostroDiasTrasLaBaja, churnDays: await new BajasParaConservar(organizationId, ahora).churnDays(),
+        },
       });
     }
 
@@ -131,17 +172,13 @@ export class ConservacionService {
    * borra nada: lo fija `pasada`. Cada rostro va en su propia unidad.
    */
   async borrarRostrosVencidos(organizationId: string, ahora: Date = new Date()): Promise<{ borrados: number; enEspera: number; errores: ErrorDePasada[] }> {
-    const arranque = await new ConservacionRepository(organizationId).arranque();
-    const plantillas = await new FaceTemplateRepository(organizationId).deExsocios();
     const salida = { borrados: 0, enEspera: 0, errores: [] as ErrorDePasada[] };
-    if (!arranque) return { ...salida, enEspera: plantillas.length };
-
-    const dias = this.diasDeSede(organizationId, ahora);
+    // P-01 (4.18): los de la baja calculada también; cada clase de baja con su arranque. Sin arranque no se borra nada.
+    const rostros = await new BajasParaConservar(organizationId, ahora).rostros(await this.arranques(organizationId));
     const enrolamientos = new EnrollmentService();
     const ctx = systemContext(organizationId);
-    for (const p of plantillas) {
-      const { hoy, diaDe } = await dias(p.sedeDelSocio);
-      if (!tocaBorrarRostro(diaDe(p.bajaEl), hoy, arranque)) { salida.enEspera += 1; continue; }
+    for (const p of rostros) {
+      if (!p.hoyToca) { salida.enEspera += 1; continue; }
       try {
         await enUnaTransaccion(() => enrolamientos.revoke(ctx, p.enrollmentId, MOTIVO_ROSTRO_TRAS_LA_BAJA));
         salida.borrados += 1;
@@ -152,6 +189,12 @@ export class ConservacionService {
       }
     }
     return salida;
+  }
+
+  /** Los dos arranques del gimnasio: el del acto de la ficha (3.9) y el de la baja calculada (4.18). */
+  async arranques(organizationId: string): Promise<{ ficha: Date | null; calculada: Date | null }> {
+    const [ficha, calculada] = await Promise.all([new ConservacionRepository(organizationId).arranque(), new BajaParaConservarRepository(organizationId).arranqueCalculada()]);
+    return { ficha, calculada };
   }
 
   /**
@@ -208,7 +251,7 @@ export class ConservacionService {
     if (await repo.delPeriodo(period)) return null;
 
     const meses = await this.meses(organizationId);
-    const candidatos = await this.cumplenElPlazo(organizationId, meses, ahora);
+    const candidatos = await this.candidatos(organizationId, meses, ahora);
     const anterior = await repo.pendiente();
     if (candidatos.length === 0 && !anterior) return null;
 
@@ -219,7 +262,7 @@ export class ConservacionService {
         const reemplazada = anterior ? await repo.reemplazar(anterior.id, ahora) : false;
         const lista = candidatos.length === 0 ? null : await repo.crear({
           period, monthsAfterArchive: meses, cutoffOn, preparedAt: ahora,
-          renglones: candidatos.map((c) => ({ memberId: c.exsocio.id, memberCode: c.exsocio.memberCode, archivedAt: c.exsocio.deletedAt!, archivedOn: c.bajaEl })),
+          renglones: candidatos.map((c) => ({ memberId: c.memberId, memberCode: c.memberCode, archivedAt: c.archivedAt, archivedOn: c.archivedOn, bajaCause: c.cause })),
         });
         // La bitácora, al final de la unidad.
         if (reemplazada) {
@@ -231,7 +274,7 @@ export class ConservacionService {
         if (lista) {
           await this.audit.record(ctx, {
             action: 'privacy.batch.prepare', resourceType: 'PrivacyBatch', resourceId: lista.id,
-            afterState: { period, listed: candidatos.length, monthsAfterArchive: meses, cutoffOn: isoDate(cutoffOn) },
+            afterState: { period, listed: candidatos.length, calculated: candidatos.filter((c) => c.cause !== 'ARCHIVED').length, monthsAfterArchive: meses, cutoffOn: isoDate(cutoffOn) },
           });
         }
         return lista;
@@ -332,6 +375,7 @@ export class ConservacionService {
     const exsocios = await repo.exsocios(porHacer.map((r) => r.memberId));
     const meses = await this.meses(organizationId);
     const dias = this.diasDeSede(organizationId, ahora);
+    const bajas = new BajasParaConservar(organizationId, ahora);
     const ctx = systemContext(organizationId);
     const privacidad = new PrivacyService();
     const motivo = motivoDeAnonimizacionPorLista(lista.period, lista.monthsAfterArchive);
@@ -340,13 +384,19 @@ export class ConservacionService {
     for (const r of porHacer) {
       if (tope !== null && hechos >= tope) break;
       try {
-        const salto = await this.porQueNo(r, exsocios.get(r.memberId) ?? null, meses, dias);
+        const exsocio = exsocios.get(r.memberId) ?? null;
+        const salto = r.bajaCause === 'ARCHIVED'
+          ? await this.porQueNo(r, exsocio, meses, dias)
+          : await this.porQueNoCalculada(r, exsocio, meses, bajas);
         if (salto) {
           await repo.resolver(r.id, { status: 'SKIPPED', note: salto, cuando: ahora, userId: null });
           continue;
         }
         await enUnaTransaccion(async () => {
-          await privacidad.anonymize(ctx, r.memberId, motivo, lista.signedByUserId);
+          // P-01 (4.18): la baja calculada no pasó por «Dar de baja». Se le da de baja en su ficha en el
+          // mismo acto (anonimizar exige la baja), como acción del sistema al amparo de la misma firma.
+          if (r.bajaCause !== 'ARCHIVED') await this.darDeBajaPorLaLista(ctx, r, exsocio, lista, motivo);
+          await privacidad.anonymize(ctx, r.memberId, motivo, lista.signedByUserId, ahora);
           await repo.resolver(r.id, { status: 'ANONYMIZED', note: null, cuando: ahora, userId: lista.signedByUserId });
         });
         salida.anonimizados += 1;
@@ -370,6 +420,32 @@ export class ConservacionService {
     return null;
   }
 
+  /**
+   * La misma comprobación para quien entró por la baja calculada (P-01):
+   * se vuelve a calcular su baja hoy. Si renovó o volvió a venir, ya no es
+   * baja (o es otra, más reciente): no se toca.
+   */
+  private async porQueNoCalculada(r: RenglonRecord, exsocio: ExsocioRecord | null, meses: number, bajas: BajasParaConservar): Promise<MotivoDeSaltoDeConservacion | null> {
+    if (!exsocio || exsocio.anonymizedAt) return 'ALREADY_ANONYMIZED';
+    // Lo dieron de baja en su ficha después de listarlo: esa baja es más reciente y cuenta desde ella.
+    if (exsocio.deletedAt) return 'NOT_DUE';
+    const s = (await bajas.de([r.memberId])).get(r.memberId);
+    if (!s?.conservar?.cuenta || s.conservar.since !== isoDate(r.archivedOn)) return 'RETURNED';
+    if (medianoche(s.conservar.since).getTime() > corteDeAnonimizacion(medianoche(s.hoy), meses).getTime()) return 'NOT_DUE';
+    return null;
+  }
+
+  /** Da de baja en su ficha, como el sistema, a quien la lista firmada anonimiza por su baja calculada. */
+  private async darDeBajaPorLaLista(ctx: RequestContext, r: RenglonRecord, exsocio: ExsocioRecord | null, lista: ListaRecord, motivo: string): Promise<void> {
+    const members = new MemberRepository(ctx.tenant.organizationId);
+    if (!await members.archive(r.memberId, lista.signedByUserId ?? '', motivo)) throw conflict('Ese socio ya estaba dado de baja');
+    await this.audit.record(ctx, {
+      action: 'member.archive', resourceType: 'Member', resourceId: r.memberId, branchId: exsocio?.homeBranchId ?? null,
+      beforeState: { status: 'INACTIVE' }, afterState: { status: 'ARCHIVED', bajaCause: r.bajaCause, bajaOn: isoDate(r.archivedOn), batchId: lista.id },
+      reason: `${motivo} (${r.bajaCause === 'CANCELED' ? 'canceló su membresía' : 'su membresía terminó y no renovó'})`, approvedByUserId: lista.signedByUserId,
+    });
+  }
+
   // ── Antes de la primera pasada ────────────────────────────────────────────
 
   /**
@@ -381,30 +457,30 @@ export class ConservacionService {
   async vistaPrevia(organizationId: string, ahora: Date = new Date()): Promise<VistaPreviaDeConservacion> {
     const repo = new ConservacionRepository(organizationId);
     const hoy = (await new BusinessCalendar(organizationId).dias(ahora)).cierre;
-    const arranqueGuardado = await repo.arranque();
-    const arranque = arranqueGuardado ?? hoy;
+    const guardados = await this.arranques(organizationId);
+    // Lo que fijaría la primera pasada: hoy.
+    const arranques = { ficha: guardados.ficha ?? hoy, calculada: guardados.calculada ?? hoy };
     const meses = await this.meses(organizationId);
-    const dias = this.diasDeSede(organizationId, ahora);
+    const bajas = new BajasParaConservar(organizationId, ahora);
 
-    const plantillas = await new FaceTemplateRepository(organizationId).deExsocios();
-    const codigos = await repo.exsocios(plantillas.map((p) => p.memberId));
-    const rostros: VistaPreviaDeConservacion['rostros'] = [];
-    for (const p of plantillas) {
-      const { hoy: hoyDeSede, diaDe } = await dias(p.sedeDelSocio);
-      const bajaEl = diaDe(p.bajaEl);
-      rostros.push({
-        memberCode: codigos.get(p.memberId)?.memberCode ?? p.memberId, bajaEl: isoDate(bajaEl),
-        seBorraEl: isoDate(rostroSeBorraEl(bajaEl, arranque)), hoy: tocaBorrarRostro(bajaEl, hoyDeSede, arranque),
-      });
+    const rostros = (await bajas.rostros(arranques)).map((p) => ({
+      memberCode: p.memberCode, causa: p.cause, bajaEl: p.since, seBorraEl: p.seBorraEl!, hoy: p.hoyToca,
+    }));
+    const plantillas = await new FaceTemplateRepository(organizationId).guardadas();
+    const exceptuados: VistaPreviaDeConservacion['exceptuados'] = [];
+    for (const s of (await bajas.de(plantillas.map((p) => p.memberId))).values()) {
+      if (s.conservar && !s.conservar.cuenta) exceptuados.push({ memberCode: s.memberCode, causa: s.conservar.cause, porque: s.conservar.porque, contaraDesde: s.conservar.contaraDesde });
     }
     const period = periodoDeConservacion(hoy);
-    const [delMes, pendiente, candidatos] = await Promise.all([repo.delPeriodo(period), repo.pendiente(), this.cumplenElPlazo(organizationId, meses, ahora)]);
+    const [delMes, pendiente, candidatos] = await Promise.all([repo.delPeriodo(period), repo.pendiente(), this.candidatos(organizationId, meses, ahora)]);
     return {
-      hoy: isoDate(hoy), arranque: arranqueGuardado ? isoDate(arranqueGuardado) : null, meses, corte: isoDate(corteDeAnonimizacion(hoy, meses)),
-      rostros,
+      hoy: isoDate(hoy), arranque: guardados.ficha ? isoDate(guardados.ficha) : null,
+      arranqueCalculada: guardados.calculada ? isoDate(guardados.calculada) : null, churnDays: await bajas.churnDays(),
+      meses, corte: isoDate(corteDeAnonimizacion(hoy, meses)),
+      rostros, exceptuados: exceptuados.sort((a, b) => a.memberCode.localeCompare(b.memberCode)),
       lista: {
         periodo: period, yaExiste: delMes !== null, enEspera: pendiente ? pendiente.period : null,
-        exsocios: candidatos.map((c) => ({ memberCode: c.exsocio.memberCode, bajaEl: isoDate(c.bajaEl) })),
+        exsocios: candidatos.map((c) => ({ memberCode: c.memberCode, causa: c.cause, bajaEl: isoDate(c.archivedOn) })),
       },
     };
   }
@@ -413,30 +489,64 @@ export class ConservacionService {
 
   async estado(organizationId: string, puede: { firmar: boolean; sacar: boolean }, ahora: Date = new Date()): Promise<PrivacyConservation> {
     const repo = new ConservacionRepository(organizationId);
-    const [{ monthsAfterArchive }, arranque, plantillas, pendiente, resueltas] = await Promise.all([
-      new OrganizationRepository(organizationId).privacySettings(), repo.arranque(),
-      new FaceTemplateRepository(organizationId).deExsocios(), repo.pendiente(), repo.resueltas(CONSERVACION.listasEnLaHistoria),
+    const bajas = new BajasParaConservar(organizationId, ahora);
+    const [{ monthsAfterArchive }, arranques, pendiente, resueltas, churnDays] = await Promise.all([
+      new OrganizationRepository(organizationId).privacySettings(), this.arranques(organizationId),
+      repo.pendiente(), repo.resueltas(CONSERVACION.listasEnLaHistoria), bajas.churnDays(),
     ]);
-    // Sin arranque todavía no corre ningún plazo: se dice cuántos hay, no una fecha que no es cierta.
-    let proximo: Date | null = null;
-    if (arranque) {
-      const dias = this.diasDeSede(organizationId, ahora);
-      for (const p of plantillas) {
-        const { diaDe } = await dias(p.sedeDelSocio);
-        const toca = rostroSeBorraEl(diaDe(p.bajaEl), arranque);
-        if (!proximo || toca.getTime() < proximo.getTime()) proximo = toca;
-      }
-    }
+    // P-01 (4.18): cuentan también los rostros de la baja calculada. Sin arranque todavía no corre ningún
+    // plazo: se dice cuántos hay, no una fecha que no es cierta (`deletesOn` null).
+    const rostros = await bajas.rostros(arranques);
+    const proximo = rostros.map((r) => r.seBorraEl).filter((d): d is string => d !== null).sort()[0] ?? null;
+    // Los nombres solo para la gerencia (la dueña ve cifras y códigos, ADR-039; los nombres los ve en la lista que firma).
+    const fichas = puede.sacar ? await new BajaParaConservarRepository(organizationId).fichas(rostros.map((r) => r.memberId)) : new Map();
     const resumenes = await this.resumenes(organizationId, resueltas);
     return {
       monthsAfterArchive: mesesDeConservacion(monthsAfterArchive),
       monthsIsDefault: monthsAfterArchive === null,
       faceDaysAfterArchive: CONSERVACION.rostroDiasTrasLaBaja,
-      startedOn: arranque ? isoDate(arranque) : null,
-      faces: { waiting: plantillas.length, nextDeletionOn: proximo ? isoDate(proximo) : null },
+      startedOn: arranques.ficha ? isoDate(arranques.ficha) : null,
+      calculatedStartedOn: arranques.calculada ? isoDate(arranques.calculada) : null,
+      churnDays,
+      faces: {
+        waiting: rostros.length, nextDeletionOn: proximo,
+        items: rostros.slice(0, ROSTROS_EN_PANTALLA).map((r) => ({
+          memberId: r.memberId, memberCode: r.memberCode, fullName: fichas.get(r.memberId)?.fullName ?? null,
+          cause: r.cause, since: r.since, deletesOn: r.seBorraEl,
+        })),
+      },
       batch: pendiente ? await this.detalle(organizationId, pendiente) : null,
       canSign: puede.firmar, canExclude: puede.sacar,
       history: resumenes,
+    };
+  }
+
+  /**
+   * Lo que la conservación hace con UN socio (P-01; `GET /members/:id/conservation`):
+   * si su baja cuenta (o por qué todavía no), cuándo se borra su rostro y
+   * desde cuándo entraría a la lista. Nada de esto escribe.
+   */
+  async deSocio(organizationId: string, memberId: string, ahora: Date = new Date()): Promise<MemberConservation> {
+    const bajas = new BajasParaConservar(organizationId, ahora);
+    const [s, guardado, arranques, meses] = await Promise.all([
+      bajas.de([memberId]).then((m) => m.get(memberId) ?? null),
+      new BajaParaConservarRepository(organizationId).rostroGuardado(memberId),
+      this.arranques(organizationId), this.meses(organizationId),
+    ]);
+    const fichas = await new BajaParaConservarRepository(organizationId).fichas([memberId]);
+    const hoy = s?.hoy ?? await bajas.hoyEn(fichas.get(memberId)?.homeBranchId ?? null);
+    const c = s?.conservar ?? null;
+    const cuenta = c?.cuenta ? c : null;
+    const arranque = cuenta ? arranqueDeLaBaja(cuenta.cause, arranques) : null;
+    return {
+      memberId, asOf: hoy,
+      baja: c ? {
+        cause: c.cause, counts: c.cuenta, since: c.cuenta ? c.since : null,
+        exception: c.cuenta ? null : c.porque, countsFrom: c.cuenta ? null : c.contaraDesde,
+        lastEntryOn: s!.actividad.ultimaEntrada,
+      } : null,
+      face: { stored: guardado, deletesOn: guardado && cuenta && arranque ? isoDate(rostroSeBorraEl(medianoche(cuenta.since), arranque)) : null },
+      listFrom: cuenta ? sumarMeses(cuenta.since, meses) : null,
     };
   }
 
@@ -452,7 +562,7 @@ export class ConservacionService {
         return {
           memberId: r.memberId, memberCode: r.memberCode,
           fullName: m && !m.anonymizedAt ? `${m.firstName} ${m.lastName}` : null,
-          homeBranchId: m?.homeBranchId ?? null, archivedOn: isoDate(r.archivedOn), status: r.status, note: r.note,
+          homeBranchId: m?.homeBranchId ?? null, archivedOn: isoDate(r.archivedOn), cause: r.bajaCause, status: r.status, note: r.note,
         };
       }),
     };
@@ -517,6 +627,26 @@ export class ConservacionService {
       if (bajaEl.getTime() <= corteDeAnonimizacion(hoy, meses).getTime()) salida.push({ exsocio, bajaEl });
     }
     return salida;
+  }
+
+  /**
+   * Quién entra a la lista del mes: los dados de baja en su ficha que cumplen
+   * el plazo (3.9) y, desde P-01 (4.18), los de la baja calculada que lo
+   * cumplen contando desde su baja para la conservación (con la excepción de
+   * quien sigue viniendo ya aplicada). Del más antiguo al más reciente.
+   */
+  private async candidatos(organizationId: string, meses: number, ahora: Date): Promise<Candidato[]> {
+    const deFicha: Candidato[] = (await this.cumplenElPlazo(organizationId, meses, ahora)).map((c) => ({
+      memberId: c.exsocio.id, memberCode: c.exsocio.memberCode, archivedAt: c.exsocio.deletedAt!, archivedOn: c.bajaEl, cause: 'ARCHIVED',
+    }));
+    const calculadas: Candidato[] = [];
+    for (const s of await new BajasParaConservar(organizationId, ahora).calculadas()) {
+      if (!s.conservar?.cuenta) continue;
+      const desde = medianoche(s.conservar.since);
+      if (desde.getTime() > corteDeAnonimizacion(medianoche(s.hoy), meses).getTime()) continue;
+      calculadas.push({ memberId: s.memberId, memberCode: s.memberCode, archivedAt: desde, archivedOn: desde, cause: s.conservar.cause });
+    }
+    return [...deFicha, ...calculadas].sort((a, b) => a.archivedOn.getTime() - b.archivedOn.getTime() || a.memberId.localeCompare(b.memberId));
   }
 
   /** El «hoy» de una sede y cómo pasar un instante a día de esa sede; una lectura de zona por sede. */

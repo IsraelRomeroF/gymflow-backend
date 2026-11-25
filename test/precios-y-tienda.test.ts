@@ -5,13 +5,19 @@ import { makeApp, loginAs, telefonoUnico } from './helpers.js';
 import { abrirTurno, gimnasioPropio, socioPropio, type GimnasioPropio } from './gimnasio-propio.js';
 import { closeDb, getDb } from '../src/platform/db/client.js';
 import { OutboundService } from '../src/modules/outbound/index.js';
+import { BusinessCalendar } from '../src/platform/time/business-calendar.js';
+import { ponerReloj, relojReal } from './reloj.js';
+import { BillingService } from '../src/modules/billing/index.js';
+import { systemContext } from '../src/platform/jobs/types.js';
 
 /**
  * FASE 3 · BLOQUE 3.6 · PRECIOS Y TIENDA (D-19, D-20, D-21).
  *
  * D-19: cambiar el precio de un plan le cambia a TODOS en su siguiente pago
  * (la misma diferencia a cada membresía viva); solo conserva su precio la
- * marcada, y aun esa cambia si quien confirma lo decide. La vista previa dice
+ * marcada, y aun esa cambia si quien confirma lo decide. Desde 4.20 (P-14) un
+ * AUMENTO espera 15 días: aquí la renovación que ya lo lleva se hace con el
+ * reloj 16 días adelante (lo propio de 4.20 está en `aviso-de-aumento.test.ts`). La vista previa dice
  * a cuántos toca y cuánto ANTES de confirmar; queda el acto, la bitácora, el
  * aviso al teléfono (bandeja de salida) y la línea del recibo.
  * D-20: nada nuevo; la visita suelta sigue sin inscripción (lo comprueba
@@ -113,11 +119,14 @@ describe('precios y tienda (3.6)', () => {
       const r = await get(gerente, `/plans/${plan}/impact?newPriceCents=65000`);
       expect(r.statusCode, r.body).toBe(200);
       const fin = (await membresia(m.lista1)).currentPeriodEnd.toISOString().slice(0, 10);
+      const hoy = await new BusinessCalendar(g.organizationId).today(null);
       expect(r.json().priceChange).toEqual({
         fromPriceCents: '60000', toPriceCents: '65000', deltaCents: '5000',
         touched: 3, touchedAtListPrice: 3, touchedAtOtherPrice: 0, touchedDeltaCents: '15000',
         protected: 1, protectedDeltaCents: '5000', atOwnPriceBranches: 1,
         firstPaymentOn: fin, touchedWithoutPhone: 2,
+        // 4.20: rige 15 días después; su siguiente pago (en un mes) ya pasa de esa fecha.
+        appliesFrom: new Date(hoy.getTime() + 15 * 86_400_000).toISOString().slice(0, 10), noticeDays: 15, touchedBeforeNotice: 0,
       });
       // Sin precio nuevo, o con el mismo, no hay cambio que mostrar.
       expect((await get(gerente, `/plans/${plan}/impact`)).json().priceChange).toBeNull();
@@ -145,10 +154,11 @@ describe('precios y tienda (3.6)', () => {
       expect(r.statusCode, r.body).toBe(200);
       expect(r.json().priceCents).toBe('65000');
 
-      expect((await membresia(m.lista1)).agreedPriceCents).toBe(65_000n);
-      expect((await membresia(m.lista2)).agreedPriceCents).toBe(65_000n);
-      // Sin precio escrito sigue sin él: paga el de lista del día de su cuota, que ya es el nuevo.
-      expect((await membresia(m.sinPacto)).agreedPriceCents).toBeNull();
+      // 4.20: el aumento espera su primera cuota; mientras, lo que pagan no se mueve.
+      expect((await membresia(m.lista1)).agreedPriceCents).toBe(60_000n);
+      expect((await membresia(m.lista2)).agreedPriceCents).toBe(60_000n);
+      // Sin precio escrito queda con el de antes escrito: el de lista ya es el nuevo y no le llega antes.
+      expect((await membresia(m.sinPacto)).agreedPriceCents).toBe(60_000n);
       expect(await membresia(m.convenio)).toMatchObject({ agreedPriceCents: 50_000n, priceProtected: true });
       expect((await membresia(m.norte)).agreedPriceCents).toBe(66_000n);
 
@@ -157,6 +167,7 @@ describe('precios y tienda (3.6)', () => {
       const filas = await db().membershipPriceChange.findMany({ where: { planPriceChangeId: acto.id } });
       expect(filas.map((f) => f.membershipId).sort()).toEqual([m.lista1, m.lista2, m.sinPacto].sort());
       expect(filas.every((f) => f.fromPriceCents === 60_000n && f.toPriceCents === 65_000n && !f.wasProtected)).toBe(true);
+      expect(filas.every((f) => f.appliesFrom !== null && f.appliesFrom.getTime() === acto.appliesFrom?.getTime())).toBe(true);
 
       // En la bitácora: el cambio del plan y a cuántos tocó.
       const asiento = await db().auditLog.findFirstOrThrow({ where: { organizationId: g.organizationId, action: 'catalog.plan.price_change', resourceId: plan } });
@@ -170,18 +181,25 @@ describe('precios y tienda (3.6)', () => {
     });
 
     it('el siguiente pago sale al precio nuevo, y el recibo lo dice', async () => {
-      const visto = (await membresia(m.lista1)).currentPeriodStart.toISOString().slice(0, 10);
-      const r = await app.inject({
-        method: 'POST', url: `/memberships/${m.lista1}/renewal`, headers: { cookie: gerente },
-        payload: { expectedPeriodStart: visto, payment: { method: 'SPEI_TRANSFER', externalRef: `REN${randomUUID().slice(0, 10)}` } },
+      // 4.20: renovar HOY por adelantado todavía no lo lleva; a los 16 días, sí.
+      const visto = (await membresia(m.lista1)).currentPeriodStart;
+      ponerReloj(new Date(Date.now() + 16 * 86_400_000).toISOString());
+      const renovada = await new BillingService().renewMembership(systemContext(g.organizationId), { membershipId: m.lista1, payment: null, expectedPeriodStart: visto })
+        .finally(relojReal);
+      expect(renovada.charge.amountCents).toBe(65_000n);
+      // Llegó: queda la constancia con su cuota y el precio pactado ya es el nuevo.
+      expect((await membresia(m.lista1)).agreedPriceCents).toBe(65_000n);
+      expect(await db().membershipPriceApplication.count({ where: { membershipId: m.lista1, chargeId: renovada.charge.id } })).toBe(1);
+      const cobro = await app.inject({
+        method: 'POST', url: `/members/${socio.lista1}/payments`, headers: { cookie: gerente },
+        payload: { idempotencyKey: randomUUID(), method: 'SPEI_TRANSFER', amountCents: '65000', branchId: g.sedes[0]!.id, externalRef: `REN${randomUUID().slice(0, 10)}`, targetChargeIds: [renovada.charge.id] },
       });
-      expect(r.statusCode, r.body).toBe(200);
-      expect(r.json().charge.amountCents).toBe('65000');
+      expect([200, 201], cobro.body).toContain(cobro.statusCode);
 
       // El comprobante de ese pago: es el primero al precio nuevo.
       const pago = await db().payment.findFirstOrThrow({ where: { memberId: socio.lista1!, organizationId: g.organizationId }, orderBy: { createdAt: 'desc' } });
       const nuevo = (await get(gerente, `/payments/${pago.id}/receipt`)).json();
-      expect(nuevo.priceNotice).toEqual({ kind: 'APPLIED', planName: 'Mensual de la prueba', fromPriceCents: '60000', toPriceCents: '65000' });
+      expect(nuevo.priceNotice).toEqual({ kind: 'APPLIED', planName: 'Mensual de la prueba', fromPriceCents: '60000', toPriceCents: '65000', startsOn: null });
       // El comprobante de la venta, anterior al cambio, no dice nada aunque se reimprima hoy.
       expect((await get(gerente, `/payments/${pagoDeLaVenta}/receipt`)).json().priceNotice).toBeNull();
 
@@ -192,7 +210,12 @@ describe('precios y tienda (3.6)', () => {
       });
       expect([200, 201], abono.body).toContain(abono.statusCode);
       const recibo = (await get(gerente, `/payments/${abono.json().payment.id}/receipt`)).json();
-      expect(recibo.priceNotice).toEqual({ kind: 'UPCOMING', planName: 'Mensual de la prueba', fromPriceCents: '60000', toPriceCents: '65000' });
+      const suFila = await db().membershipPriceChange.findFirstOrThrow({ where: { membershipId: m.lista2 } });
+      // Su membresía sigue por activar (no hay fecha prevista): el recibo dice desde cuándo rige.
+      expect(recibo.priceNotice).toEqual({
+        kind: 'UPCOMING', planName: 'Mensual de la prueba', fromPriceCents: '60000', toPriceCents: '65000',
+        startsOn: (suFila.firstChargeOn ?? suFila.appliesFrom)!.toISOString().slice(0, 10),
+      });
     });
 
     it('el aviso al teléfono queda en Mensajes para quien tiene celular, con el antes y el después', async () => {
@@ -203,10 +226,12 @@ describe('precios y tienda (3.6)', () => {
       const aviso = lista.pending.find((x: { memberId: string }) => x.memberId === socio.lista1);
       expect(aviso).toBeTruthy();
       expect(aviso.kind).toBe('PRICE_CHANGE');
-      expect(aviso.text).toContain('a partir de tu siguiente pago');
+      // 4.20: dice el día de su primer pago al precio nuevo.
+      expect(aviso.text).toContain('a partir de tu pago del');
       expect(aviso.text).toContain('$650.00');
       expect(aviso.text).toContain('antes $600.00');
       expect(aviso.detail).toContain('de $600.00 a $650.00');
+      expect(aviso.detail).toContain('desde su pago del');
       // Volver a armarlos (el job diario) no duplica nada.
       expect((await new OutboundService().avisarCambiosDePrecio(g.organizationId)).created).toBe(0);
       expect(await db().outboundMessage.count({ where: { organizationId: g.organizationId, kind: 'PRICE_CHANGE' } })).toBe(1);
@@ -222,8 +247,11 @@ describe('precios y tienda (3.6)', () => {
       const r = await cambiarPrecio(plan, '70000', { includeProtected: true, fromPriceCents: '65000' });
       expect(r.statusCode, r.body).toBe(200);
       // Conserva su distancia con el de lista y sigue marcado: el siguiente cambio vuelve a preguntar.
-      expect(await membresia(m.convenio)).toMatchObject({ agreedPriceCents: 55_000n, priceProtected: true });
-      expect((await membresia(m.lista1)).agreedPriceCents).toBe(70_000n);
+      // 4.20: el aumento espera sus 15 días; lo que paga hoy no se mueve.
+      expect(await membresia(m.convenio)).toMatchObject({ agreedPriceCents: 50_000n, priceProtected: true });
+      expect((await membresia(m.lista1)).agreedPriceCents).toBe(65_000n);
+      const suyas = await db().membershipPriceChange.findMany({ where: { membershipId: { in: [m.convenio, m.lista1] }, acto: { toPriceCents: 70_000n } } });
+      expect(suyas.map((f) => `${f.fromPriceCents}>${f.toPriceCents}`).sort()).toEqual(['50000>55000', '65000>70000']);
       const acto = await db().planPriceChange.findFirstOrThrow({ where: { planId: plan, toPriceCents: 70_000n } });
       expect(acto).toMatchObject({ includedProtected: true, touchedCount: 4, protectedKeptCount: 0 });
       // El aviso del convenio nace; el del primer cambio de lista1 se reemplaza por el nuevo.
@@ -236,8 +264,10 @@ describe('precios y tienda (3.6)', () => {
     it('bajar el precio también le llega a todos y nunca deja un precio negativo', async () => {
       const r = await cambiarPrecio(plan, '64000', { includeProtected: false, fromPriceCents: '70000' });
       expect(r.statusCode, r.body).toBe(200);
+      // La bajada no espera (4.20): pagaba 650 con un aumento a 700 por llegar; ya paga 640.
       expect((await membresia(m.lista1)).agreedPriceCents).toBe(64_000n);
-      expect((await membresia(m.convenio)).agreedPriceCents).toBe(55_000n);
+      // El convenio no entró en la bajada: sigue en 500 con su aumento a 550 por llegar.
+      expect((await membresia(m.convenio)).agreedPriceCents).toBe(50_000n);
     });
 
     it('«conserva su precio» se pone y se quita con motivo, queda en la bitácora y solo lo hace quien arma el catálogo', async () => {
@@ -251,7 +281,8 @@ describe('precios y tienda (3.6)', () => {
       // Quien no tenía precio escrito queda con el que paga hoy.
       const r = await marcar(gerente, m.sinPacto, true);
       expect(r.statusCode, r.body).toBe(200);
-      expect(r.json()).toEqual({ membershipId: m.sinPacto, priceProtected: true, agreedPriceCents: '64000', reason: 'Acuerdo de la prueba con el socio' });
+      // Hoy paga 600: su aumento a 650 no ha llegado y la bajada a 640 no lo adelanta (4.20).
+      expect(r.json()).toEqual({ membershipId: m.sinPacto, priceProtected: true, agreedPriceCents: '60000', reason: 'Acuerdo de la prueba con el socio' });
       expect(await db().auditLog.count({ where: { organizationId: g.organizationId, action: 'catalog.price_protection.set', resourceId: socio.sinPacto! } })).toBe(1);
       // Repetirla no hace nada.
       expect((await marcar(gerente, m.sinPacto, true)).statusCode).toBe(200);
@@ -261,16 +292,19 @@ describe('precios y tienda (3.6)', () => {
       expect(lista.statusCode, lista.body).toBe(200);
       expect(lista.json().total).toBe(2);
       expect(lista.json().items.map((x: { membershipId: string }) => x.membershipId).sort()).toEqual([m.convenio, m.sinPacto].sort());
-      expect(lista.json().items.find((x: { membershipId: string }) => x.membershipId === m.convenio)).toMatchObject({ agreedPriceCents: '55000', listPriceCents: '64000', reason: 'Se pactó un precio distinto al de lista' });
+      expect(lista.json().items.find((x: { membershipId: string }) => x.membershipId === m.convenio)).toMatchObject({ agreedPriceCents: '50000', listPriceCents: '64000', reason: 'Se pactó un precio distinto al de lista' });
       expect((await get(recepcion, `/plans/${plan}/protected-prices`)).statusCode).toBe(403);
 
       // Un cambio que no los incluye no los toca; al quitar la marca, el siguiente sí.
       expect((await cambiarPrecio(plan, '66000', { includeProtected: false })).statusCode).toBe(200);
-      expect((await membresia(m.sinPacto)).agreedPriceCents).toBe(64_000n);
-      expect((await marcar(gerente, m.sinPacto, false)).json()).toMatchObject({ priceProtected: false, agreedPriceCents: '64000', reason: null });
+      expect((await membresia(m.sinPacto)).agreedPriceCents).toBe(60_000n);
+      expect((await marcar(gerente, m.sinPacto, false)).json()).toMatchObject({ priceProtected: false, agreedPriceCents: '60000', reason: null });
       expect((await cambiarPrecio(plan, '67000', { includeProtected: false })).statusCode).toBe(200);
-      expect((await membresia(m.sinPacto)).agreedPriceCents).toBe(65_000n);
-      expect((await membresia(m.lista1)).agreedPriceCents).toBe(67_000n);
+      // 4.20: los aumentos esperan; la ficha dice a cuánto pasa.
+      expect((await membresia(m.sinPacto)).agreedPriceCents).toBe(60_000n);
+      expect((await membresia(m.lista1)).agreedPriceCents).toBe(64_000n);
+      expect((await get(gerente, `/memberships/${m.sinPacto}`)).json().pendingPrice).toMatchObject({ toPriceCents: '65000' });
+      expect((await get(gerente, `/memberships/${m.lista1}`)).json().pendingPrice).toMatchObject({ toPriceCents: '67000' });
     });
 
     it('un plan sin socios que conserven su precio se cambia sin más, y el de la visita suelta no toca a nadie (D-20)', async () => {

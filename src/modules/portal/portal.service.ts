@@ -5,7 +5,7 @@ import { generateOpaqueToken, hashToken } from '../../platform/crypto.js';
 import { isModuleOn } from '../../platform/modules/module-state.js';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
-import { ChargeRepository, PaymentRepository, StatementRepository, comoSeSaldo, precioDeCuotaDe, type ChargeRecord } from '../billing/index.js';
+import { ChargeRepository, PaymentRepository, StatementRepository, comoSeSaldo, precioDeCuotaPara, type ChargeRecord } from '../billing/index.js';
 import type { NoticePriority, PartesDelCursor } from '@gymflow/core/contracts';
 import type { DenialReason, VisitPackStatus } from '@gymflow/core';
 import { MemberRepository, MemberNoticeRepository } from '../members/index.js';
@@ -222,7 +222,8 @@ export class PortalService {
     // también mira el precio propio de la sede cuando la membresía no tiene pactado (pendiente de 3.6).
     const cuota = membership && plan && membership.autoRenew && (membership.status === 'ACTIVE' || membership.status === 'TRIALING')
       && (plan.billingModel === 'RECURRING' || plan.billingModel === 'PREPAID_PERIOD')
-      ? await precioDeCuotaDe(organizationId, membership, plan) : null;
+      // 4.20 (P-14): con el aumento solo si ya rige para la cuota de ese día (la emite el job ese mismo día).
+      ? (await precioDeCuotaPara(organizationId, membership, plan, { inicio: membership.currentPeriodEnd, emitidaEl: membership.currentPeriodEnd })).precio : null;
 
     return {
       memberId: member.id,
@@ -439,13 +440,13 @@ export class PortalService {
    */
   private async avisoDePrecio(
     organizationId: string, pago: { memberId: string; amountCents: bigint; createdAt: Date }, tocados: ReadonlyArray<ChargeRecord | null>,
-  ): Promise<{ kind: 'UPCOMING' | 'APPLIED'; planName: string | null; fromPriceCents: bigint; toPriceCents: bigint } | null> {
+  ): Promise<{ kind: 'UPCOMING' | 'APPLIED'; planName: string | null; fromPriceCents: bigint; toPriceCents: bigint; startsOn: Date | null } | null> {
     const membresiaId = tocados.find((c) => c?.membershipId && c.chargeType === 'MEMBERSHIP_PERIOD')?.membershipId ?? null;
     if (!membresiaId || pago.amountCents <= 0n) return null;
     const pagadas = new Set(tocados.filter((c) => c?.membershipId === membresiaId && c.chargeType === 'MEMBERSHIP_PERIOD').map((c) => c!.id));
     const cuotas = (await new ChargeRepository(organizationId).listForMember(pago.memberId))
       .filter((c) => c.membershipId === membresiaId && c.chargeType === 'MEMBERSHIP_PERIOD')
-      .map((c) => ({ createdAt: c.createdAt, cubierta: pagadas.has(c.id) }));
+      .map((c) => ({ id: c.id, createdAt: c.createdAt, cubierta: pagadas.has(c.id) }));
     const aviso = await avisoDePrecioEnRecibo(organizationId, { membershipId: membresiaId, pagadoEn: pago.createdAt, cuotas });
     if (!aviso) return null;
     const membresia = await new MembershipRepository(organizationId).findById(membresiaId);

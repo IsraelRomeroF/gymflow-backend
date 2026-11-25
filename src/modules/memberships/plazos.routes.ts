@@ -1,7 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import {
-  PLAZOS_DEL_SOCIO, erroresDePlazos, notFound, plazosCambiados, plazosDelGrupo, sumarDias, validation,
+  DomainError, PLAZOS_DEL_SOCIO, erroresDePlazos, notFound, plazosCambiados, plazosDelGrupo, sumarDias, validation,
   type GrupoDePlazo, type PlazoKey,
 } from '@gymflow/core';
 import { MemberStanding, MemberTerms } from '@gymflow/core/contracts';
@@ -25,6 +25,8 @@ import { BajaRepository } from './baja.repository.js';
  *  - los de la DEUDA (venta sin cobrar, deuda que se da por perdida): la
  *    gerencia, SIEMPRE con la firma de la dueña (`billing:debt-terms:set`,
  *    bajo la llave del Tablero).
+ * Sin un gerente que administre, los dos los ajusta la dueña (P-02, bloque
+ * 4.19); los de la deuda, con SU contraseña, como cierra el mes (D-23).
  * Un cambio rige desde la siguiente consulta y el siguiente cierre diario; no
  * reescribe nada hacia atrás (una deuda ya dada por perdida no «regresa»).
  */
@@ -40,7 +42,11 @@ const serializar = (p: PlazosDelGimnasio): MemberTerms => ({
 /** El cuerpo de un ajuste: solo las llaves de ese grupo, todas opcionales, más el motivo. */
 function cuerpoDe(group: GrupoDePlazo) {
   const llaves = Object.fromEntries(plazosDelGrupo(group).map((d) => [d.key, z.number().int().optional()])) as Record<PlazoKey, z.ZodOptional<z.ZodNumber>>;
-  return z.object({ ...llaves, reason: z.string().trim().min(3).max(300), approvalToken: z.string().min(20).max(200).optional() }).strict();
+  return z.object({
+    ...llaves, reason: z.string().trim().min(3).max(300), approvalToken: z.string().min(20).max(200).optional(),
+    /** La contraseña de la dueña cuando los ajusta sola (sin gerente; P-02, bloque 4.19). */
+    ...(group === 'debt' ? { password: z.string().min(1).max(200).optional() } : {}),
+  }).strict();
 }
 
 export function registerPlazosRoutes(app: FastifyInstance): void {
@@ -61,15 +67,30 @@ export function registerPlazosRoutes(app: FastifyInstance): void {
   ): Promise<MemberTerms> {
     const ctx = request.ctx!;
     const orgId = ctx.tenant.organizationId;
-    const { reason, approvalToken, ...resto } = cuerpoDe(group).parse(request.body);
+    const { reason, approvalToken, password, ...resto } = cuerpoDe(group).parse(request.body) as z.infer<ReturnType<typeof cuerpoDe>> & { password?: string };
     const propuesto = Object.fromEntries(Object.entries(resto).filter(([, v]) => v !== undefined)) as Partial<Record<PlazoKey, number>>;
     if (Object.keys(propuesto).length === 0) throw validation('Indica al menos un plazo que cambiar');
 
+    // ¿Los de la deuda los ajusta sola (P-02, bloque 4.19)? Quien da la segunda firma (la dueña) Y tiene el
+    // permiso, que la sesión solo le da sin un gerente que administre. Nadie se firma a sí mismo: en vez de
+    // la firma, su contraseña, y la bitácora dice que lo hizo sola. Igual que el cierre de mes (D-23).
+    const sola = permiso === 'billing:debt-terms:set' && !approvalToken
+      && request.holds('approvals:grant', null) && request.holds('billing:debt-terms:set', null);
+    if (sola) {
+      if (!password) throw validation('Escribe tu contraseña para cambiar los plazos de la deuda');
+      const { AuthUserRepository } = await import('../identity/index.js');
+      const { ApprovalService } = await import('../approvals/index.js');
+      const yo = await new AuthUserRepository().findById(ctx.tenant.actorUserId!);
+      if (!yo || !yo.isActive) throw new DomainError('UNAUTHENTICATED', 'Tu cuenta ya no está activa');
+      await new ApprovalService().comprobarContrasena(ctx, yo, password, { branchId: null }, { canal: 'telefono', asentarFallo: async () => undefined });
+    }
     // La firma, si el permiso la pide (los de la deuda): se ata al gimnasio, como los topes del cajón.
-    const aprobador = permiso === 'billing:debt-terms:set'
+    const aprobador = permiso === 'billing:debt-terms:set' && !sola
       ? await request.verifyApprover(approvalToken, permiso, { branchId: null, resourceType: 'MemberTerms', resourceId: orgId })
       : null;
-    request.authorize(permiso, { branchId: null, reason, ...(aprobador ? { approvedByUserId: aprobador } : {}) });
+    // Sola no pasa por la segunda firma (su contraseña la reemplaza, como en el cierre de mes): solo el permiso.
+    if (sola) request.requirePermission(permiso, null);
+    else request.authorize(permiso, { branchId: null, reason, ...(aprobador ? { approvedByUserId: aprobador } : {}) });
 
     const repo = new PlazosDelSocioRepository(orgId);
     return enUnaTransaccion(async () => {
@@ -83,7 +104,7 @@ export function registerPlazosRoutes(app: FastifyInstance): void {
         const solo = (t: Record<PlazoKey, number>) => Object.fromEntries(cambiaron.map((k) => [k, t[k]]));
         await audit.record(ctx, {
           action: accion, resourceType: 'Organization', resourceId: orgId,
-          beforeState: solo(antes.terms), afterState: solo(despues.terms), reason,
+          beforeState: solo(antes.terms), afterState: { ...solo(despues.terms), ...(sola ? { ownerAlone: true } : {}) }, reason,
           ...(aprobador ? { approvedByUserId: aprobador } : {}),
         });
       }
@@ -91,7 +112,7 @@ export function registerPlazosRoutes(app: FastifyInstance): void {
     });
   }
 
-  /** Los plazos de retención: la gerencia, con motivo. Recepción y el coach no; la dueña tampoco (no opera). */
+  /** Los plazos de retención: la gerencia, con motivo. Recepción y el coach no; la dueña solo sin gerente (P-02). */
   route(app, {
     method: 'PUT',
     url: '/member-terms/retention',
@@ -100,7 +121,7 @@ export function registerPlazosRoutes(app: FastifyInstance): void {
     handler: (request) => cambiar(request, 'retention', 'retention:terms:set', 'settings.retention_terms.update'),
   });
 
-  /** Los plazos de la deuda: la gerencia, SIEMPRE con la firma de la dueña (dar dinero por perdido es control). */
+  /** Los plazos de la deuda: la gerencia, SIEMPRE con la firma de la dueña (dar dinero por perdido es control); sin gerente, la dueña con su contraseña (P-02). */
   route(app, {
     method: 'PUT',
     url: '/member-terms/debt',

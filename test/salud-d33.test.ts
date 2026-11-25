@@ -69,7 +69,10 @@ describe('salud: solo la nota del alta (D-33)', () => {
   }
   const menor = () => altaPorQr({ adult: false, birthDate: naceHace(16), guardianName: 'Tutora De Prueba', guardianPhone: telefonoUnico().slice(3) });
   const notaEnFicha = async (memberId: string) => descifrarSensible((await getDb().member.findUniqueOrThrow({ where: { id: memberId }, select: { healthNotes: true } })).healthNotes);
-  /** Una cuenta de recepción de la sede de la prueba; con `ve`, la gerencia le encendió «Ver la nota de salud». */
+  /**
+   * Una cuenta de recepción de la sede de la prueba; con `ve`, tiene GUARDADO «Ver la nota de salud» encendido
+   * de antes (P-10, bloque 4.19: ya no se le enciende a recepción y lo guardado no vale).
+   */
   async function recepcionista(ve: boolean): Promise<string> {
     const correo = await cuentaDePrueba(orgId, 'RECEPTION', [sede.id]);
     if (ve) await getDb().user.updateMany({ where: { email: correo }, data: { permissionOverrides: { add: ['members:health:read'], remove: [] } } });
@@ -84,13 +87,13 @@ describe('salud: solo la nota del alta (D-33)', () => {
     expect(deSalud.map((p) => `${p.key} · ${p.description}`)).toEqual(['members:health:read · Ver la nota de salud del socio']);
   });
 
-  it('quién lo tiene: gerencia y coach por su puesto; recepción y la dueña no, y a recepción solo se le enciende por persona', () => {
+  it('quién lo tiene: gerencia y coach por su puesto; recepción y la dueña no, y a recepción ya no se le enciende (P-10)', () => {
     const de = (puesto: string) => ROLE_BY_KEY.get(puesto)!.permissions as readonly string[];
     for (const puesto of ['MANAGER', 'COACH']) expect(de(puesto), puesto).toContain('members:health:read');
     for (const puesto of ['RECEPTION', 'OWNER']) expect(de(puesto), puesto).not.toContain('members:health:read');
     const ajustable = (puesto: 'RECEPTION' | 'COACH') => ADJUSTABLE_BY_ROLE[puesto].flatMap((g) => g.permissions);
-    // A recepción se le puede encender por persona (queda en la bitácora, con motivo); al coach se le puede quitar.
-    expect(ajustable('RECEPTION')).toContain('members:health:read');
+    // A recepción ya no se le enciende por persona (P-10, bloque 4.19); al coach se le puede quitar.
+    expect(ajustable('RECEPTION')).not.toContain('members:health:read');
     expect(ajustable('COACH')).toContain('members:health:read');
   });
 
@@ -139,8 +142,8 @@ describe('salud: solo la nota del alta (D-33)', () => {
 
     expect((await pedir(recepcion, 'GET', `/members/${memberId}/health`)).statusCode).toBe(403);
     expect((await pedir(deLaSede, 'GET', `/members/${memberId}/health`)).statusCode).toBe(403);
-    // La persona de recepción a quien la gerencia se lo encendió, sí (como hoy).
-    expect((await pedir(await recepcionista(true), 'GET', `/members/${memberId}/health`)).statusCode).toBe(200);
+    // Ni la persona de recepción que lo tenía encendido de antes (P-10, bloque 4.19).
+    expect((await pedir(await recepcionista(true), 'GET', `/members/${memberId}/health`)).statusCode).toBe(403);
 
     // El coach: solo de quien tiene asignado.
     expect([403, 404]).toContain((await pedir(coach, 'GET', `/members/${memberId}/health`)).statusCode);
@@ -195,11 +198,14 @@ describe('salud: solo la nota del alta (D-33)', () => {
     expect(deGerencia.statusCode, deGerencia.body).toBe(201);
     expect(await notaEnFicha(deGerencia.json().memberId)).toBe('Asma leve');
 
-    // Y la persona de recepción a quien la gerencia le encendió verla.
+    // Ni la persona de recepción que tenía encendido verla de antes (P-10, bloque 4.19): esa alta la aprueba la gerencia.
     const c = await menor();
-    const autorizada = await pedir(await recepcionista(true), 'POST', `/intakes/${c}/approve`, tutor('Alergia al látex'));
-    expect(autorizada.statusCode, autorizada.body).toBe(201);
-    expect(await notaEnFicha(autorizada.json().memberId)).toBe('Alergia al látex');
+    const deAntes = await pedir(await recepcionista(true), 'POST', `/intakes/${c}/approve`, tutor('Alergia al látex'));
+    expect(deAntes.statusCode, deAntes.body).toBe(403);
+    expect((await getDb().memberIntake.findUniqueOrThrow({ where: { id: c } })).status).toBe('SUBMITTED');
+    const laGerencia = await pedir(gerencia, 'POST', `/intakes/${c}/approve`, tutor('Alergia al látex'));
+    expect(laGerencia.statusCode, laGerencia.body).toBe(201);
+    expect(await notaEnFicha(laGerencia.json().memberId)).toBe('Alergia al látex');
 
     // Vincular a una ficha que ya existía sigue la misma regla.
     const d = await menor();

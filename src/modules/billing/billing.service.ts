@@ -7,7 +7,7 @@ import { ChargeRepository, type ChargeRecord } from './charge.repository.js';
 import { MemberRepository } from '../members/index.js';
 import { MembershipRepository, VisitPackRepository } from '../memberships/index.js';
 import { PaymentRepository, type PaymentRecord } from './payment.repository.js';
-import { PlanRepository, type PlanRecord } from '../catalog/index.js';
+import { PlanRepository, registrarLlegadaDeAumento, type PlanRecord } from '../catalog/index.js';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { MembershipService } from '../memberships/index.js';
 import { CashService } from '../cash/index.js';
@@ -15,7 +15,7 @@ import { OrganizationRepository } from '../organization/index.js';
 import type { RequestContext } from '../../platform/context.js';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 import { enUnidadDeDinero } from '../../platform/db/unit-of-work.js';
-import { precioDeCuotaDe } from './precio-de-cuota.js';
+import { precioDeCuotaPara } from './precio-de-cuota.js';
 import { isModuleOnAt } from '../../platform/modules/module-state.js';
 import * as sales from './sales.js';
 import * as membership_billing from './membership-billing.js';
@@ -189,7 +189,10 @@ export class BillingService {
     // (DM-05) y, sin pactado, el precio del plan en su sede aunque la sede ya
     // no lo venda a socios nuevos. Ya no hay «sin precio»: dejar de vender un
     // plan en una sede no rompe la renovación de quien lo compró ahí.
-    const precio = await precioDeCuotaDe(orgId, membership, plan);
+    // 4.20 (P-14): un aumento guardado llega solo a la cuota que EMPIEZA y SE EMITE desde su
+    // «rige desde» (15 días después de guardarlo); la de antes sale al precio de antes.
+    const emitidaEl = await new BusinessCalendar(orgId).today(membership.soldAtBranchId);
+    const { precio, llegan } = await precioDeCuotaPara(orgId, membership, plan, { inicio: start, emitidaEl });
     const { subtotalCents, taxCents } = amountsForPlan(plan, precio);
 
     const result = await new ChargeRepository(orgId).create({
@@ -207,6 +210,9 @@ export class BillingService {
       idempotencyKey: key,
       createdByUserId: ctx.tenant.actorUserId ?? null,
     });
+
+    // Con la cuota ya emitida al precio nuevo, el aumento queda llegado (4.20).
+    if (result.created && llegan.length > 0) await registrarLlegadaDeAumento(orgId, membership.id, llegan, result.charge.id, precio);
 
     // Lo que el socio tenga a favor cubre la cuota nueva antes de que nadie se la cobre (DM-02).
     // Sin activar aquí: a media decisión de adeudo, activar movería la

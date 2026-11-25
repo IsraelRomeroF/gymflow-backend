@@ -29,6 +29,13 @@ export type DatosDelMensaje = {
   /** Solo PRICE_CHANGE: lo que pagaba y lo que pagará por periodo. */
   priceFromCents: bigint | null;
   priceToCents: bigint | null;
+  /**
+   * Solo PRICE_CHANGE de un aumento (4.20, P-14: 15 días de aviso): el día de su primer pago al
+   * precio nuevo (`priceStartsOn`, la previsión) y desde cuándo rige (`priceAppliesFrom`). Sin las
+   * dos (bajadas y cambios anteriores a 4.20) se dice «a partir de tu siguiente pago», como antes.
+   */
+  priceStartsOn?: Date | null;
+  priceAppliesFrom?: Date | null;
   /** Con cobro en línea no se manda al socio solo al mostrador. */
   enLinea: boolean;
   /** Para nombrarlo completo cuando el mensaje va a quien responde por su celular. */
@@ -82,9 +89,10 @@ export function textoDelMensaje(d: DatosDelMensaje): string {
       return `${saludo} ${TE_EXTRANAMOS[d.engagementState ?? ''] ?? TE_EXTRANAMOS.DORMANT!}`;
     case 'PRICE_CHANGE': {
       // D-19: se avisa antes de su siguiente pago, con el antes y el después. Sin promesas ni disculpas.
+      // 4.20 (P-14): un aumento dice el día de su primer pago al precio nuevo (15 días de aviso como mínimo).
       const plan = d.planName ? `tu plan ${d.planName}` : 'tu plan';
       const baja = d.priceFromCents !== null && d.priceToCents !== null && d.priceToCents < d.priceFromCents;
-      return `${saludo} Te avisamos que a partir de tu siguiente pago ${plan} ${baja ? 'baja a' : 'cuesta'} ${importe(d.priceToCents)}${d.priceFromCents !== null ? ` (antes ${importe(d.priceFromCents)})` : ''}. Cualquier duda, con gusto te atendemos en recepción.`;
+      return `${saludo} Te avisamos que a partir de ${desdeCuando(d, 'tu')} ${plan} ${baja ? 'baja a' : 'cuesta'} ${importe(d.priceToCents)}${d.priceFromCents !== null ? ` (antes ${importe(d.priceFromCents)})` : ''}. Cualquier duda, con gusto te atendemos en recepción.`;
     }
   }
 }
@@ -117,7 +125,7 @@ function textoParaElResponsable(d: DatosDelMensaje, para: string): string {
     case 'PRICE_CHANGE': {
       const plan = d.planName ? `su plan ${d.planName}` : 'su plan';
       const baja = d.priceFromCents !== null && d.priceToCents !== null && d.priceToCents < d.priceFromCents;
-      return `${saludo} Te avisamos que a partir de su siguiente pago ${plan} ${baja ? 'baja a' : 'cuesta'} ${importe(d.priceToCents)}${d.priceFromCents !== null ? ` (antes ${importe(d.priceFromCents)})` : ''}. Cualquier duda, con gusto te atendemos en recepción.`;
+      return `${saludo} Te avisamos que a partir de ${desdeCuando(d, 'su')} ${plan} ${baja ? 'baja a' : 'cuesta'} ${importe(d.priceToCents)}${d.priceFromCents !== null ? ` (antes ${importe(d.priceFromCents)})` : ''}. Cualquier duda, con gusto te atendemos en recepción.`;
     }
   }
 }
@@ -125,7 +133,17 @@ function textoParaElResponsable(d: DatosDelMensaje, para: string): string {
 const corta = (d: Date) => d.toLocaleDateString('es-MX', { timeZone: 'UTC', day: 'numeric', month: 'long' });
 
 /** De qué es, en una línea, para la fila de la lista. */
-export function detalleDelMensaje(d: Pick<DatosDelMensaje, 'kind' | 'concept' | 'dueCents' | 'dueDate' | 'planName' | 'periodEnd' | 'engagementState' | 'priceFromCents' | 'priceToCents'>): string {
+/**
+ * DESDE CUÁNDO PAGA EL PRECIO NUEVO (4.20, P-14): «su pago del 10 de diciembre» si se sabe el día;
+ * «su primer pago desde el 10 de diciembre» si solo se sabe desde cuándo rige; si no, «su siguiente pago».
+ */
+function desdeCuando(d: Pick<DatosDelMensaje, 'priceStartsOn' | 'priceAppliesFrom'>, quien: 'tu' | 'su'): string {
+  if (d.priceStartsOn) return `${quien} pago del ${corta(d.priceStartsOn)}`;
+  if (d.priceAppliesFrom) return `${quien} primer pago desde el ${corta(d.priceAppliesFrom)}`;
+  return `${quien} siguiente pago`;
+}
+
+export function detalleDelMensaje(d: Pick<DatosDelMensaje, 'kind' | 'concept' | 'dueCents' | 'dueDate' | 'planName' | 'periodEnd' | 'engagementState' | 'priceFromCents' | 'priceToCents' | 'priceStartsOn' | 'priceAppliesFrom'>): string {
   switch (d.kind) {
     case 'PAYMENT_DUE_SOON':
       if (d.dueDate === null) return [d.planName, d.periodEnd ? `su siguiente pago es el ${corta(d.periodEnd)}` : null].filter(Boolean).join(' · ');
@@ -139,6 +157,7 @@ export function detalleDelMensaje(d: Pick<DatosDelMensaje, 'kind' | 'concept' | 
     case 'WE_MISS_YOU':
       return ESTADO_DE_HABITO[d.engagementState ?? '']?.label ?? 'En riesgo';
     case 'PRICE_CHANGE':
-      return [d.planName, d.priceFromCents !== null && d.priceToCents !== null ? `de ${importe(d.priceFromCents)} a ${importe(d.priceToCents)}` : null, 'desde su siguiente pago'].filter(Boolean).join(' · ');
+      return [d.planName, d.priceFromCents !== null && d.priceToCents !== null ? `de ${importe(d.priceFromCents)} a ${importe(d.priceToCents)}` : null,
+        d.priceStartsOn ? `desde su pago del ${corta(d.priceStartsOn)}` : d.priceAppliesFrom ? `desde su primer pago a partir del ${corta(d.priceAppliesFrom)}` : 'desde su siguiente pago'].filter(Boolean).join(' · ');
   }
 }

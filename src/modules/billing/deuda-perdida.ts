@@ -2,6 +2,7 @@ import { TenantRepository } from '../../platform/db/tenant-repository.js';
 import { enUnaTransaccion } from '../../platform/db/unit-of-work.js';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { systemContext, type JobHandler, type JobResult } from '../../platform/jobs/types.js';
+import type { RequestContext } from '../../platform/context.js';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 import { plazosDe } from '../../platform/plazos/plazos-del-socio.repository.js';
 
@@ -33,6 +34,8 @@ import { plazosDe } from '../../platform/plazos/plazos-del-socio.repository.js';
  */
 
 export type DeudaPorMarcar = { chargeId: string; memberId: string; membershipId: string; branchId: string | null; balanceCents: bigint };
+/** Un cargo sin saldar de una ficha (P-11): de membresía o no. */
+export type DeudaDeFicha = { chargeId: string; memberId: string; branchId: string | null; balanceCents: bigint };
 
 const ABIERTOS = `('OPEN','PARTIALLY_PAID','OVERDUE')`;
 
@@ -103,6 +106,34 @@ export class DeudaPerdidaRepository extends TenantRepository {
     return new Map(filas.map((f) => [f.id, f.lostOn!]));
   }
 
+  // ── P-11 (4.18): la deuda de una ficha anonimizada ─────────────────────────
+
+  /** Lo que un socio debe y aún no se dio por perdido, de cualquier cargo (membresía, tienda, clases, pases). */
+  async abiertosDeSocio(memberId: string): Promise<DeudaDeFicha[]> {
+    return this.db.$queryRawUnsafe<DeudaDeFicha[]>(`
+      SELECT c."id" AS "chargeId", c."memberId", c."branchId",
+             (c."amountCents" - c."allocatedCents" - c."adjustedCents")::bigint AS "balanceCents"
+        FROM "charges" c
+       WHERE c."organizationId" = $1::uuid AND c."memberId" = $2::uuid
+         AND c."status" IN ${ABIERTOS} AND c."lostOn" IS NULL
+         AND (c."amountCents" - c."allocatedCents" - c."adjustedCents") > 0
+       ORDER BY c."dueDate", c."id"`, this.organizationId, memberId);
+  }
+
+  /** La deuda de fichas YA anonimizadas que sigue contando en «Por cobrar»: de solo lectura. */
+  async deAnonimizados(limit = 5000): Promise<DeudaDeFicha[]> {
+    return this.db.$queryRawUnsafe<DeudaDeFicha[]>(`
+      SELECT c."id" AS "chargeId", c."memberId", c."branchId",
+             (c."amountCents" - c."allocatedCents" - c."adjustedCents")::bigint AS "balanceCents"
+        FROM "charges" c
+        JOIN "members" m ON m."id" = c."memberId" AND m."organizationId" = c."organizationId"
+       WHERE c."organizationId" = $1::uuid AND m."anonymizedAt" IS NOT NULL
+         AND c."status" IN ${ABIERTOS} AND c."lostOn" IS NULL
+         AND (c."amountCents" - c."allocatedCents" - c."adjustedCents") > 0
+       ORDER BY c."memberId", c."dueDate", c."id"
+       LIMIT $2`, this.organizationId, limit);
+  }
+
   /** ¿Ya hubo una corrida que marcara algo en este gimnasio? */
   async yaCorrio(): Promise<boolean> {
     return (await this.db.auditLog.count({ where: this.scope({ action: 'billing.debt.lost.summary' }) })) > 0;
@@ -168,6 +199,11 @@ export const markLostDebt: JobHandler = async (organizationId) => {
   }
   result.truncated = result.batches >= MAX_LOTES;
 
+  // P-11 (4.18): lo que quede sin marcar de fichas ya anonimizadas (las de antes de 4.18, o un cargo
+  // que no se pudo marcar al anonimizar). Se cuenta aparte: no es deuda de una suspendida.
+  const anonimizadas = await marcarDeudaDeAnonimizados(organizationId, day);
+  result.errors.push(...anonimizadas.errores);
+
   if (result.processed > 0) {
     await audit.record(ctx, {
       action: 'billing.debt.lost.summary', resourceType: 'Organization', resourceId: organizationId,
@@ -182,3 +218,74 @@ export const markLostDebt: JobHandler = async (organizationId) => {
   }
   return result;
 };
+
+// ── P-11 (Israel 2026-11-25; fase 4, bloque 4.18) ─────────────────────────────
+
+/** El motivo de la bitácora cuando la deuda se da por perdida al anonimizar la ficha. */
+export const MOTIVO_DEUDA_AL_ANONIMIZAR = 'Se anonimizó su ficha: la deuda ya no dice de quién es y sale de «Por cobrar». No se borra ni se condona';
+
+/**
+ * AL ANONIMIZAR UNA FICHA SU DEUDA SE DA POR PERDIDA (P-11). Lo que debía y
+ * no estaba ya dado por perdido se marca con el día (`lostOn`): sale de «Por
+ * cobrar» y se suma a «Dada por perdida». No es condonación ni anulación
+ * (D-12): el cargo conserva su estado y su saldo. Un asiento `billing.debt.lost`
+ * en la historia de la ficha, con `cause: 'ANONYMIZED'`.
+ *
+ * Se llama desde `PrivacyService.anonymize`, dentro de la unidad del que llama
+ * (la marca y su asiento van juntos). Sin deuda, no escribe nada.
+ */
+export async function darPorPerdidaAlAnonimizar(ctx: RequestContext, memberId: string, day: Date): Promise<{ charges: number; amountCents: bigint }> {
+  const orgId = ctx.tenant.organizationId;
+  const repo = new DeudaPerdidaRepository(orgId);
+  return enUnaTransaccion(async () => {
+    const abiertos = await repo.abiertosDeSocio(memberId);
+    const marcados = new Set(await repo.marcar(abiertos.map((c) => c.chargeId), day));
+    const suyos = abiertos.filter((c) => marcados.has(c.chargeId));
+    if (suyos.length === 0) return { charges: 0, amountCents: 0n };
+    const importe = suyos.reduce((a, c) => a + c.balanceCents, 0n);
+    await new AuditService().record(ctx, {
+      action: 'billing.debt.lost', resourceType: 'Member', resourceId: memberId, branchId: suyos[0]!.branchId,
+      afterState: { amountCents: importe.toString(), charges: suyos.map((c) => c.chargeId), lostOn: day.toISOString().slice(0, 10), cause: 'ANONYMIZED' },
+      reason: MOTIVO_DEUDA_AL_ANONIMIZAR,
+    });
+    return { charges: suyos.length, amountCents: importe };
+  });
+}
+
+/**
+ * LAS FICHAS YA ANONIMIZADAS (P-11, datos que ya existen). Marca su deuda
+ * pendiente como dada por perdida, una ficha por unidad (marca y asiento
+ * juntos), y deja UN resumen `billing.debt.lost.anonymized` (va a «Para
+ * revisar») si marcó algo. Se puede correr las veces que sea: solo marca lo
+ * que no tiene marca. Lo corren el cierre diario (`billing.mark-lost-debt`) y
+ * `scripts/deuda-de-anonimizados.ts --aplicar`; ese guion, sin `--aplicar`,
+ * solo cuenta.
+ */
+export async function marcarDeudaDeAnonimizados(organizationId: string, day: Date): Promise<{ members: number; charges: number; amountCents: bigint; errores: Array<{ entityId: string; error: string }> }> {
+  const repo = new DeudaPerdidaRepository(organizationId);
+  const ctx = systemContext(organizationId);
+  const salida = { members: 0, charges: 0, amountCents: 0n, errores: [] as Array<{ entityId: string; error: string }> };
+  const fallidos = new Set<string>();
+  for (let lote = 0; lote < MAX_LOTES; lote++) {
+    const pendientes = (await repo.deAnonimizados(LOTE)).filter((c) => !fallidos.has(c.memberId));
+    if (pendientes.length === 0) break;
+    for (const memberId of new Set(pendientes.map((c) => c.memberId))) {
+      try {
+        const r = await darPorPerdidaAlAnonimizar(ctx, memberId, day);
+        if (r.charges === 0) { fallidos.add(memberId); continue; }
+        salida.members += 1; salida.charges += r.charges; salida.amountCents += r.amountCents;
+      } catch (error) {
+        fallidos.add(memberId);
+        salida.errores.push({ entityId: memberId, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+  }
+  if (salida.charges > 0) {
+    await new AuditService().record(ctx, {
+      action: 'billing.debt.lost.anonymized', resourceType: 'Organization', resourceId: organizationId,
+      afterState: { amountCents: salida.amountCents.toString(), charges: salida.charges, members: salida.members, lostOn: day.toISOString().slice(0, 10) },
+      reason: 'Deuda de fichas ya anonimizadas: sale de «Por cobrar» y se suma a «Dada por perdida». No se borra ni se condona',
+    });
+  }
+  return salida;
+}

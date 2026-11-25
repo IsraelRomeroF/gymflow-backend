@@ -1,4 +1,4 @@
-import { uuidv7, type Grant, lockedPermissions, applyOverrides, normalizeOverrides, ADJUSTABLE_ROLES } from '@gymflow/core';
+import { uuidv7, type Grant, lockedPermissions, applyOverrides, normalizeOverrides, ADJUSTABLE_ROLES, OWNER_WITHOUT_MANAGER } from '@gymflow/core';
 import type { SessionKind } from '@gymflow/core/contracts';
 import { GlobalRepository } from '../../platform/db/tenant-repository.js';
 import type { LimitRow } from './role.repository.js';
@@ -213,14 +213,14 @@ export class SessionRepository extends GlobalRepository {
         // su puesto admite (17-02): caja guardada a un coach no le da caja.
         const ajustable = r.roleKeys.find((k) => ADJUSTABLE_ROLES.has(k));
         if (ajustable) grants = applyOverrides(grants, normalizeOverrides(r.permissionOverrides, ajustable), r.assignmentBranches);
-        // Sin un gerente que administre (activo y con Personal liberado, D17-05), el dueño da de alta y ajusta al personal (2026-10-09).
-        // Y registra los gastos fijos (renta, nómina…): sin ellos la ganancia del Tablero miente.
-        if (r.roleKeys.includes('OWNER') && !r.orgHasManager) grants = [...grants, { permission: 'staff:manage', branchId: null }];
-        // D-23 (fase 3, bloque 3.7): la dueña anota gastos, nómina y «Retiro del dueño» AUNQUE haya gerente
-        // (antes, solo sin él); y sin un gerente que administre, cierra el mes ella, con su contraseña.
+        // D-23 (fase 3, bloque 3.7): la dueña anota gastos, nómina y «Retiro del dueño» AUNQUE haya gerente.
+        // Sin un gerente que administre (activo y con Personal liberado, D17-05), además lo de
+        // `OWNER_WITHOUT_MANAGER` (núcleo), en todo el gimnasio: da de alta y ajusta al personal
+        // (2026-10-09), cierra el mes con su contraseña (D-23) y, desde P-02 (bloque 4.19), cancela una
+        // clase, cambia el coach de un socio, cierra la revisión de un descuadre y ajusta los plazos.
         if (r.roleKeys.includes('OWNER')) {
           grants = [...grants, { permission: 'expenses:manage', branchId: null }];
-          if (!r.orgHasManager) grants = [...grants, { permission: 'reports:month:close', branchId: null }];
+          if (!r.orgHasManager) grants = [...grants, ...OWNER_WITHOUT_MANAGER.map((permission) => ({ permission, branchId: null }))];
         }
         const fuera = lockedPermissions(r.unlockedSections, r.roleKeys, r.platformSections);
         const vigentes = grants.filter((g) => !fuera.has(g.permission));

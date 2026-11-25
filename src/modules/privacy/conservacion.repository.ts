@@ -1,4 +1,4 @@
-import { uuidv7, type EstadoDeListaDeConservacion, type EstadoDeRenglonDeConservacion } from '@gymflow/core';
+import { uuidv7, type CausaDeBaja, type EstadoDeListaDeConservacion, type EstadoDeRenglonDeConservacion } from '@gymflow/core';
 import { TenantRepository } from '../../platform/db/tenant-repository.js';
 
 export type ListaRecord = {
@@ -9,6 +9,8 @@ export type ListaRecord = {
 export type RenglonRecord = {
   id: string; batchId: string; memberId: string; memberCode: string; archivedAt: Date; archivedOn: Date;
   status: EstadoDeRenglonDeConservacion; note: string | null;
+  /** P-01 (4.18): de qué baja entró (`ARCHIVED` = la de su ficha; `CANCELED` / `EXPIRED` = la calculada). */
+  bajaCause: CausaDeBaja;
 };
 
 /** Lo que hace falta saber de un exsocio para listarlo o para volver a comprobarlo antes de tocarlo. */
@@ -21,7 +23,7 @@ const LISTA = {
   id: true, period: true, status: true, monthsAfterArchive: true, cutoffOn: true,
   preparedAt: true, signedAt: true, signedByUserId: true, closedAt: true,
 } as const;
-const RENGLON = { id: true, batchId: true, memberId: true, memberCode: true, archivedAt: true, archivedOn: true, status: true, note: true } as const;
+const RENGLON = { id: true, batchId: true, memberId: true, memberCode: true, archivedAt: true, archivedOn: true, status: true, note: true, bajaCause: true } as const;
 const EXSOCIO = { id: true, memberCode: true, firstName: true, lastName: true, homeBranchId: true, deletedAt: true, anonymizedAt: true } as const;
 
 /**
@@ -99,7 +101,7 @@ export class ConservacionRepository extends TenantRepository {
   /** Crea la lista del mes con sus renglones. Se llama dentro de una unidad: o nace entera o no nace. */
   async crear(input: {
     period: string; monthsAfterArchive: number; cutoffOn: Date; preparedAt: Date;
-    renglones: ReadonlyArray<{ memberId: string; memberCode: string; archivedAt: Date; archivedOn: Date }>;
+    renglones: ReadonlyArray<{ memberId: string; memberCode: string; archivedAt: Date; archivedOn: Date; bajaCause: CausaDeBaja }>;
   }): Promise<ListaRecord> {
     const id = uuidv7();
     const lista = await this.db.privacyBatch.create({

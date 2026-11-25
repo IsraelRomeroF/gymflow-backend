@@ -96,11 +96,11 @@ describe('cabos sueltos de las fases 3 y 4 (bloque 4.11)', () => {
       expect((await pedir(recepcion, 'PUT', url, { autoRenew: false, reason: 'Otra vez' })).statusCode).toBe(403);
     });
 
-    it('anular una venta de tienda: no viene con el puesto de recepción; es de lo que se enciende por persona', () => {
+    it('anular una venta de tienda: no viene con el puesto de recepción y, desde P-09 (bloque 4.19), tampoco se enciende por persona', () => {
       expect(ROLE_PERMISSIONS.RECEPTION).not.toContain('pos:sale:void');
       expect(ROLE_PERMISSIONS.RECEPTION).not.toContain('pos:sale:return');
       const ajustable = ADJUSTABLE_BY_ROLE.RECEPTION.flatMap((x) => x.permissions);
-      expect(ajustable).toContain('pos:sale:void');
+      expect(ajustable).not.toContain('pos:sale:void');
       // Devolver otro día (con firma) no se le enciende a nadie de recepción.
       expect(ajustable).not.toContain('pos:sale:return');
     });

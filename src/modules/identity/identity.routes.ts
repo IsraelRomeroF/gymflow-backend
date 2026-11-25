@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { nombrePersona } from '../../platform/http/person-name.js';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { conflict, DomainError, forbidden, notFound, PERMISSIONS, PERMISSION_BY_KEY, ROLE_BY_KEY, validation, type PermissionKey, isSectionToken, UNLOCK_EXEMPT_ROLES, normalizeUnlocked, ADJUSTABLE_PERMISSIONS, ADJUSTABLE_PERMISSION_GROUPS, ADJUSTABLE_ROLES, adjustableFor, normalizeOverrides, normalizePhoneMx } from '@gymflow/core';
+import { conflict, DomainError, forbidden, notFound, PERMISSIONS, PERMISSION_BY_KEY, ROLE_BY_KEY, validation, type PermissionKey, isSectionToken, UNLOCK_EXEMPT_ROLES, normalizeUnlocked, ADJUSTABLE_PERMISSIONS, ADJUSTABLE_PERMISSION_GROUPS, ADJUSTABLE_ROLES, NEVER_ADJUSTABLE_BY_ROLE, adjustableFor, normalizeOverrides, normalizePhoneMx } from '@gymflow/core';
 import { route } from '../../platform/http/registry.js';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { enUnaTransaccion } from '../../platform/db/unit-of-work.js';
@@ -360,6 +360,11 @@ export function registerStaffRoutes(app: FastifyInstance): void {
         permissions: (ROLE_BY_KEY.get(k)?.permissions ?? []).filter((p) => adjustableFor(k).has(p)),
         // Lo que se le puede ajustar a ESTE puesto (17-02): el panel muestra solo eso.
         adjustable: [...adjustableFor(k)],
+        // Lo que NUNCA se le enciende a este puesto y por qué (P-09 y P-10, bloque 4.19): el panel lo dice
+        // donde antes ofrecía el interruptor. No es una regla nueva: la regla es que no está en `adjustable`.
+        never: (NEVER_ADJUSTABLE_BY_ROLE[k as keyof typeof NEVER_ADJUSTABLE_BY_ROLE] ?? []).map((n) => ({
+          key: n.permission, description: PERMISSIONS.find((p) => p.key === n.permission)?.description ?? n.permission, why: n.why,
+        })),
       })),
     }),
   });
@@ -381,8 +386,10 @@ export function registerStaffRoutes(app: FastifyInstance): void {
         reason: z.string().trim().min(3).max(300),
       }).parse(request.body);
       if (id === ctx.tenant.actorUserId) throw forbidden('Tus propios permisos no se cambian');
+      // Lo que nunca se le enciende a recepción dice por qué (P-09 y P-10, bloque 4.19).
+      const porque = (ks: readonly string[]) => Object.values(NEVER_ADJUSTABLE_BY_ROLE).flat().filter((n) => ks.includes(n.permission)).map((n) => ` ${n.why}`).join('');
       const fuera = [...body.add, ...body.remove].filter((k) => !ADJUSTABLE_PERMISSIONS.has(k));
-      if (fuera.length) throw validation(`Esa acción no se ajusta por persona: ${fuera.join(', ')}`);
+      if (fuera.length) throw validation(`Esa acción no se ajusta por persona: ${fuera.join(', ')}.${porque(fuera)}`);
       const repo = new StaffRepository(ctx.tenant.organizationId);
       const antes = await repo.find(id);
       if (!antes) throw notFound('Usuario no encontrado');
@@ -391,7 +398,7 @@ export function registerStaffRoutes(app: FastifyInstance): void {
       // Cada puesto con su lista (17-02): al coach nunca se le enciende dinero,
       // caja, punto de venta, acceso ni altas.
       const ajenas = [...body.add, ...body.remove].filter((k) => !adjustableFor(puesto).has(k));
-      if (ajenas.length) throw validation(`A ${ROLE_BY_KEY.get(puesto)?.name ?? 'este puesto'} no se le ajusta: ${enPalabras(ajenas)}`);
+      if (ajenas.length) throw validation(`A ${ROLE_BY_KEY.get(puesto)?.name ?? 'este puesto'} no se le ajusta: ${enPalabras(ajenas)}.${porque(ajenas)}`);
       const sedes = serialize(antes).branchIds;
       autorizar(request, body.reason, sedes);
       // Lo que se agrega lo tiene quien lo da (el dueño, por ser la cabeza del gimnasio, está exento).

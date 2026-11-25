@@ -1,4 +1,4 @@
-import { conflict, notFound, planIssues, validation, type PlanDraft } from '@gymflow/core';
+import { DIAS_DE_AVISO_DE_AUMENTO, conflict, notFound, planIssues, validation, type PlanDraft } from '@gymflow/core';
 import { AuditService } from '../../platform/audit/audit.service.js';
 import { isUniqueViolation } from '../../platform/db/prisma-errors.js';
 import { enUnidadDeDinero } from '../../platform/db/unit-of-work.js';
@@ -129,6 +129,9 @@ export class CatalogService {
       atOwnPriceBranches: c.enSedesConPrecioPropio,
       firstPaymentOn: c.firstPaymentOn ? c.firstPaymentOn.toISOString().slice(0, 10) : null,
       touchedWithoutPhone: c.sinCelular,
+      // 4.20 (P-14): un aumento rige 15 días después; quien paga antes, paga esa vez el precio de antes.
+      appliesFrom: c.rige.toISOString().slice(0, 10), noticeDays: nuevo > plan.priceCents ? DIAS_DE_AVISO_DE_AUMENTO : 0,
+      touchedBeforeNotice: c.antesDelAviso,
     };
   }
 
@@ -182,8 +185,10 @@ export class CatalogService {
    * centavos; `branchIds`, si viene, reemplaza dónde se vende.
    *
    * CAMBIAR EL PRECIO LE CAMBIA A TODOS EN SU SIGUIENTE PAGO (D-19): en la
-   * misma transacción que el precio de lista se mueve el precio pactado de
-   * las membresías vivas del plan (la misma diferencia a cada una). Las que
+   * misma transacción que el precio de lista queda el cambio de cada
+   * membresía viva del plan (la misma diferencia a cada una). Una bajada se
+   * aplica ya; un AUMENTO respeta 15 días de aviso (4.20, P-14): llega con la
+   * primera cuota que empiece y se emita desde ese día. Las que
    * conservan su precio no cambian solas: si las hay, el pedido debe decir
    * qué se decide (`cambio.includeProtected`); sin esa decisión no se cambia
    * nada. `cambio.fromPriceCents` es el precio que vio quien confirma: si ya
@@ -222,7 +227,7 @@ export class CatalogService {
       const plan = await this.editarSinPrecio(ctx, id, pedido, branchIds, reason);
       const acto = await cambios.aplicar({
         planId: id, fromPriceCents: antes.priceCents, toPriceCents: nuevo, includeProtected: incluir,
-        reason, userId: ctx.tenant.actorUserId ?? null, protectedKept: incluir ? 0 : cuenta.protegidas,
+        reason, userId: ctx.tenant.actorUserId ?? null, protectedKept: incluir ? 0 : cuenta.protegidas, hoy,
       });
       await this.audit.record(ctx, {
         action: 'catalog.plan.price_change', resourceType: 'plan', resourceId: id, reason,
@@ -230,6 +235,8 @@ export class CatalogService {
         afterState: {
           priceCents: nuevo.toString(), priceChangeId: acto.id, touched: acto.touched,
           protectedKept: incluir ? 0 : cuenta.protegidas, includedProtected: incluir, atOwnPriceBranches: cuenta.enSedesConPrecioPropio,
+          // 4.20 (P-14): desde qué día rige y el primer cobro previsto.
+          appliesFrom: acto.rige.toISOString().slice(0, 10), firstPaymentOn: cuenta.firstPaymentOn?.toISOString().slice(0, 10) ?? null,
         },
       });
       return { plan, cambioId: acto.touched > 0 ? acto.id : null };

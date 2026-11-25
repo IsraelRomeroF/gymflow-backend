@@ -85,6 +85,26 @@ export class StaffRepository extends TenantRepository {
     return count === 1;
   }
 
+  /**
+   * Las excepciones TAL COMO ESTÁN GUARDADAS (sin limpiar) de quien hoy tiene
+   * el puesto de Recepción. Solo para retirar lo que ya no se le enciende
+   * (P-09 y P-10, bloque 4.19): la lista normal las limpia y no las dejaría ver.
+   */
+  async excepcionesGuardadasDeRecepcion(): Promise<Array<{ id: string; isActive: boolean; permissionOverrides: unknown }>> {
+    return this.db.user.findMany({
+      where: this.scope({ deletedAt: null, permissionOverrides: { not: Prisma.DbNull }, roleAssignments: { some: { revokedAt: null, role: { key: 'RECEPTION' } } } }),
+      select: { id: true, isActive: true, permissionOverrides: true },
+      orderBy: { id: 'asc' },
+    });
+  }
+
+  /** Guarda las excepciones tal cual (vacías = exactamente su puesto). Ver `excepcionesGuardadasDeRecepcion`. */
+  async guardarExcepciones(userId: string, o: { add: unknown[]; remove: unknown[] }): Promise<boolean> {
+    const vacio = o.add.length === 0 && o.remove.length === 0;
+    const { count } = await this.db.user.updateMany({ where: this.scope({ id: userId, deletedAt: null }), data: { permissionOverrides: vacio ? Prisma.DbNull : (o as Prisma.InputJsonValue) } });
+    return count === 1;
+  }
+
   async setUnlockedSections(userId: string, sections: string[]): Promise<boolean> {
     const { count } = await this.db.user.updateMany({ where: this.scope({ id: userId, deletedAt: null }), data: { unlockedSections: sections } });
     return count === 1;

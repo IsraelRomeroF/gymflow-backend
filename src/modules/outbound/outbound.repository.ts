@@ -32,6 +32,8 @@ export type OutboundRow = {
   planName: string | null; periodEnd: Date | null;
   /** Solo PRICE_CHANGE (D-19, bloque 3.6): de cuánto a cuánto cambió lo que paga por periodo. */
   priceFromCents: bigint | null; priceToCents: bigint | null;
+  /** Solo PRICE_CHANGE de un aumento (4.20, P-14): la previsión de su primer pago al precio nuevo y desde qué día rige. */
+  priceStartsOn: Date | null; priceAppliesFrom: Date | null;
   resolvedByName: string | null;
   /**
    * Celular compartido (D-09; fase 3, bloque 3.10): quién responde por el
@@ -81,6 +83,7 @@ const COLUMNAS = Prisma.sql`
   c."concept", (c."amountCents" - c."allocatedCents" - c."adjustedCents") AS "dueCents", c."dueDate",
   p."name" AS "planName", ms."currentPeriodEnd" AS "periodEnd",
   pc."fromPriceCents" AS "priceFromCents", pc."toPriceCents" AS "priceToCents",
+  pc."firstChargeOn" AS "priceStartsOn", pc."appliesFrom" AS "priceAppliesFrom",
   m."responsibleKind", m."responsibleName", m."responsiblePhoneE164",
   r."firstName" AS "responsibleMemberFirstName", r."lastName" AS "responsibleMemberLastName", (r."anonymizedAt" IS NOT NULL) AS "responsibleMemberAnonymized",
   (SELECT u."fullName" FROM "users" u WHERE u."id" = o."resolvedByUserId") AS "resolvedByName"`;

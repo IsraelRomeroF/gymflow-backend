@@ -32,5 +32,5 @@ export { prepagosQueSeRenuevan, apagarRenovacionDePrepagos, cambiarRenovacion, t
 
 // D-18 (fase 4, bloque 4.4): «está de baja desde», calculado con la regla del núcleo.
 // Consumida por: analytics (las bajas del mes en el Inicio) y retention («Recuperar»).
-// `privacy` (la conservación, D-32) NO la consume todavía: es una decisión de Israel (informe 4.4).
+// Y, desde el bloque 4.18 (P-01), `privacy`: la conservación cuenta también esta baja (`privacy/baja-para-conservar.ts`).
 export { BajaRepository, bajaDeLosHechos, type HechosDeBaja, type SocioConBaja } from './baja.repository.js';

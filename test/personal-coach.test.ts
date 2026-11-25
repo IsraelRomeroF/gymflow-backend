@@ -90,11 +90,12 @@ describe('personal a la medida y coach con sus socios', () => {
   it('permisos por persona: se encienden y apagan acciones de la lista, sobre el puesto', async () => {
     const dueno = await loginAs(app, correo('duena'));
     const rec = await idDe(correo('recepcion'));
-    const r = await app.inject({ method: 'PUT', url: `/users/${rec}/permissions`, headers: { cookie: dueno }, payload: { add: ['pos:sale:void', 'classes:manage'], remove: ['pos:sale:create'], reason: 'Encargada del turno' } });
+    const r = await app.inject({ method: 'PUT', url: `/users/${rec}/permissions`, headers: { cookie: dueno }, payload: { add: ['billing:discount:apply', 'classes:manage'], remove: ['pos:sale:create'], reason: 'Encargada del turno' } });
     expect(r.statusCode, r.body).toBe(200);
-    expect(r.json().permissionOverrides).toEqual({ add: ['classes:manage', 'pos:sale:void'], remove: ['pos:sale:create'] });
+    expect(r.json().permissionOverrides).toEqual({ add: ['billing:discount:apply', 'classes:manage'], remove: ['pos:sale:create'] });
+    // (Antes el ejemplo era «anular ventas»; desde P-09, bloque 4.19, ya no se enciende a recepción.)
     const permisos = (await yo(await loginAs(app, correo('recepcion')))).permissions as string[];
-    expect(permisos).toContain('pos:sale:void');
+    expect(permisos).toContain('billing:discount:apply');
     expect(permisos).toContain('classes:manage');
     expect(permisos).not.toContain('pos:sale:create');
     expect(permisos).toContain('payments:record');
@@ -177,23 +178,23 @@ describe('personal a la medida y coach con sus socios', () => {
     const alta = await app.inject({ method: 'POST', url: '/users', headers: { cookie: dueno }, payload: { email: correo('cambia'), fullName: 'Carla Cambia Puesto', roleKey: 'RECEPTION', branchIds: [sede], reason: 'Turno de la mañana' } });
     expect(alta.statusCode, alta.body).toBe(201);
     const id = alta.json().user.id as string;
-    const ajuste = await app.inject({ method: 'PUT', url: `/users/${id}/permissions`, headers: { cookie: dueno }, payload: { add: ['pos:sale:void'], reason: 'Encargada del turno' } });
-    expect(ajuste.json().permissionOverrides).toEqual({ add: ['pos:sale:void'], remove: [] });
+    const ajuste = await app.inject({ method: 'PUT', url: `/users/${id}/permissions`, headers: { cookie: dueno }, payload: { add: ['billing:discount:apply'], reason: 'Encargada del turno' } });
+    expect(ajuste.json().permissionOverrides).toEqual({ add: ['billing:discount:apply'], remove: [] });
     // Pasa a coach: lo que se le encendió en el mostrador no viaja con ella.
     const aCoach = await app.inject({ method: 'PUT', url: `/users/${id}/role`, headers: { cookie: dueno }, payload: { roleKey: 'COACH', branchIds: [], reason: 'Ahora da clases' } });
     expect(aCoach.statusCode, aCoach.body).toBe(200);
     expect(aCoach.json().permissionOverrides).toEqual({ add: [], remove: [] });
     expect((await getDb().user.findUniqueOrThrow({ where: { id }, select: { permissionOverrides: true } })).permissionOverrides).toBeNull();
     const asiento = await getDb().auditLog.findFirstOrThrow({ where: { action: 'staff.role', resourceId: id }, orderBy: { at: 'desc' } });
-    expect(asiento.beforeState).toMatchObject({ role: 'RECEPTION', permissionOverrides: { add: ['pos:sale:void'], remove: [] } });
+    expect(asiento.beforeState).toMatchObject({ role: 'RECEPTION', permissionOverrides: { add: ['billing:discount:apply'], remove: [] } });
     expect(asiento.afterState).toMatchObject({ role: 'COACH', overridesCleared: true });
     // Y si vuelve a recepción, no reviven.
     const vuelve = await app.inject({ method: 'PUT', url: `/users/${id}/role`, headers: { cookie: dueno }, payload: { roleKey: 'RECEPTION', branchIds: [sede], reason: 'Regresa al mostrador' } });
     expect(vuelve.statusCode, vuelve.body).toBe(200);
     expect(vuelve.json().permissionOverrides).toEqual({ add: [], remove: [] });
     // Cambiar solo de sucursal no es cambiar de puesto: lo que tenga se queda.
-    await app.inject({ method: 'PUT', url: `/users/${id}/permissions`, headers: { cookie: dueno }, payload: { add: ['pos:sale:void'], reason: 'Encargada otra vez' } });
+    await app.inject({ method: 'PUT', url: `/users/${id}/permissions`, headers: { cookie: dueno }, payload: { add: ['billing:discount:apply'], reason: 'Encargada otra vez' } });
     const sedes = await app.inject({ method: 'PUT', url: `/users/${id}/role`, headers: { cookie: dueno }, payload: { roleKey: 'RECEPTION', branchIds: [sede], reason: 'Misma sucursal' } });
-    expect(sedes.json().permissionOverrides).toEqual({ add: ['pos:sale:void'], remove: [] });
+    expect(sedes.json().permissionOverrides).toEqual({ add: ['billing:discount:apply'], remove: [] });
   });
 });

@@ -29,7 +29,7 @@ export { PaymentRepository } from './payment.repository.js';
 //     la misma palabra que recepción (bloque 1.6; 3-04, 3-06).
 export { StatementRepository } from './statement.repository.js';
 export { comoSeSaldo } from './statement.serializers.js';
-export { precioDeCuotaDe } from './precio-de-cuota.js';
+export { precioDeCuotaDe, precioDeCuotaPara } from './precio-de-cuota.js';
 //   · El pase del día (1.8) lo consume `access`: la puerta pregunta si el
 //     socio trae un pase pagado de hoy. El pase es su cargo, así que vive aquí.
 export { DayPassRepository, type DayPassRecord } from './day-pass.repository.js';
@@ -40,3 +40,5 @@ export type { ChargeRecord } from './charge.repository.js';
 // D-18 (fase 4, bloque 4.4): la deuda que se da por perdida. Lo consume
 // `scripts/plazos-estado.ts` (lo que haría la primera corrida, sin escribir).
 export { DeudaPerdidaRepository, type DeudaPorMarcar } from './deuda-perdida.js';
+// P-11 (4.18): al anonimizar, la deuda de la ficha se da por perdida. Consumida por: privacy.
+export { darPorPerdidaAlAnonimizar, marcarDeudaDeAnonimizados, MOTIVO_DEUDA_AL_ANONIMIZAR, type DeudaDeFicha } from './deuda-perdida.js';

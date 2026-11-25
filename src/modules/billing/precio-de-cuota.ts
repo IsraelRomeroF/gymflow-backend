@@ -1,5 +1,5 @@
 import { precioDeCuota } from '@gymflow/core';
-import { PlanRepository, type PlanRecord } from '../catalog/index.js';
+import { PlanRepository, precioDeLaCuotaConAumentos, type PlanRecord } from '../catalog/index.js';
 
 /**
  * LA CUOTA de una membresía (fase 1.3; 16-04): la única puerta del servidor a
@@ -13,10 +13,14 @@ import { PlanRepository, type PlanRecord } from '../catalog/index.js';
  * precio de lista aunque la membresía tuviera otro pactado.
  *
  * D-19 (fase 3, bloque 3.6): la regla de aquí NO cambió. Lo que cambió es
- * quién escribe el pactado: cada cambio de precio de un plan lo mueve, en su
- * misma transacción, en las membresías vivas que no «conservan su precio»
- * (`catalog/price-change.repository.ts`). Por eso la siguiente cuota de cada
- * socio sale ya al precio nuevo sin que esta función sepa del cambio.
+ * quién escribe el pactado: cada cambio de precio de un plan lo mueve en las
+ * membresías vivas que no «conservan su precio»
+ * (`catalog/price-change.repository.ts`).
+ *
+ * 4.20 (P-14): una BAJADA lo mueve al guardarse; un AUMENTO espera sus 15
+ * días de aviso y se suma solo a la cuota que ya lo lleva: eso lo dice
+ * `precioDeCuotaPara`, que es lo que usa la emisión. Esta función sigue
+ * diciendo lo que paga HOY por periodo.
  */
 export async function precioDeCuotaDe(
   organizationId: string,
@@ -28,4 +32,20 @@ export async function precioDeCuotaDe(
     ? (await new PlanRepository(organizationId).availabilityFor(plan.id)).find((a) => a.branchId === membresia.soldAtBranchId)
     : undefined;
   return precioDeCuota({ agreedPriceCents: null, planPriceCents: plan.priceCents, branchPriceCents: sede?.priceOverrideCents ?? null });
+}
+
+/**
+ * EL PRECIO DE UNA CUOTA CONCRETA (4.20, P-14): lo que paga hoy más los
+ * aumentos guardados que ya rigen para el periodo que empieza `inicio` y se
+ * emite `emitidaEl`. Devuelve también cuáles llegan: quien EMITE la cuota deja
+ * su constancia (`registrarLlegadaDeAumento`); quien solo cotiza, no.
+ */
+export async function precioDeCuotaPara(
+  organizationId: string,
+  membresia: { id: string; planId: string; agreedPriceCents: bigint | null; soldAtBranchId: string | null },
+  plan: PlanRecord,
+  cuota: { inicio: Date; emitidaEl: Date },
+): Promise<{ precio: bigint; llegan: string[] }> {
+  const base = await precioDeCuotaDe(organizationId, membresia, plan);
+  return precioDeLaCuotaConAumentos(organizationId, membresia.id, base, cuota);
 }

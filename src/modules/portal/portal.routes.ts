@@ -446,7 +446,11 @@ export function registerPortalRoutes(app: FastifyInstance, env: Env): void {
         reversal: r.pago.reversesPaymentId !== null,
         lines: r.lines.map((l) => ({ concept: l.concept, amountCents: cents(l.amountCents) })),
         // El aviso del cambio de precio de su plan (D-19), el mismo del comprobante del mostrador.
-        priceNotice: r.priceNotice && { kind: r.priceNotice.kind, planName: r.priceNotice.planName, fromPriceCents: cents(r.priceNotice.fromPriceCents), toPriceCents: cents(r.priceNotice.toPriceCents) },
+        priceNotice: r.priceNotice && {
+          kind: r.priceNotice.kind, planName: r.priceNotice.planName, fromPriceCents: cents(r.priceNotice.fromPriceCents), toPriceCents: cents(r.priceNotice.toPriceCents),
+          // 4.20 (P-14): el día desde el que paga el aumento, si espera sus 15 días.
+          startsOn: r.priceNotice.startsOn ? r.priceNotice.startsOn.toISOString().slice(0, 10) : null,
+        },
         gym: r.gym,
       };
     },

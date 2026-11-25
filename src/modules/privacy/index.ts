@@ -7,7 +7,9 @@
  *
  * Tablas propias (desde el bloque 3.9, D-32): `privacy_conservation_starts`,
  * `privacy_batches` y `privacy_batch_items` (la lista mensual de exsocios por
- * anonimizar y su firma). De las demás solo lee.
+ * anonimizar y su firma) y, desde el bloque 4.18 (P-01), `privacy_calculated_baja_starts`
+ * (el arranque de la baja calculada). De las demás solo lee; la baja de D-18
+ * la toma de `memberships` y la deuda al anonimizar la marca `billing` (P-11).
  */
 export { PRIVACY_JOBS, RETENCION } from './privacy.jobs.js';
 export { registerPrivacyRoutes } from './privacy.routes.js';

@@ -12,6 +12,8 @@ import { PaymentMethodRepository } from '../payments/index.js';
 import { TrainingRepository } from '../training/index.js';
 import { olvidarTextosDeMensajes } from '../outbound/index.js';
 import { MemberPushRepository } from '../portal/index.js';
+import { darPorPerdidaAlAnonimizar } from '../billing/index.js';
+import { BusinessCalendar } from '../../platform/time/business-calendar.js';
 import { PrivacyRequestsService } from './privacy-requests.service.js';
 
 /**
@@ -198,7 +200,7 @@ export class PrivacyService {
     };
   }
 
-  async anonymize(ctx: RequestContext, memberId: string, reason: string, approvedByUserId: string | null = null): Promise<void> {
+  async anonymize(ctx: RequestContext, memberId: string, reason: string, approvedByUserId: string | null = null, ahora: Date = new Date()): Promise<void> {
     const orgId = ctx.tenant.organizationId;
     const members = new MemberRepository(orgId);
     const m = await members.findByIdIncludingArchived(memberId);
@@ -222,11 +224,15 @@ export class PrivacyService {
     await olvidarTextosDeMensajes(orgId, memberId);
     await new MemberPushRepository().removeAllForMember(orgId, memberId);
     if (!await members.anonymize(memberId)) throw conflict('Ese socio ya estaba anonimizado');
+    // P-11 (Israel 2026-11-25; bloque 4.18): su deuda ya no dice de quién es. Se da por perdida en este
+    // momento: sale de «Por cobrar» y se suma a «Dada por perdida», sin borrarse ni condonarse (D-12).
+    const dia = (await new BusinessCalendar(orgId).dias(ahora)).gimnasio;
+    const deuda = await darPorPerdidaAlAnonimizar(ctx, memberId, dia);
 
     // Sin nombre en la bitácora: se identifica por el código, que ya no dice quién es.
     await this.audit.record(ctx, {
       action: 'member.anonymize', resourceType: 'Member', resourceId: memberId, branchId: m.homeBranchId,
-      afterState: { memberCode: m.memberCode, faceTemplatesDeleted: biometria.plantillasBorradas }, reason, approvedByUserId,
+      afterState: { memberCode: m.memberCode, faceTemplatesDeleted: biometria.plantillasBorradas, debtLostCents: deuda.amountCents.toString() }, reason, approvedByUserId,
     });
     // Si pidió la cancelación de sus datos y procedía, con esto quedó hecha (1.10, 21-03).
     await new PrivacyRequestsService().alHacerse(ctx, memberId, 'CANCELLATION', 'Se le dio de baja y sus datos se anonimizaron; lo contable se conserva');

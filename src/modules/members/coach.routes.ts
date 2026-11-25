@@ -20,7 +20,8 @@ export function registerCoachRoutes(app: FastifyInstance): void {
   route(app, {
     method: 'GET',
     url: '/members/coaches',
-    security: { kind: 'permission', permission: 'members:create' },
+    // También quien cambia el coach de un socio sin dar altas: la dueña sin gerente (P-02, bloque 4.19).
+    security: { kind: 'permission', permission: 'members:create', anyOf: ['members:coach:assign'] },
     schema: respuesta(200, CoachOptions),
     handler: async (request): Promise<CoachOptions> => {
       const { StaffRepository } = await import('../identity/index.js');

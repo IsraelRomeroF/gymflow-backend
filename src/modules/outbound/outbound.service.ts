@@ -259,6 +259,7 @@ export class OutboundService {
       sede: m.variasSedes && f.homeBranchId ? m.sedes.get(f.homeBranchId) ?? null : null,
       concept: f.concept, dueCents: f.dueCents, dueDate: f.dueDate, planName: f.planName, periodEnd: f.periodEnd,
       priceFromCents: f.priceFromCents, priceToCents: f.priceToCents,
+      priceStartsOn: f.priceStartsOn, priceAppliesFrom: f.priceAppliesFrom,
       engagementState: f.engagementState, enLinea: m.enLinea,
     });
   }
