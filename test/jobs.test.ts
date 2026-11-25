@@ -92,10 +92,14 @@ describe('jobs · bloque 1.16', () => {
         { name: 'prueba.frecuente', cadence: 'frequent', handler: async (org) => { llamadas.push(`f:${org}`); return resultado('prueba.frecuente'); } },
         { name: 'prueba.plataforma', scope: 'platform', handler: async () => { llamadas.push('plataforma'); return resultado('prueba.plataforma', 3); } },
       ]);
-      const gimnasios = (await repo.organizations()).length;
-      expect(gimnasios).toBeGreaterThanOrEqual(2);
+      // Dos gimnasios y no toda la base (bloque 4.17): la base de pruebas suma unos cien gimnasios por
+      // corrida de la suite y este caso, que corre el cierre tres veces, pasaba de los 60 s sin estar
+      // colgado. Lo de plataforma corre igual, una vez, antes que ellos (`conPlataforma`).
+      const dos = [demo, otro];
+      const gimnasios = dos.length;
+      const cierre = { runner: 'DAILY' as const, modules, ordenes, soloGimnasios: dos, conPlataforma: true };
 
-      const primera = terminada(await correr({ runner: 'DAILY', modules, ordenes, perfil: null, host: 'prueba#1' }));
+      const primera = terminada(await correr({ ...cierre, perfil: null, host: 'prueba#1' }));
       expect(primera.estado).toBe('OK');
       expect(codigoDeSalida(primera)).toBe(0);
       // Plataforma: una sola vez, antes que cualquier gimnasio, aunque haya varios.
@@ -124,17 +128,17 @@ describe('jobs · bloque 1.16', () => {
 
       // Segunda corrida el mismo día: los diarios y el de plataforma ya corrieron; el frecuente corre siempre.
       llamadas.length = 0;
-      const segunda = terminada(await correr({ runner: 'DAILY', modules, ordenes }));
+      const segunda = terminada(await correr(cierre));
       deEstaPrueba.push(segunda.runId);
       expect(segunda.estado).toBe('OK');
-      expect(llamadas.sort()).toEqual((await repo.organizations()).map((o) => `f:${o.id}`).sort());
+      expect(llamadas.sort()).toEqual(dos.map((id) => `f:${id}`).sort());
       expect(segunda.resumen).toMatchObject({ corrieron: gimnasios, yaCorrieronHoy: 1 + gimnasios * 2 });
       // No corrió ningún diario: no vuelve a asentar el cierre.
       expect(await asientos()).toHaveLength(1);
 
       // Forzada: repite todo.
       llamadas.length = 0;
-      const forzada = terminada(await correr({ runner: 'DAILY', modules, ordenes, forzar: true }));
+      const forzada = terminada(await correr({ ...cierre, forzar: true }));
       deEstaPrueba.push(forzada.runId);
       expect(llamadas).toHaveLength(1 + gimnasios * 3);
       expect(await asientos()).toHaveLength(2);
@@ -303,11 +307,16 @@ describe('jobs · bloque 1.16', () => {
       ]);
       let runId = '';
       const detenida = correr({ runner: 'DAILY', modules, ordenes, soloGimnasios: [demo], latidoMs: 20, alEmpezar: (id) => { runId = id; } });
-      await hasta(() => llamadas.length === 1);
-      // Otra la da por cortada mientras sigue dentro de `a`.
-      expect(await repo.abandon(runId, 'Sin señal de vida (prueba)')).toBe(true);
-      await new Promise((r) => setTimeout(r, 80));
-      soltar();
+      try {
+        await hasta(() => llamadas.length === 1);
+        // Otra la da por cortada mientras sigue dentro de `a`.
+        expect(await repo.abandon(runId, 'Sin señal de vida (prueba)')).toBe(true);
+        await new Promise((r) => setTimeout(r, 80));
+      } finally {
+        // Siempre se suelta (bloque 4.17): si algo de arriba falla, la corrida no se queda latiendo cada
+        // 20 ms el resto del archivo (llegó a agotar el pool: «timeout exceeded when trying to connect»).
+        soltar();
+      }
       const c = terminada(await detenida);
       expect(c.estado).toBe('ABANDONED');
       expect(codigoDeSalida(c)).toBe(1);

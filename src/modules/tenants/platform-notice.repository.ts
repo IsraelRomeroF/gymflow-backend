@@ -61,9 +61,18 @@ export class PlatformNoticeRepository extends GlobalRepository {
     return this.db.platformNotice.findMany({ where: { organizationId }, select: SELECT, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take: limite });
   }
 
-  /** Abiertos de todas las marcas: la consola arma con ellos «Avisos por mandar». */
-  abiertos(): Promise<Aviso[]> {
-    return this.db.platformNotice.findMany({ where: { closedAt: null }, select: SELECT, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }], take: 500 });
+  /**
+   * «Avisos por mandar» de la consola: abiertos, sin constancia de entrega, de marcas vivas; del más
+   * viejo al más nuevo. Sin tope (bloque 4.17): antes eran los 500 abiertos más VIEJOS de cualquier
+   * clase y el filtro iba después, así que con más de 500 abiertos (entregados o de marcas dadas de
+   * baja incluidos) el aviso más nuevo no salía en la lista y nadie lo mandaba. Lo que queda aquí es
+   * lo que alguien tiene que mandar: sale de aquí al tener constancia de entrega o al cerrarse.
+   */
+  porMandar(): Promise<Aviso[]> {
+    return this.db.platformNotice.findMany({
+      where: { closedAt: null, deliveredOn: null, organization: { deletedAt: null } },
+      select: SELECT, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+    });
   }
 
   /** Avisos abiertos de cambio de precio para esa fecha. */

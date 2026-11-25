@@ -56,6 +56,12 @@ export type OpcionesDeCorrida = {
   /** Avisa el id de la corrida en cuanto se toma el candado (para cortarla con una señal). */
   alEmpezar?: (runId: string) => void;
   // Lo de abajo solo lo cambian las pruebas.
+  /**
+   * Con `soloGimnasios`, corre también los de plataforma (bloque 4.17). Así una prueba ve el cierre
+   * completo —plataforma una vez y después cada gimnasio— sin recorrer todos los gimnasios de la base,
+   * que en la base de pruebas crecen con cada corrida de la suite.
+   */
+  conPlataforma?: boolean;
   ordenes?: Ordenes;
   ahora?: () => Date;
   latidoMs?: number;
@@ -181,7 +187,7 @@ export async function correr(o: OpcionesDeCorrida): Promise<Corrida> {
     //    (23-12), y ANTES que los gimnasios: lo que asienten en la bitácora de
     //    un gimnasio queda cubierto por la verificación de la cadena de ese día.
     const dePlataforma = planes.plataforma.filter((j) => diaria || j.cadence === 'frequent');
-    if (dePlataforma.length && !o.soloGimnasios) {
+    if (dePlataforma.length && (!o.soloGimnasios || o.conPlataforma)) {
       const fecha = fechaDeNegocio(ZONA_PLATAFORMA, ahora());
       const hechos = diaria && !o.forzar ? await repo.okOn(null, fecha) : new Set<string>();
       log.linea('── Plataforma ──');

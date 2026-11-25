@@ -23,7 +23,8 @@ process.env.NODE_ENV = 'test';
  *    crea una vez y se reutiliza;
  *  · un gimnasio «Propio …» por archivo y por corrida (`gimnasio-propio.ts`):
  *    reloj, concurrencia, cierre diario y listas. Nada de lo suyo lo ve otro
- *    archivo: todo cuelga de su `organizationId`, y sus sedes se archivan.
+ *    archivo: todo cuelga de su `organizationId`; sus sedes se archivan y el
+ *    gimnasio queda dado de baja al cerrarse (4.17).
  * Las tablas `job_runs` y `job_run_steps` son de `jobs.test.ts`, que las vacía;
  * quien corra el cierre de verdad pasa `soloGimnasios` y borra lo suyo.
  */

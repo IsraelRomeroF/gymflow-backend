@@ -267,7 +267,7 @@ export class PlatformCollectionsService {
       const prorroga = marca.autoSuspendHoldUntil && iso(marca.autoSuspendHoldUntil) >= hoy ? iso(marca.autoSuspendHoldUntil) : null;
       enRiesgo.push({ organizationId, tradeName: marca.tradeName, ...serializarDecision(d, prorroga) });
     }
-    const sinEntregar = (await this.avisos.abiertos()).filter((a) => a.deliveredOn === null && marcas.has(a.organizationId));
+    const sinEntregar = (await this.avisos.porMandar()).filter((a) => marcas.has(a.organizationId));
     const duenos = await this.avisos.duenosDe([...new Set(sinEntregar.map((a) => a.organizationId))]);
     return {
       suspendsAfterDays: DIAS_PARA_SUSPENDER,

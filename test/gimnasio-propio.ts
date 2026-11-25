@@ -19,7 +19,9 @@ import { PASSWORD, loginAs, nombreUnico, publicarTextosDePrueba } from './helper
  * que se queda en la base, porque los cobros y los cargos no se pueden borrar
  * ni con el rol dueño (el libro es de solo agregar). Lo que deja no lo ve
  * ningún otro archivo: todo cuelga de su `organizationId`. Las sedes se
- * archivan al terminar (`cerrar()`) para liberar su prefijo de socio.
+ * archivan al terminar (`cerrar()`) para liberar su prefijo de socio, y el
+ * gimnasio queda dado de baja (`deletedAt`, bloque 4.17) para que lo que recorre
+ * todas las marcas vivas no crezca con cada corrida.
  */
 export type SedePropia = { id: string; code: string; name: string; timezone: string | null; cajas: string[] };
 
@@ -31,7 +33,7 @@ export type GimnasioPropio = {
   ownerId: string;
   /** Plan mensual domiciliable de $600, se vende en todas las sedes. */
   planMensual: string;
-  /** Archiva las sedes (libera su prefijo). Los turnos abiertos se cortan cuadrados en la base. */
+  /** Archiva las sedes (libera su prefijo) y da de baja el gimnasio. Los turnos abiertos se cortan cuadrados en la base. */
   cerrar(): Promise<void>;
 };
 
@@ -120,6 +122,10 @@ export async function gimnasioPropio(opciones: {
         }).catch(() => undefined);
       }
       await db.branch.updateMany({ where: { organizationId: o }, data: { deletedAt: new Date() } });
+      // Y el gimnasio queda dado de baja (bloque 4.17): lo que recorre TODAS las marcas vivas (el cierre
+      // diario, la factura y la cobranza de plataforma, los avisos) ya no lo vuelve a contar. Sin esto la base
+      // de pruebas sumaba unos 70 gimnasios vivos por corrida de la suite y esas pruebas se iban alentando.
+      await db.organization.update({ where: { id: o }, data: { deletedAt: new Date() } });
     },
   };
 }
