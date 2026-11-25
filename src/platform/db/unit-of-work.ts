@@ -28,6 +28,25 @@ export function dbActual(): Db {
   return actual.getStore() ?? getDb();
 }
 
+/**
+ * PUNTO DE RETORNO dentro de la unidad en curso (bloque 4.16): si `fn` falla, se deshace SOLO lo que
+ * hizo `fn` y lo anterior de la unidad se confirma igual. Devuelve el error en vez de lanzarlo, para
+ * que quien llama lo lance DESPUÉS de confirmar. Lo usa el corte: el conteo queda aunque el cierre se rechace.
+ */
+export async function conPuntoDeRetorno<T>(fn: () => Promise<T>): Promise<{ ok: true; valor: T } | { ok: false; error: unknown }> {
+  const db = actual.getStore();
+  if (!db) throw new Error('conPuntoDeRetorno: solo dentro de una unidad de trabajo');
+  await db.$executeRawUnsafe('SAVEPOINT punto_de_retorno');
+  try {
+    const valor = await fn();
+    await db.$executeRawUnsafe('RELEASE SAVEPOINT punto_de_retorno');
+    return { ok: true, valor };
+  } catch (error) {
+    await db.$executeRawUnsafe('ROLLBACK TO SAVEPOINT punto_de_retorno');
+    return { ok: false, error };
+  }
+}
+
 /** Un cliente de transacción al que se le puede volver a pedir `$transaction`. */
 function anidable(tx: Db): Db {
   return new Proxy(tx, {

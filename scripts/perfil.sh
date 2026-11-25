@@ -59,8 +59,10 @@ case "$perfil" in
       [ -n "$DOMINIO" ] && export SESSION_COOKIE_DOMAIN="$DOMINIO"
     fi
     # Avisos al teléfono (llaves propias; las crea «bash gymflow.sh avisos») y,
-    # si se quiere, las redes desde las que se opera la consola de plataforma.
-    for variable in VAPID_PUBLIC_KEY VAPID_PRIVATE_KEY VAPID_SUBJECT PLATFORM_ALLOWED_IPS; do
+    # si se quiere, las redes desde las que se opera la consola de plataforma,
+    # y los datos de GymFlow como emisor de sus facturas (D-39).
+    for variable in VAPID_PUBLIC_KEY VAPID_PRIVATE_KEY VAPID_SUBJECT PLATFORM_ALLOWED_IPS \
+        GYMFLOW_ISSUER_LEGAL_NAME GYMFLOW_ISSUER_RFC GYMFLOW_ISSUER_ADDRESS GYMFLOW_ISSUER_PAYMENT GYMFLOW_ISSUER_CONTACT; do
       valor=$(secreto "$variable")
       [ -n "$valor" ] && export "$variable=$valor"
     done

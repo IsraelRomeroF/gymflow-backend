@@ -68,6 +68,17 @@ const BUCKET_SQL = `
     ELSE '90+'
   END`;
 
+/** Una cifra de la lista de deudores (bloque 4.15). */
+export type CifraRow = { outstandingCents: bigint; lostCents: bigint; members: number };
+
+/** Toda la cartera de la consulta, partida en vivos / dados de baja / anonimizados, y lo que suma la lista. */
+export type ResumenDeDeudores = { all: CifraRow; archived: CifraRow; anonymized: CifraRow; listed: CifraRow };
+
+export type DeudorRow = {
+  memberId: string; memberCode: string; fullName: string; homeBranchId: string | null; archived: boolean;
+  outstandingCents: bigint; overdueCents: bigint; lostCents: bigint; oldestDueDate: Date; owedCents: bigint;
+};
+
 export class PortfolioRepository extends TenantRepository {
   async snapshot(today: Date, branchId?: string | null): Promise<Portfolio> {
     const filtroSucursal = branchId ? `AND c."branchId" = $3::uuid` : '';
@@ -157,6 +168,91 @@ export class PortfolioRepository extends TenantRepository {
         amountCents: r.amount,
         members: Number(r.members),
       })),
+    };
+  }
+
+  /**
+   * QUIÉN DEBE (bloque 4.15): por socio, lo que cuenta en «Por cobrar», lo
+   * vencido, lo dado por perdido y el vencimiento más antiguo, con las mismas
+   * reglas que `snapshot` (mismos estados, misma sede del CARGO, lo perdido
+   * aparte). Los dados de baja entran si `incluirBajas`; las fichas
+   * anonimizadas NUNCA salen como renglón: solo en `resumen` (no se dice de quién
+   * es una deuda cuyo dueño ya no tiene nombre).
+   *
+   * Orden: lo que debe en total (cobrable + perdido), de más a menos, y el id
+   * desempata; la página siguiente empieza después de `despuesDe`.
+   */
+  async debtors(opts: {
+    today: Date; branchId: string | null; incluirBajas: boolean; limit: number;
+    despuesDe?: { owedCents: bigint; memberId: string };
+  }): Promise<{ resumen: ResumenDeDeudores; filas: DeudorRow[] }> {
+    const params: unknown[] = [this.organizationId, opts.today];
+    const filtroSucursal = opts.branchId ? `AND c."branchId" = $${params.push(opts.branchId)}::uuid` : '';
+    const deudas = `
+      WITH d AS (
+        SELECT c."memberId",
+               COALESCE(SUM(c."amountCents" - c."allocatedCents" - c."adjustedCents") FILTER (WHERE c."lostOn" IS NULL), 0)::bigint AS outstanding,
+               COALESCE(SUM(c."amountCents" - c."allocatedCents" - c."adjustedCents") FILTER (WHERE c."lostOn" IS NULL AND c."dueDate" < $2::date), 0)::bigint AS overdue,
+               COALESCE(SUM(c."amountCents" - c."allocatedCents" - c."adjustedCents") FILTER (WHERE c."lostOn" IS NOT NULL), 0)::bigint AS lost,
+               MIN(c."dueDate") AS oldest
+        FROM "charges" c
+        WHERE c."organizationId" = $1::uuid
+          AND c."status" IN ('OPEN','PARTIALLY_PAID','OVERDUE')
+          ${filtroSucursal}
+        GROUP BY c."memberId"
+      )`;
+    const categoria = `CASE WHEN m."anonymizedAt" IS NOT NULL THEN 'ANON' WHEN m."deletedAt" IS NOT NULL THEN 'BAJA' ELSE 'VIVO' END`;
+
+    const porCategoria = await this.db.$queryRawUnsafe<Array<{ cat: string; outstanding: bigint; lost: bigint; members: bigint }>>(`
+      ${deudas}
+      SELECT ${categoria} AS cat,
+             COALESCE(SUM(d.outstanding), 0)::bigint AS outstanding,
+             COALESCE(SUM(d.lost), 0)::bigint AS lost,
+             COUNT(*) FILTER (WHERE d.outstanding <> 0 OR d.lost <> 0)::bigint AS members
+      FROM d JOIN "members" m ON m."id" = d."memberId" AND m."organizationId" = $1::uuid
+      GROUP BY 1`, ...params);
+
+    const filtroBajas = opts.incluirBajas ? '' : 'AND m."deletedAt" IS NULL';
+    let filtroPagina = '';
+    if (opts.despuesDe) {
+      const owed = params.push(opts.despuesDe.owedCents);
+      const id = params.push(opts.despuesDe.memberId);
+      filtroPagina = `AND ((d.outstanding + d.lost) < $${owed}::bigint OR ((d.outstanding + d.lost) = $${owed}::bigint AND m."id" > $${id}::uuid))`;
+    }
+    const limite = params.push(opts.limit);
+    const filas = await this.db.$queryRawUnsafe<DeudorRow[]>(`
+      ${deudas}
+      SELECT m."id" AS "memberId", m."memberCode",
+             m."firstName" || ' ' || m."lastName" AS "fullName",
+             m."homeBranchId", (m."deletedAt" IS NOT NULL) AS "archived",
+             d.outstanding AS "outstandingCents", d.overdue AS "overdueCents", d.lost AS "lostCents",
+             d.oldest AS "oldestDueDate", (d.outstanding + d.lost)::bigint AS "owedCents"
+      FROM d JOIN "members" m ON m."id" = d."memberId" AND m."organizationId" = $1::uuid
+      WHERE m."anonymizedAt" IS NULL
+        AND (d.outstanding <> 0 OR d.lost <> 0)
+        ${filtroBajas}
+        ${filtroPagina}
+      ORDER BY "owedCents" DESC, m."id" ASC
+      LIMIT $${limite}`, ...params);
+
+    const de = (cat: string): CifraRow => {
+      const r = porCategoria.find((x) => x.cat === cat);
+      return { outstandingCents: r?.outstanding ?? 0n, lostCents: r?.lost ?? 0n, members: Number(r?.members ?? 0n) };
+    };
+    const suma = (...cs: CifraRow[]): CifraRow => ({
+      outstandingCents: cs.reduce((a, c) => a + c.outstandingCents, 0n),
+      lostCents: cs.reduce((a, c) => a + c.lostCents, 0n),
+      members: cs.reduce((a, c) => a + c.members, 0),
+    });
+    const vivos = de('VIVO'); const bajas = de('BAJA'); const anon = de('ANON');
+    return {
+      resumen: {
+        all: suma(vivos, bajas, anon),
+        archived: bajas,
+        anonymized: anon,
+        listed: opts.incluirBajas ? suma(vivos, bajas) : vivos,
+      },
+      filas,
     };
   }
 

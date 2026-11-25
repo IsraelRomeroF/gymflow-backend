@@ -16,6 +16,8 @@ import { moduleViewOf } from '../../platform/modules/module-state.js';
 import type { Env } from '../../platform/env.js';
 
 const LOCK_THRESHOLD = 5;
+/** Lo más que una petición espera a que se anote el último uso de su sesión (bloque 4.16). */
+const ESPERA_DE_ULTIMO_USO_MS = 1_000;
 
 /** Parámetros de Argon2id. */
 const ARGON_OPTS = { memoryCost: 19456, timeCost: 2, parallelism: 1 } as const;
@@ -337,7 +339,11 @@ export class AuthService {
         }
       }
     }
-    if (!renovadaHasta && Date.now() - r.session.lastSeenAt.getTime() > 60_000) await this.sessions.touch(r.session.id);
+    // El último uso se espera solo un rato (bloque 4.16): si la base tarda en confirmar (disco ocupado),
+    // la petición sigue sin él; `touch` no falla y termina por su cuenta.
+    if (!renovadaHasta && Date.now() - r.session.lastSeenAt.getTime() > 60_000) {
+      await Promise.race([this.sessions.touch(r.session.id), new Promise<void>((res) => setTimeout(res, ESPERA_DE_ULTIMO_USO_MS).unref())]);
+    }
     return {
       ok: true, session: r.session, user: r.user, grants: r.grants, roleKeys: r.roleKeys, limits: r.session.organizationId ? mergeLimits(r.limitRows) : null,
       ...(renovadaHasta ? { renovadaHasta } : {}),

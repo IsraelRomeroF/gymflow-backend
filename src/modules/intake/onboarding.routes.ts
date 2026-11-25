@@ -61,6 +61,9 @@ export function registerOnboardingRoutes(app: FastifyInstance): void {
         isModuleOnAt(orgId, sede, 'member_portal'),
       ]);
       const plan = membresia ? await new PlanRepository(orgId).findById(membresia.planId) : null;
+      // Bloque 4.16: quien ya tuvo plan (lo canceló o le venció) ya pasó por la venta de su alta. Antes la franja
+      // le volvía a pedir «Vender su membresía · Todavía no tiene plan» como si nunca hubiera comprado.
+      const yaTuvoPlan = !membresia && (await new MembershipRepository(orgId).listForMember(id)).length > 0;
 
       const missingFields: string[] = [];
       if (!socio.birthDate) missingFields.push('birthDate');
@@ -68,7 +71,7 @@ export function registerOnboardingRoutes(app: FastifyInstance): void {
       if (!socio.phoneE164 && !socio.email) missingFields.push('phoneE164');
 
       const steps = onboardingSteps({
-        hasMembership: !!membresia, owesCents: debe, portalOn: portalEncendido, portalActive: portal.active > 0,
+        hasMembership: !!membresia || yaTuvoPlan, owesCents: debe, portalOn: portalEncendido, portalActive: portal.active > 0,
         biometricsOn: biometria, enrolled: rostros.some((r) => r.revokedAt === null), missingFields,
       });
       const next = nextOnboardingStep(steps);

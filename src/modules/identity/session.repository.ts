@@ -247,10 +247,21 @@ export class SessionRepository extends GlobalRepository {
    * cookie copiada seguía sirviendo hasta 16 h.
    */
   async touch(id: string): Promise<void> {
-    await this.db.session.updateMany({
-      where: { id, lastSeenAt: { lt: new Date(Date.now() - 60_000) } },
-      data: { lastSeenAt: new Date() },
-    });
+    // Bloque 4.16: es contabilidad, no la petición. Antes era un UPDATE que esperaba su turno sobre la fila
+    // de la sesión (hasta el tope de 5 s): las tres o cuatro peticiones que el panel lanza juntas con la
+    // misma cookie hacían fila sobre ESA fila, y con la base lenta para confirmar (disco ocupado) la que
+    // esperaba de más caía en 500 «lock timeout» aunque solo quisiera leer. Ahora, si otra petición ya la
+    // está anotando (fila tomada), esta no espera (SKIP LOCKED); y un fallo aquí nunca tumba la petición.
+    const ahora = new Date();
+    try {
+      await this.db.$executeRaw`
+        UPDATE "sessions" SET "lastSeenAt" = ${ahora}
+         WHERE "id" = (SELECT "id" FROM "sessions"
+                        WHERE "id" = ${id}::uuid AND "lastSeenAt" < ${new Date(ahora.getTime() - 60_000)}
+                        FOR UPDATE SKIP LOCKED)`;
+    } catch {
+      // Se anota en la siguiente petición (a lo más un minuto después).
+    }
   }
 
   /**

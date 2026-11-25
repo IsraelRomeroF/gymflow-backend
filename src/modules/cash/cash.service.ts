@@ -9,7 +9,7 @@ import { CashRegisterRepository, CashSessionRepository, type CashMovementRecord,
 import { AuditService } from '../../platform/audit/audit.service.js';
 import type { RequestContext } from '../../platform/context.js';
 import { BusinessCalendar } from '../../platform/time/business-calendar.js';
-import { enUnidadDeDinero } from '../../platform/db/unit-of-work.js';
+import { conPuntoDeRetorno, enUnidadDeDinero } from '../../platform/db/unit-of-work.js';
 import { CashSettingsRepository } from './cash-settings.repository.js';
 import { ExpensesRepository, MonthlyCloseService } from '../finance/index.js';
 
@@ -186,21 +186,43 @@ export class CashService {
     if (input.countedCashCents < 0n) throw validation('El conteo no puede ser negativo');
 
     if (session.status !== 'OPEN') throw validation('Ese turno ya está cerrado');
-    // El conteo se anota ANTES de decir si cuadra (UXA-02): ver cuánto debía
-    // haber y recontar exactamente esa cifra ya no tapa un faltante. Va fuera
-    // del candado a propósito: aunque el cierre se rechace, el conteo queda.
-    const primero = await sessions.recordCount(input.sessionId, input.countedCashCents);
-    const esReconteo = primero !== input.countedCashCents;
-    if (esReconteo && !input.varianceReason?.trim()) {
-      throw validation(
-        `Es un segundo conteo: el primero fue de ${formatMoney(money(primero))}. ` +
-        'Explica por qué cambió; los dos conteos quedan en el corte',
-      );
-    }
 
-    // D-17 (bloque 4.3): el cierre y su asiento se confirman juntos, en el turno de dinero del
-    // gimnasio. El conteo de arriba queda fuera a propósito (se conserva aunque el cierre se rechace).
-    return enUnidadDeDinero(orgId, async () => {
+    // D-17 (bloque 4.3): el cierre y su asiento se confirman juntos, en el turno de dinero del gimnasio.
+    // Bloque 4.16: el conteo también va dentro del turno (antes iba suelto, antes de pedirlo, y peleaba la
+    // fila del turno con el cierre en curso: el reintento de un corte lento caía en 500 «lock timeout»).
+    // Sigue conservándose aunque el cierre se rechace: el cierre corre tras un punto de retorno y, si
+    // falla, se deshace solo él; el conteo se confirma y el error se lanza después.
+    const r = await enUnidadDeDinero(orgId, async () => {
+      // El conteo se anota ANTES de decir si cuadra (UXA-02): ver cuánto debía
+      // haber y recontar exactamente esa cifra ya no tapa un faltante.
+      const primero = await sessions.recordCount(input.sessionId, input.countedCashCents);
+      if (primero === null) return { ok: false as const, error: validation('Ese turno ya está cerrado') };
+      const esReconteo = primero !== input.countedCashCents;
+      if (esReconteo && !input.varianceReason?.trim()) {
+        return {
+          ok: false as const,
+          error: validation(
+            `Es un segundo conteo: el primero fue de ${formatMoney(money(primero))}. ` +
+            'Explica por qué cambió; los dos conteos quedan en el corte',
+          ),
+        };
+      }
+      return conPuntoDeRetorno(() => this.cerrarConConteo(ctx, session, userId, input, primero));
+    });
+    if (!r.ok) throw r.error;
+    return r.valor;
+  }
+
+  /** El cierre propiamente dicho, ya con el turno de dinero y el conteo anotado (`closeSession`). */
+  private async cerrarConConteo(
+    ctx: RequestContext,
+    session: CashSessionRecord,
+    userId: string,
+    input: { sessionId: string; countedCashCents: bigint; varianceReason?: string | null },
+    primero: bigint,
+  ): Promise<{ session: CashSessionRecord; varianceCents: bigint }> {
+    const sessions = new CashSessionRepository(ctx.tenant.organizationId);
+    {
       let esperadoCents = 0n;
       const cerrada: CashSessionRecord = await sessions.closeLocked({
         sessionId: input.sessionId,
@@ -244,7 +266,7 @@ export class CashService {
       });
 
       return { session: cerrada, varianceCents: cerrada.varianceCents ?? 0n };
-    });
+    }
   }
 
   /**

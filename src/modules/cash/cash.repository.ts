@@ -309,17 +309,18 @@ export class CashSessionRepository extends TenantRepository {
    * para siempre (solo se escribe si está vacío) y cada intento suma. Devuelve
    * el primer conteo, para saber si este es un reconteo.
    */
-  async recordCount(sessionId: string, countedCashCents: bigint): Promise<bigint> {
-    await this.db.cashSession.updateMany({
-      where: this.scope({ id: sessionId, status: S.OPEN, firstCountedCashCents: null }),
-      data: { firstCountedCashCents: countedCashCents },
-    });
-    await this.db.cashSession.updateMany({
-      where: this.scope({ id: sessionId, status: S.OPEN }),
-      data: { countAttempts: { increment: 1 } },
-    });
-    const s = await this.db.cashSession.findFirstOrThrow({ where: this.scope({ id: sessionId }), select: { firstCountedCashCents: true } });
-    return s.firstCountedCashCents ?? countedCashCents;
+  async recordCount(sessionId: string, countedCashCents: bigint): Promise<bigint | null> {
+    // Una sola escritura (bloque 4.16; antes, dos UPDATE sueltos y una lectura, cada uno con su
+    // confirmación): con la base lenta para confirmar, cada UPDATE retenía la fila del turno mientras
+    // confirmaba y el reintento de un corte caía en 500 «lock timeout». Ahora corre dentro del turno
+    // de dinero del gimnasio (`CashService.closeSession`). `null` = el turno ya no está abierto.
+    const [fila] = await this.db.$queryRaw<Array<{ primero: bigint }>>`
+      UPDATE "cash_sessions"
+         SET "firstCountedCashCents" = COALESCE("firstCountedCashCents", ${countedCashCents}),
+             "countAttempts" = "countAttempts" + 1
+       WHERE "id" = ${sessionId}::uuid AND "organizationId" = ${this.organizationId}::uuid AND "status"::text = 'OPEN'
+       RETURNING "firstCountedCashCents" AS primero`;
+    return fila ? BigInt(fila.primero) : null;
   }
 
   /**

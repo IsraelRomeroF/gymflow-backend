@@ -207,10 +207,18 @@ export class PortalAuthRepository extends GlobalRepository {
     }
     // «Visto por última vez» con precisión de un minuto (fase 2, bloque 2.8): una pantalla del
     // portal hace varias peticiones a la vez y todas escribían el mismo renglón de la sesión.
-    // Ahora escribe la primera; las demás no encuentran nada que cambiar y no esperan turno.
-    await this.db.memberSession.updateMany({
-      where: { id: row.id, lastSeenAt: { lt: new Date(ahora - VISTO_CADA_MS) } }, data: { lastSeenAt: new Date(ahora) },
-    });
+    // Ahora escribe la primera; las demás no encuentran nada que cambiar. Bloque 4.16: tampoco esperan
+    // a que la primera confirme (antes sí hacían fila sobre la fila, y con la base lenta caían en 500
+    // «lock timeout»): si la fila está tomada se saltan, y un fallo aquí no tumba la petición.
+    try {
+      await this.db.$executeRaw`
+        UPDATE "member_sessions" SET "lastSeenAt" = ${new Date(ahora)}
+         WHERE "id" = (SELECT "id" FROM "member_sessions"
+                        WHERE "id" = ${row.id}::uuid AND "lastSeenAt" < ${new Date(ahora - VISTO_CADA_MS)}
+                        FOR UPDATE SKIP LOCKED)`;
+    } catch {
+      // Se anota en la siguiente petición.
+    }
     return row as MemberSessionRecord;
   }
 
